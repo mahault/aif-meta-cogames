@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "aif-meta-cogames"
+version = "0.1.0"
+description = "Meta-learning world models with active inference on CoGames"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Mahault Albarracin"},
+    {name = "Luca"},
+    {name = "Alejandro"},
+]
+
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+    "pymdp>=0.0.7",
+    "pyyaml>=6.0",
+    "wandb>=0.16",
+    "matplotlib>=3.7",
+    "tqdm>=4.65",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1",
+]
+cogames = [
+    "cogames",
+    "mettagrid>=0.18",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
