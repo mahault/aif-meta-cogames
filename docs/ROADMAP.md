@@ -22,10 +22,19 @@ Build an active inference agent that meta-learns a world model across diverse co
 | Environment wrapper | Wrap cogames env into clean `(obs, action, next_obs, reward, done)` interface | TODO |
 | Observation encoder | Token obs `(200, 3)` uint8 → flat vector or learned embedding | TODO |
 | Trajectory dataset | PyTorch Dataset loading `.npz` files from data collection | TODO |
+| **Trajectory data v3** | **3,600 episodes with trained agents across 36 variants** | **Done** |
 | Variant sampler | Sample env configs for meta-learning task distribution | TODO |
 | Abstract interfaces | `WorldModel` base class so parallel work can proceed | TODO |
 
-**Data**: 36 environment variants x 10 episodes = 360 episodes (104K steps) already collected. Stored as compressed `.npz` with `obs(T, N, 200, 3)`, `actions(T, N)`, `rewards(T, N)`, `dones(T, N)`.
+**Data (v3 — March 2026)**:
+- **36 environment variants** × 100 episodes = **3,600 episodes** (2,100,000 steps)
+- **Trained agent policies**: Heterogeneous team using kickstarted LSTM checkpoints (miner, aligner, scrambler) — NOT random/biased-move
+- Agent counts: n=4 (1M+1A+2S) and n=8 (2M+3A+3S); n=2 skipped to ensure all 3 roles present
+- Variants: 30 arena (2 sizes × 3 difficulties × 5 terrains) + 6 machina1 (2 sizes × 3 difficulties)
+- EnergizedVariant: agents stay alive for full episodes (500-1000 steps)
+- Format: compressed `.npz` with `obs(T, N, 200, 3) uint8`, `actions(T, N) int32`, `rewards(T, N) float32`, `dones(T, N) bool`
+- Size: **440MB** compressed (`trajectory_data_v3.tar.gz`)
+- Previous v2 dataset (54 variants × 50 episodes, biased-move policy, 1.58M steps) also available
 
 **Done when**: `trajectory_dataset.py` loads data and produces batches, `wrapper.py` steps a live env, tests pass.
 
@@ -129,9 +138,9 @@ for each meta-step:
 
 | Experiment | What | Tests |
 |-----------|------|-------|
-| E1: WM sanity | MLP on 3 easy variants | Architecture works |
-| E2: WM comparison | MLP vs RNN on all 36 variants | Best world model |
-| E3: Meta-learning | MAML vs None on 30/6 train/test | H1: MAML helps adaptation |
+| E1: WM sanity | MLP on 3 easy variants (100 episodes each) | Architecture works |
+| E2: WM comparison | MLP vs RNN on all 36 variants (3,600 episodes) | Best world model |
+| E3: Meta-learning | MAML vs None on 30/6 train/test split | H1: MAML helps adaptation |
 | E4: Discrete AIF | pymdp on 3 arena variants | H3: Epistemic value helps |
 | E5: Neural AIF | MLP+MAML+Neural AIF on all | H2: Better WM → better agent |
 | E6: Ablation | ±epistemic value on 6 test variants | H3: Epistemic value contribution |
