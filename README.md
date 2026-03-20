@@ -51,17 +51,19 @@ pip install -e ".[dev,cogames]"
 ## Quick Start
 
 ```bash
-# Collect trajectory data (requires cogames)
-python scripts/collect_trajectories.py --episodes 10 --output data/trajectories
+# Run unit tests (no cogames dependency needed)
+python -m pytest tests/ -v -k "not integration"
 
-# Train world model on offline data
-python scripts/train_world_model.py --data data/trajectories --model mlp
+# Run with cogames (requires cogames + mettagrid on Linux/AWS)
+python -m pytest tests/ -v
 
-# Meta-train with MAML
-python scripts/meta_train.py --data data/trajectories --inner-steps 5
+# Live evaluation of AIF agent in CogsGuard
+cogames eval -m cogsguard_arena.basic \
+  -p class=aif_meta_cogames.aif_agent.cogames_policy.AIFPolicy \
+  -c 4 -e 3
 
-# Evaluate adaptation on held-out variants
-python scripts/evaluate_adaptation.py --checkpoint models/meta_model.pt
+# Collect trajectory data (for world model training)
+python scripts/collect_trajectories_v3.py --episodes 10 --output data/trajectories
 ```
 
 ## Project Structure
@@ -72,7 +74,17 @@ src/aif_meta_cogames/
 ├── world_model/      # Neural world models (MLP, RNN)
 ├── meta_learning/    # MAML and task distribution
 ├── aif_agent/        # Active inference agents (discrete + neural)
+│   ├── generative_model.py   # 18-state POMDP (phase×hand)
+│   ├── discretizer.py        # Token obs → discrete modalities
+│   └── cogames_policy.py     # AIFPolicy(MultiAgentPolicy) for live play
 └── evaluation/       # Metrics and baselines
 ```
+
+## Current Status (March 2026)
+
+- **Phase 3 COMPLETE**: Discrete AIF agent runs live in CogsGuard. 18-state POMDP with pymdp JAX. Hybrid architecture: pymdp beliefs + rule-based navigation. 26/26 tests pass.
+- **Phase 0**: Trajectory data v3 collected (3,600 episodes, 36 variants, trained agents).
+- **Phases 1-2**: World model training and meta-learning in progress (Luca leading).
+- **Phase 4**: Neural AIF (merge world model + AIF agent) — next milestone.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the full development plan and [docs/DESIGN.md](docs/DESIGN.md) for technical architecture.

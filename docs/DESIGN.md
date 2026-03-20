@@ -96,28 +96,125 @@ def inner_loop(theta, support_data, steps):
 
 ## AIF Agent
 
-### Phase 1: Discrete (pymdp)
+### Phase 3b (Current): Full 216-State Discrete AIF Agent
 
-**State space** (factored, 216 states):
-- `phase(6)`: EXPLORE, MINE, DEPOSIT, CRAFT, GEAR, CAPTURE
-- `hand(3)`: EMPTY, HOLDING_RESOURCE, HOLDING_GEAR
-- `target_mode(3)`: FREE, CONTESTED, LOST
-- `role(4)`: MINER, ALIGNER, SCOUT, SCRAMBLER
+#### State Space (216 states = phase × hand × target_mode × role)
 
-**Observation modalities** (discretized from tokens):
-- `o_resource`: {NONE, NEAR, AT_RESOURCE}
-- `o_station`: {NONE, NEAR_DEPOT, NEAR_CRAFT, NEAR_GEAR, NEAR_JUNCTION}
-- `o_inventory`: {EMPTY, HAS_RESOURCE, HAS_GEAR}
-- `o_social`: {ALONE, TEAMMATE_NEAR, OPPONENT_NEAR}
-- `o_junction`: {NONE, NEUTRAL, TEAM, OPPONENT}
-
-**EFE**:
 ```
-G(pi) = E[-ln P(o|C)]                    # pragmatic: match preferences
-      - E[D_KL[q(s|o,pi) || q(s|pi)]]    # epistemic: information gain
+phase(6):        EXPLORE, MINE, DEPOSIT, CRAFT, GEAR, CAPTURE
+hand(3):         EMPTY, HOLDING_RESOURCE, HOLDING_GEAR
+target_mode(3):  FREE, CONTESTED, LOST
+role(4):         GATHERER, CRAFTER, CAPTURER, SUPPORT
 ```
 
-### Phase 3: Neural AIF
+All four factors are meaningful because the POMDP action space is task-level
+policies (not primitive movements), making B matrices action-dependent:
+- **phase × hand**: Economy-chain progress
+- **target_mode**: Junction contest status — affects EFE for CAPTURE vs YIELD
+- **role**: Agent specialisation — affects which task policies are preferred via C
+
+#### Action Space (13 task-level policies)
+
+**Critical design decision**: The POMDP action space is 13 task-level policies,
+NOT the 5 primitive movement actions. Each task policy has distinct B matrix
+transitions, so pymdp's EFE computation produces non-uniform policy selection.
+
+A navigator converts the selected task policy to primitive movement:
+
+| Policy | B matrix effect | Navigator action |
+|--------|----------------|-----------------|
+| NAV_RESOURCE | EXPLORE → MINE | Move toward extractor |
+| MINE | hand → HOLDING_RESOURCE | Noop (interact) |
+| NAV_DEPOT | → DEPOSIT phase | Move toward hub |
+| DEPOSIT | hand → EMPTY | Noop (interact) |
+| NAV_CRAFT | → CRAFT phase | Move toward craft station |
+| CRAFT | hand → HOLDING_GEAR | Noop (interact) |
+| NAV_GEAR | → GEAR phase | Move toward craft station |
+| ACQUIRE_GEAR | hand → HOLDING_GEAR | Noop (interact) |
+| NAV_JUNCTION | → CAPTURE phase | Move toward junction |
+| CAPTURE | cycle → EXPLORE/EMPTY | Noop (interact) |
+| EXPLORE | self-transition | Wander |
+| YIELD | self-transition | Move away from agent |
+| WAIT | self-transition | Noop |
+
+**Why not primitive movements?** CogsGuard has 5 actions (noop, N, S, E, W).
+Phase/hand transitions happen when stepping onto specific tiles (extractors, hubs,
+craft stations, junctions). So all 5 primitive actions produce the same state
+transitions → B is action-independent → EFE is uniform → random action selection.
+Task-level policies abstract over spatial movement, producing action-dependent B.
+
+#### Observation Modalities (6)
+
+| Modality | Dim | Source | Depends on |
+|----------|-----|--------|-----------|
+| o_resource | 3 | tag tokens (extractor proximity) | phase |
+| o_station | 4 | tag tokens (hub/craft/junction) | phase |
+| o_inventory | 3 | global inventory tokens | hand |
+| o_contest | 3 | junction + agent:group tokens | target_mode |
+| o_social | 4 | agent:group spatial tokens | weakly informative |
+| o_role_signal | 2 | vibe tokens | role |
+
+#### Architecture
+
+```
+Token Observation (200, 3) uint8
+        ↓
+ObservationDiscretizer
+        ↓
+(o_res, o_sta, o_inv, o_contest, o_social, o_role) — 6 discrete modalities
+        ↓
+pymdp.Agent (JAX, equinox Module)
+  ├── infer_states() → posterior beliefs over 216 states
+  ├── infer_policies() → EFE over 13 task policies
+  └── update_empirical_prior() → state prediction for next step
+        ↓
+Task policy selection (argmax EFE)
+        ↓
+Navigator: task policy → primitive movement action
+```
+
+#### EFE Decomposition
+
+```
+G(π) = E_q(o,s|π) [ ln q(s|π) - ln P(o|C) - ln P(o|s) + ln q(s|o,π) ]
+     = risk + ambiguity - information_gain
+
+risk       = E[ D_KL[ q(o|π) || P(o|C) ] ]     — prefer preferred outcomes
+ambiguity  = E[ H[P(o|s)] ]                      — avoid uncertain observations
+info_gain  = E[ D_KL[ q(s|o,π) || q(s|π) ] ]    — seek informative states
+```
+
+With action-dependent B, different task policies lead to different expected
+observations → different risk and information gain → meaningful policy selection.
+
+#### Matrices
+
+**A** (observation likelihood): 6 matrices, each `(n_obs_m, 216)`.
+Hand-crafted defaults encode factor-observation dependencies:
+- A[inventory] near-deterministic from hand
+- A[contest] near-deterministic from target_mode
+- A[resource/station] depend on phase
+
+**B** (transition): `(216, 216, 13)`. Hand-crafted defaults, MAML-refinable.
+Each task policy column encodes expected state transitions.
+Role factor: self-transition (doesn't change within episode).
+Target_mode: changes based on capture/contest outcomes.
+
+**C** (preferences): 6 vectors.
+- Prefer: AT resource, JUNCTION station, HAS_GEAR inventory, FREE contest, ALLY_NEAR
+- Avoid: LOST contest, ENEMY_NEAR
+
+**D** (prior): `(216,)`. Peak at EXPLORE/EMPTY/FREE/GATHERER.
+
+#### MAML Target
+
+For meta-learning (Luca's Phase 2):
+- A/B matrices are the meta-learning parameters
+- Inner loop: fit A/B from 2-3 episodes of a new variant via MLE + Dirichlet smoothing
+- Outer loop: learn initialization θ* that minimizes post-adaptation loss across variants
+- B matrix has 606K entries but is block-sparse (most transitions are within-factor)
+
+### Phase 4 (NEXT): Neural AIF + Meta-Learned World Model
 
 Replace hand-crafted A/B with learned world model:
 - A matrix = decoder network
@@ -130,7 +227,7 @@ class NeuralAIFAgent:
     def act(self, obs):
         z = world_model.encode(obs)
         G = []
-        for action in range(5):
+        for action in range(13):  # 13 task-level policies
             z_next = world_model.predict(z, action)
             g_pragmatic = -preferences.score(world_model.decode(z_next))
             g_epistemic = -world_model.uncertainty(z, action)

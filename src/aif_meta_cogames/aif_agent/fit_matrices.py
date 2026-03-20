@@ -4,6 +4,10 @@ Loads trajectories from ``.npz`` files, discretizes observations using
 :class:`ObservationDiscretizer`, and estimates maximum-likelihood A and B
 matrices via transition counting with Dirichlet smoothing.
 
+For B matrix fitting, primitive actions from trajectories are mapped to
+task-level policies via ``infer_task_policy()``, since the POMDP action
+space is 13 task-level policies (not 5 movement actions).
+
 Can be run as a script::
 
     python -m aif_meta_cogames.aif_agent.fit_matrices \\
@@ -19,7 +23,10 @@ import numpy as np
 from .discretizer import (
     NUM_OBS,
     NUM_STATES,
+    TASK_POLICY_NAMES,
     ObservationDiscretizer,
+    infer_task_policy,
+    state_factors,
     state_label,
 )
 from .generative_model import NUM_ACTIONS, CogsGuardPOMDP
@@ -56,12 +63,11 @@ def fit_variant(
     for npz_path in npz_files:
         data = np.load(npz_path)
         obs = data["obs"]          # (T, N, 200, 3)
-        actions = data["actions"]  # (T, N)
         T, N = obs.shape[:2]
 
         for t in range(T):
             for a in range(N):
-                s = discretizer.infer_state(obs[t, a])
+                s = discretizer.infer_state(obs[t, a], agent_id=a)
                 o = discretizer.discretize_obs(obs[t, a])
 
                 state_counts[s] += 1
@@ -69,10 +75,15 @@ def fit_variant(
                     A_counts[m][o[m], s] += 1
 
                 if t < T - 1:
-                    s_next = discretizer.infer_state(obs[t + 1, a])
-                    act = int(actions[t, a])
-                    if 0 <= act < NUM_ACTIONS:
-                        B_counts[s_next, s, act] += 1
+                    s_next = discretizer.infer_state(obs[t + 1, a], agent_id=a)
+
+                    # Infer task-level policy from state transition
+                    p_t, h_t, _, _ = state_factors(s)
+                    p_next, h_next, _, _ = state_factors(s_next)
+                    task = infer_task_policy(p_t, h_t, p_next, h_next)
+
+                    if 0 <= task < NUM_ACTIONS:
+                        B_counts[s_next, s, task] += 1
                         n_transitions += 1
 
     # Normalise with Dirichlet smoothing
@@ -191,7 +202,7 @@ def _top_transitions(B_counts: np.ndarray, k: int = 10) -> list[dict]:
                     entries.append({
                         "from": state_label(s),
                         "to": state_label(s_next),
-                        "action": a,
+                        "task_policy": TASK_POLICY_NAMES[a],
                         "count": count,
                     })
     entries.sort(key=lambda e: e["count"], reverse=True)
@@ -227,6 +238,7 @@ def main():
         variant_names = [v.strip() for v in args.variants.split(",")]
 
     print(f"Fitting POMDP from: {args.data}")
+    print(f"State space: {NUM_STATES} states, {NUM_ACTIONS} task-level policies")
     results = fit_all_variants(
         Path(args.data),
         variant_names=variant_names,
@@ -246,7 +258,7 @@ def main():
         count = int(first["state_counts"][s])
         if count > 0:
             pct = 100.0 * count / first["state_counts"].sum()
-            print(f"  {state_label(s):25s} {count:>8,}  ({pct:5.1f}%)")
+            print(f"  {state_label(s):45s} {count:>8,}  ({pct:5.1f}%)")
 
 
 if __name__ == "__main__":

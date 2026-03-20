@@ -1,4 +1,4 @@
-"""Tests for the discrete AIF agent module."""
+"""Tests for the discrete AIF agent module (216-state, 13 task policies)."""
 
 import numpy as np
 import pytest
@@ -8,12 +8,23 @@ from aif_meta_cogames.aif_agent import (
     NUM_HANDS,
     NUM_OBS,
     NUM_PHASES,
+    NUM_ROLES,
     NUM_STATES,
+    NUM_TARGET_MODES,
+    NUM_TASK_POLICIES,
     Hand,
+    ObsContest,
     ObsInventory,
     ObsResource,
+    ObsRoleSignal,
+    ObsSocial,
     ObsStation,
     Phase,
+    Role,
+    TargetMode,
+    TaskPolicy,
+    TASK_POLICY_NAMES,
+    infer_task_policy,
     state_factors,
     state_index,
     state_label,
@@ -39,7 +50,6 @@ from aif_meta_cogames.aif_agent.generative_model import (
 # ---------------------------------------------------------------------------
 
 # Minimal obs_feature_names list for testing.
-# Indices must match what the discretizer expects.
 OBS_FEATURES = [
     "agent:group",      # 0
     "agent:frozen",     # 1
@@ -121,27 +131,132 @@ def disc():
 
 
 # ---------------------------------------------------------------------------
-# State indexing
+# Dimensions
+# ---------------------------------------------------------------------------
+
+class TestDimensions:
+    def test_state_dimensions(self):
+        assert NUM_PHASES == 6
+        assert NUM_HANDS == 3
+        assert NUM_TARGET_MODES == 3
+        assert NUM_ROLES == 4
+        assert NUM_STATES == 216  # 6 * 3 * 3 * 4
+
+    def test_action_dimensions(self):
+        assert NUM_TASK_POLICIES == 13
+        assert NUM_ACTIONS == 13
+        assert len(TASK_POLICY_NAMES) == 13
+
+    def test_obs_dimensions(self):
+        assert len(NUM_OBS) == 6
+        assert NUM_OBS == [3, 4, 3, 3, 4, 2]
+
+
+# ---------------------------------------------------------------------------
+# State indexing (4 factors)
 # ---------------------------------------------------------------------------
 
 class TestStateIndexing:
-    def test_dimensions(self):
-        assert NUM_PHASES == 6
-        assert NUM_HANDS == 3
-        assert NUM_STATES == 18
-
     def test_roundtrip(self):
         for p in range(NUM_PHASES):
             for h in range(NUM_HANDS):
-                idx = state_index(p, h)
-                assert state_factors(idx) == (p, h)
-                assert 0 <= idx < NUM_STATES
+                for t in range(NUM_TARGET_MODES):
+                    for r in range(NUM_ROLES):
+                        idx = state_index(p, h, t, r)
+                        assert 0 <= idx < NUM_STATES
+                        assert state_factors(idx) == (p, h, t, r)
+
+    def test_unique_indices(self):
+        indices = set()
+        for p in range(NUM_PHASES):
+            for h in range(NUM_HANDS):
+                for t in range(NUM_TARGET_MODES):
+                    for r in range(NUM_ROLES):
+                        idx = state_index(p, h, t, r)
+                        assert idx not in indices
+                        indices.add(idx)
+        assert len(indices) == NUM_STATES
 
     def test_label(self):
-        assert state_label(0) == "EXPLORE/EMPTY"
-        assert state_label(state_index(Phase.CAPTURE, Hand.HOLDING_GEAR)) == (
-            "CAPTURE/HOLDING_GEAR"
-        )
+        assert state_label(0) == "EXPLORE/EMPTY/FREE/GATHERER"
+        idx = state_index(Phase.CAPTURE, Hand.HOLDING_GEAR, TargetMode.CONTESTED, Role.CAPTURER)
+        assert state_label(idx) == "CAPTURE/HOLDING_GEAR/CONTESTED/CAPTURER"
+
+    def test_default_target_mode_and_role(self):
+        # Backward compat: state_index with just phase, hand defaults to FREE, GATHERER
+        idx = state_index(Phase.EXPLORE, Hand.EMPTY)
+        p, h, t, r = state_factors(idx)
+        assert p == Phase.EXPLORE
+        assert h == Hand.EMPTY
+        assert t == TargetMode.FREE
+        assert r == Role.GATHERER
+
+
+# ---------------------------------------------------------------------------
+# Enums
+# ---------------------------------------------------------------------------
+
+class TestEnums:
+    def test_task_policy_values(self):
+        assert TaskPolicy.NAV_RESOURCE == 0
+        assert TaskPolicy.WAIT == 12
+        assert len(TaskPolicy) == 13
+
+    def test_target_mode_values(self):
+        assert TargetMode.FREE == 0
+        assert TargetMode.CONTESTED == 1
+        assert TargetMode.LOST == 2
+
+    def test_role_values(self):
+        assert Role.GATHERER == 0
+        assert Role.SUPPORT == 3
+        assert len(Role) == 4
+
+
+# ---------------------------------------------------------------------------
+# Task-policy inference
+# ---------------------------------------------------------------------------
+
+class TestTaskPolicyInference:
+    def test_nav_resource(self):
+        tp = infer_task_policy(Phase.EXPLORE, Hand.EMPTY, Phase.MINE, Hand.EMPTY)
+        assert tp == TaskPolicy.NAV_RESOURCE
+
+    def test_mine(self):
+        tp = infer_task_policy(Phase.MINE, Hand.EMPTY, Phase.MINE, Hand.HOLDING_RESOURCE)
+        assert tp == TaskPolicy.MINE
+
+    def test_nav_depot(self):
+        tp = infer_task_policy(Phase.MINE, Hand.HOLDING_RESOURCE, Phase.DEPOSIT, Hand.HOLDING_RESOURCE)
+        assert tp == TaskPolicy.NAV_DEPOT
+
+    def test_deposit(self):
+        tp = infer_task_policy(Phase.DEPOSIT, Hand.HOLDING_RESOURCE, Phase.DEPOSIT, Hand.EMPTY)
+        assert tp == TaskPolicy.DEPOSIT
+
+    def test_craft(self):
+        tp = infer_task_policy(Phase.CRAFT, Hand.EMPTY, Phase.CRAFT, Hand.HOLDING_GEAR)
+        assert tp == TaskPolicy.CRAFT
+
+    def test_capture_success(self):
+        tp = infer_task_policy(Phase.CAPTURE, Hand.HOLDING_GEAR, Phase.EXPLORE, Hand.EMPTY)
+        assert tp == TaskPolicy.CAPTURE
+
+    def test_self_transition_is_wait(self):
+        # CRAFT/HOLDING_RESOURCE → same = no matching economy pattern → WAIT
+        tp = infer_task_policy(Phase.CRAFT, Hand.HOLDING_RESOURCE,
+                               Phase.CRAFT, Hand.HOLDING_RESOURCE)
+        assert tp == TaskPolicy.WAIT
+
+    def test_deposit_self_transition_is_deposit(self):
+        # DEPOSIT/HOLDING_RESOURCE → same = still depositing (not WAIT)
+        tp = infer_task_policy(Phase.DEPOSIT, Hand.HOLDING_RESOURCE,
+                               Phase.DEPOSIT, Hand.HOLDING_RESOURCE)
+        assert tp == TaskPolicy.DEPOSIT
+
+    def test_explore_self_transition(self):
+        tp = infer_task_policy(Phase.EXPLORE, Hand.EMPTY, Phase.EXPLORE, Hand.EMPTY)
+        assert tp == TaskPolicy.EXPLORE
 
 
 # ---------------------------------------------------------------------------
@@ -190,8 +305,6 @@ class TestPhaseInference:
         assert disc.infer_phase(obs, Hand.HOLDING_GEAR) == Phase.CAPTURE
 
     def test_mine_when_adjacent_to_extractor(self, disc):
-        # Center of 13x13 is (6,6) -> location = 6<<4|6 = 102
-        # Adjacent cell (6,7) -> 6<<4|7 = 103
         obs = _obs_with_tag(15, 103)  # carbon_extractor adjacent
         assert disc.infer_phase(obs, Hand.EMPTY) == Phase.MINE
 
@@ -213,43 +326,46 @@ class TestPhaseInference:
 
 
 # ---------------------------------------------------------------------------
-# Discretizer — observation discretisation
+# Discretizer — observation discretisation (6 modalities)
 # ---------------------------------------------------------------------------
 
 class TestObservationDiscretisation:
-    def test_empty_obs_returns_none(self, disc):
+    def test_empty_obs_returns_defaults(self, disc):
         obs = _empty_obs()
-        o_res, o_sta, o_inv = disc.discretize_obs(obs)
+        result = disc.discretize_obs(obs)
+        assert len(result) == 6
+        o_res, o_sta, o_inv, o_con, o_soc, o_role = result
         assert o_res == ObsResource.NONE
         assert o_sta == ObsStation.NONE
         assert o_inv == ObsInventory.EMPTY
+        assert o_con == ObsContest.FREE
+        assert o_soc == ObsSocial.ALONE
+        assert o_role == ObsRoleSignal.SAME_ROLE
 
     def test_inventory_reflects_hand(self, disc):
         obs = _obs_with_inventory(39, 1)  # aligner gear
-        _, _, o_inv = disc.discretize_obs(obs)
-        assert o_inv == ObsInventory.HAS_GEAR
+        result = disc.discretize_obs(obs)
+        assert result[2] == ObsInventory.HAS_GEAR
 
     def test_adjacent_extractor(self, disc):
         obs = _obs_with_tag(15, 103)  # carbon_extractor adjacent
-        o_res, _, _ = disc.discretize_obs(obs)
-        assert o_res == ObsResource.AT
+        result = disc.discretize_obs(obs)
+        assert result[0] == ObsResource.AT
 
     def test_near_extractor(self, disc):
-        # Location (6, 9) -> 6<<4|9 = 105, dist=3 from center (6,6)
-        obs = _obs_with_tag(15, 105)
-        o_res, _, _ = disc.discretize_obs(obs)
-        assert o_res == ObsResource.NEAR
+        obs = _obs_with_tag(15, 105)  # dist=3 from center
+        result = disc.discretize_obs(obs)
+        assert result[0] == ObsResource.NEAR
 
     def test_far_extractor(self, disc):
-        # Location (2, 2) -> 2<<4|2 = 34, dist=8 from center
-        obs = _obs_with_tag(15, 34)
-        o_res, _, _ = disc.discretize_obs(obs)
-        assert o_res == ObsResource.NONE
+        obs = _obs_with_tag(15, 34)  # dist=8 from center
+        result = disc.discretize_obs(obs)
+        assert result[0] == ObsResource.NONE
 
     def test_adjacent_junction(self, disc):
         obs = _obs_with_tag(18, 102)  # junction at center
-        _, o_sta, _ = disc.discretize_obs(obs)
-        assert o_sta == ObsStation.JUNCTION
+        result = disc.discretize_obs(obs)
+        assert result[1] == ObsStation.JUNCTION
 
 
 # ---------------------------------------------------------------------------
@@ -261,14 +377,14 @@ class TestBatchDiscretization:
         obs_seq = np.full((10, 4, 200, 3), 255, dtype=np.uint8)
         result = disc.discretize_trajectory(obs_seq)
         assert result["states"].shape == (10, 4)
-        assert result["obs"].shape == (10, 4, 3)
+        assert result["obs"].shape == (10, 4, 6)  # 6 modalities
 
     def test_all_empty_trajectory(self, disc):
         obs_seq = np.full((5, 2, 200, 3), 255, dtype=np.uint8)
         result = disc.discretize_trajectory(obs_seq)
-        # All should be EXPLORE/EMPTY
-        expected_state = state_index(Phase.EXPLORE, Hand.EMPTY)
-        assert np.all(result["states"] == expected_state)
+        # All should be EXPLORE/EMPTY/FREE/GATHERER (agent_id=0 → role=GATHERER)
+        expected_state = state_index(Phase.EXPLORE, Hand.EMPTY, TargetMode.FREE, Role.GATHERER)
+        assert np.all(result["states"][:, 0] == expected_state)
 
 
 # ---------------------------------------------------------------------------
@@ -278,7 +394,7 @@ class TestBatchDiscretization:
 class TestGenerativeModel:
     def test_A_shapes(self):
         A = build_default_A()
-        assert len(A) == 3
+        assert len(A) == 6
         for m, a in enumerate(A):
             assert a.shape == (NUM_OBS[m], NUM_STATES)
 
@@ -299,13 +415,24 @@ class TestGenerativeModel:
             for a in range(NUM_ACTIONS):
                 col_sum = B[0][:, s, a].sum()
                 assert abs(col_sum - 1.0) < 1e-10, (
-                    f"B column for state={state_label(s)}, action={a} "
+                    f"B column for state={state_label(s)}, action={TASK_POLICY_NAMES[a]} "
                     f"sums to {col_sum}"
                 )
 
+    def test_B_is_action_dependent(self):
+        """B must be action-dependent — different task policies produce different transitions."""
+        B = build_default_B()[0]
+        s = state_index(Phase.EXPLORE, Hand.EMPTY, TargetMode.FREE, Role.GATHERER)
+        # NAV_RESOURCE should have different transitions than WAIT
+        nav_col = B[:, s, TaskPolicy.NAV_RESOURCE]
+        wait_col = B[:, s, TaskPolicy.WAIT]
+        assert not np.allclose(nav_col, wait_col), (
+            "B must be action-dependent: NAV_RESOURCE and WAIT should differ"
+        )
+
     def test_C_shapes(self):
         C = build_C()
-        assert len(C) == 3
+        assert len(C) == 6
         for m, c in enumerate(C):
             assert c.shape == (NUM_OBS[m],)
 
@@ -315,10 +442,17 @@ class TestGenerativeModel:
         assert D[0].shape == (NUM_STATES,)
         np.testing.assert_allclose(D[0].sum(), 1.0, atol=1e-10)
 
-    def test_D_peaks_at_explore_empty(self):
+    def test_D_peaks_at_explore_empty_free(self):
         D = build_D()
-        expected = state_index(Phase.EXPLORE, Hand.EMPTY)
-        assert D[0].argmax() == expected
+        # Should have highest mass across EXPLORE/EMPTY/FREE for all roles
+        explore_empty_free = [
+            state_index(Phase.EXPLORE, Hand.EMPTY, TargetMode.FREE, r)
+            for r in Role
+        ]
+        for s in explore_empty_free:
+            assert D[0][s] > D[0].mean(), (
+                f"D[{state_label(s)}] should be above average"
+            )
 
     def test_uniform_A_is_uniform(self):
         A = build_uniform_A()
@@ -334,9 +468,9 @@ class TestGenerativeModel:
 class TestCogsGuardPOMDP:
     def test_default_construction(self):
         model = CogsGuardPOMDP()
-        assert len(model.A) == 3
+        assert len(model.A) == 6
         assert len(model.B) == 1
-        assert len(model.C) == 3
+        assert len(model.C) == 6
         assert len(model.D) == 1
 
     def test_uniform_construction(self):
@@ -351,12 +485,13 @@ class TestCogsGuardPOMDP:
         model.save(save_path)
 
         loaded = CogsGuardPOMDP.from_fitted(save_path)
-        for m in range(3):
+        for m in range(6):
             np.testing.assert_array_almost_equal(model.A[m], loaded.A[m])
         np.testing.assert_array_almost_equal(model.B[0], loaded.B[0])
 
     def test_summary(self):
         model = CogsGuardPOMDP()
         text = model.summary()
-        assert "18" in text
-        assert "EXPLORE/EMPTY" in text
+        assert "216" in text
+        assert "EXPLORE/EMPTY/FREE/GATHERER" in text
+        assert "13" in text

@@ -91,24 +91,126 @@ for each meta-step:
 
 ---
 
-## Phase 3: Discrete AIF Agent (Weeks 3-5, parallel with Phase 2)
+## Phase 3: Discrete AIF Agent — v1 Prototype (Weeks 3-5) — COMPLETE
 
-**Lead**: Mahault
+**Lead**: Mahault | **Completed**: 2026-03-17
 
 | Task | Description | Status |
 |------|-------------|--------|
-| Generative model | 216-state factored POMDP: phase(6) × hand(3) × target_mode(3) × role(4) | TODO |
-| A/B/C/D matrices | Hand-crafted for CogsGuard economy chain | TODO |
-| pymdp agent | Discrete AIF with EFE (risk + ambiguity + epistemic) | TODO |
-| Cogames integration | Implement `MultiAgentPolicy` interface for live env | TODO |
-| Observation discretizer | Map token obs → discrete observation modalities | TODO |
-| Port variational engine | Adapt from social-layer repo | TODO |
+| Generative model | 18-state POMDP: phase(6) × hand(3) | **Done** |
+| A/B/C/D matrices | Hand-crafted for CogsGuard economy chain | **Done** |
+| pymdp agent | Discrete AIF with EFE via pymdp JAX v1.0 | **Done** |
+| Cogames integration | `AIFPolicy(MultiAgentPolicy)` — live play in CogsGuard | **Done** |
+| Observation discretizer | Token obs → 3 discrete modalities | **Done** |
+| Hybrid navigator | Rule-based movement toward AIF-selected targets | **Done** |
 
-**State space**: 216 states capture the economy chain (EXPLORE → MINE → DEPOSIT → CRAFT → GEAR → CAPTURE) × inventory state × territorial context × role.
+### Results
 
-**Key advantage over PPO**: Epistemic value creates a gradient toward unexplored states (gear stations) even when no reward signal exists there. This directly addresses the "gear wall" — 43 PPO experiments, 2.3B steps, gear acquisition always zero.
+- Hearts: 6.0/agent, Aligner gear: 0.75, Junctions: 0
+- Better than random, worse than starter
 
-**Done when**: AIF agent runs in cogames live environment, selects actions from EFE minimization, explores more state space than random/biased-move baselines.
+### Design Oversight Identified
+
+The v1 prototype mapped the POMDP action space to 5 primitive movement actions (noop, N, S, E, W). Since phase/hand transitions happen automatically when stepping onto tiles, the B matrix is **action-independent** — identical for all 5 actions. When B is action-independent, pymdp computes the same EFE for every action → uniform distribution → effectively random action selection. The "hybrid navigator" works around this by bypassing pymdp's planning entirely and using hardcoded heuristics for goal selection.
+
+**This is fixed in Phase 3b.**
+
+---
+
+## Phase 3b: Discrete AIF Agent — Full 216-State Design (Current) — IN PROGRESS
+
+**Lead**: Mahault | **Target**: 2026-03-20
+
+### Core Fix: Task-Level Policies as POMDP Actions
+
+The POMDP action space is changed from 5 primitive movements to **13 task-level policies**. Each task policy has distinct B matrix transitions, giving pymdp meaningful EFE differences for planning. A navigator then executes the selected task policy spatially.
+
+| Task | Description | Status |
+|------|-------------|--------|
+| Task-level action space | 13 policies: NAV_RESOURCE, MINE, NAV_DEPOT, DEPOSIT, NAV_CRAFT, CRAFT, NAV_GEAR, ACQUIRE_GEAR, NAV_JUNCTION, CAPTURE, EXPLORE, YIELD, WAIT | In Progress |
+| 216-state space | phase(6) × hand(3) × target_mode(3) × role(4) = 216 | In Progress |
+| 6 observation modalities | resource, station, inventory + contest, social, role_signal | In Progress |
+| Action-dependent B matrices | Hand-crafted B[216, 216, 13] with distinct transitions per task policy | TODO |
+| Task-policy inference | Map trajectory (state_t → state_{t+1}) to task-level policy labels for fitting | TODO |
+| pymdp task-policy dispatch | `infer_policies()` over 13 tasks → navigator executes selected task | TODO |
+| Updated tests | 216 states, 13 actions, 6 modalities, 4-factor indexing | TODO |
+| Commit and push | Push to GitHub for Luca's MAML work | TODO |
+
+### State Space (216 states)
+
+```
+phase(6):        EXPLORE, MINE, DEPOSIT, CRAFT, GEAR, CAPTURE
+hand(3):         EMPTY, HOLDING_RESOURCE, HOLDING_GEAR
+target_mode(3):  FREE, CONTESTED, LOST
+role(4):         GATHERER, CRAFTER, CAPTURER, SUPPORT
+```
+
+With action-dependent B matrices, all four factors are meaningful:
+- **phase × hand**: Economy-chain progress (same as v1)
+- **target_mode**: Junction contest status — affects EFE for CAPTURE vs YIELD
+- **role**: Agent specialisation — affects which task policies are preferred
+
+### Action Space (13 task-level policies)
+
+Each task policy maps to a different B matrix column:
+
+| Policy | What it does | Key B transition |
+|--------|-------------|-----------------|
+| NAV_RESOURCE | Navigate to extractor | EXPLORE → MINE |
+| MINE | Extract resources | hand → HOLDING_RESOURCE |
+| NAV_DEPOT | Navigate to hub | → DEPOSIT phase |
+| DEPOSIT | Deposit at hub | hand → EMPTY |
+| NAV_CRAFT | Navigate to craft station | → CRAFT phase |
+| CRAFT | Craft gear | hand → HOLDING_GEAR |
+| NAV_GEAR | Navigate to gear pickup | → GEAR phase |
+| ACQUIRE_GEAR | Pick up gear | hand → HOLDING_GEAR |
+| NAV_JUNCTION | Navigate to junction | → CAPTURE phase |
+| CAPTURE | Capture junction | cycle resets to EXPLORE |
+| EXPLORE | Random exploration | self-transition |
+| YIELD | Give way to teammate | self-transition |
+| WAIT | Wait / noop | self-transition |
+
+### Observation Modalities (6)
+
+| Modality | Values | Source |
+|----------|--------|--------|
+| o_resource(3) | NONE, NEAR, AT | extractor tag proximity |
+| o_station(4) | NONE, HUB, CRAFT, JUNCTION | station tag proximity |
+| o_inventory(3) | EMPTY, HAS_RESOURCE, HAS_GEAR | global inventory tokens |
+| o_contest(3) | FREE, CONTESTED, LOST | junction + agent:group tokens |
+| o_social(4) | ALONE, ALLY_NEAR, ENEMY_NEAR, BOTH | agent:group tokens |
+| o_role_signal(2) | SAME_ROLE, DIFFERENT_ROLE | vibe tokens |
+
+### Why This Fixes the Problem
+
+With 13 task-level actions, B is action-dependent:
+- `B[:, s, NAV_RESOURCE]` → high prob of transitioning to MINE
+- `B[:, s, MINE]` → high prob of gaining HOLDING_RESOURCE
+- `B[:, s, WAIT]` → high prob of staying in current state
+
+pymdp evaluates EFE for each task policy → different expected free energies → non-uniform policy selection → meaningful active inference planning.
+
+### Architecture
+
+```
+Observation → Discretizer → 6 modalities
+                                ↓
+                          pymdp.Agent
+                     (belief update + EFE)
+                                ↓
+                     Task policy selection
+                                ↓
+                     Navigator (spatial movement)
+```
+
+### MAML Integration (for Luca)
+
+The A/B matrices at 216 states are the meta-learning target:
+- **Inner loop**: Fit A/B from 2-3 episodes of a new variant
+- **Outer loop**: Learn initialization that adapts fastest across variants
+- **Task distribution**: 36 CogsGuard variants (30 train / 6 test)
+- B matrix: 216 × 216 × 13 = 606K entries — sparse but structured
+- More trajectory data can be collected as needed
 
 ---
 
@@ -124,7 +226,7 @@ for each meta-step:
 | MAML integration | Initialize world model from meta-learned params | TODO |
 | Adaptation loop | On new variant: few gradient steps → adapted world model → AIF acts | TODO |
 
-**This is the merge**: The world model (Phase 1) meta-learned initialization (Phase 2) becomes the generative model for the AIF agent (Phase 3). The neural agent:
+**This is the merge**: The world model (Phase 1) meta-learned initialization (Phase 2) becomes the generative model for the AIF agent (Phase 3b). The neural agent:
 1. Encodes observations: `z_t = encoder(obs_t)`
 2. Predicts next states: `z_{t+1} = transition(z_t, a_t)` — this IS the B matrix
 3. Computes EFE in latent space with epistemic uncertainty
@@ -141,7 +243,7 @@ for each meta-step:
 | E1: WM sanity | MLP on 3 easy variants (100 episodes each) | Architecture works |
 | E2: WM comparison | MLP vs RNN on all 36 variants (3,600 episodes) | Best world model |
 | E3: Meta-learning | MAML vs None on 30/6 train/test split | H1: MAML helps adaptation |
-| E4: Discrete AIF | pymdp on 3 arena variants | H3: Epistemic value helps |
+| E4: Discrete AIF | pymdp on 3 arena variants (216-state, 13 task policies) | H3: Epistemic value helps |
 | E5: Neural AIF | MLP+MAML+Neural AIF on all | H2: Better WM → better agent |
 | E6: Ablation | ±epistemic value on 6 test variants | H3: Epistemic value contribution |
 
