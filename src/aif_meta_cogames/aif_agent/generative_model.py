@@ -1,24 +1,25 @@
-"""CogsGuard POMDP generative model for pymdp.
+"""CogsGuard POMDP generative model for pymdp 1.0 (factored).
 
 Defines the A (likelihood), B (transition), C (preference), and D (prior)
-matrices for the 216-state CogsGuard POMDP, compatible with ``pymdp.Agent``.
+matrices for the CogsGuard POMDP using a **factored** state representation,
+compatible with ``pymdp.agent.Agent`` from inferactively-pymdp v1.0.
 
-State space:
-    216 flat states = phase(6) x hand(3) x target_mode(3) x role(4)
+State factors:
+    factor 0: phase (6)       — economy-chain phase
+    factor 1: hand (3)        — what agent is holding
+    factor 2: target_mode (3) — junction contest status
+    factor 3: role (4)        — agent specialisation
 
-Observation modalities:
+Observation modalities (6):
     o_resource(3), o_station(4), o_inventory(3),
     o_contest(3), o_social(4), o_role_signal(2)
 
 Actions:
-    13 task-level policies (not primitive movements!)
-    NAV_RESOURCE, MINE, NAV_DEPOT, DEPOSIT, NAV_CRAFT, CRAFT,
-    NAV_GEAR, ACQUIRE_GEAR, NAV_JUNCTION, CAPTURE, EXPLORE, YIELD, WAIT
+    13 task-level policies (shared across all state factors)
 
-The model provides three initialisation modes:
-    - **default**: hand-crafted matrices encoding economy-chain structure
-    - **uniform**: uninformative matrices (for fitting from data)
-    - **from_fitted**: load A/B matrices fitted from trajectory data
+Dependencies:
+    A_dependencies: [[0], [0], [1], [2], [3, 2], [3]]
+    B_dependencies: [[0, 1], [0, 1], [2], [3]]
 """
 
 from pathlib import Path
@@ -52,302 +53,347 @@ from .discretizer import (
 NUM_ACTIONS = NUM_TASK_POLICIES  # 13
 ACTION_NAMES = TASK_POLICY_NAMES
 
+# Factor counts
+NUM_STATE_FACTORS = [NUM_PHASES, NUM_HANDS, NUM_TARGET_MODES, NUM_ROLES]  # [6, 3, 3, 4]
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _all_states():
-    """Iterate over all (phase, hand, target_mode, role) combinations."""
-    for p in Phase:
-        for h in Hand:
-            for t in TargetMode:
-                for r in Role:
-                    yield p, h, t, r, state_index(p, h, t, r)
-
-
-def _normalize_columns(matrix: np.ndarray, axis: int = 0):
-    """Normalize columns (axis=0) of a 2D matrix to sum to 1."""
-    col_sums = matrix.sum(axis=axis, keepdims=True)
-    col_sums = np.where(col_sums == 0, 1.0, col_sums)
-    return matrix / col_sums
+# Dependency structure
+A_DEPENDENCIES = [[0], [0], [1], [2], [3, 2], [3]]
+B_DEPENDENCIES = [[0, 1], [0, 1], [2], [3]]
 
 
 # ---------------------------------------------------------------------------
-# A matrices (observation likelihood)
+# A matrices (observation likelihood) — factored
 # ---------------------------------------------------------------------------
 
 def build_uniform_A() -> list[np.ndarray]:
-    """Uniform observation likelihood (no information)."""
-    return [np.ones((n_obs, NUM_STATES)) / n_obs for n_obs in NUM_OBS]
+    """Uniform observation likelihood (no information), factored."""
+    A = []
+    for m, n_obs in enumerate(NUM_OBS):
+        dep_dims = tuple(NUM_STATE_FACTORS[f] for f in A_DEPENDENCIES[m])
+        shape = (n_obs,) + dep_dims
+        a = np.ones(shape) / n_obs
+        A.append(a)
+    return A
 
 
 def build_default_A() -> list[np.ndarray]:
-    """Hand-crafted observation likelihood encoding economy-chain structure.
+    """Hand-crafted observation likelihood, factored.
 
-    6 observation modalities x 216 states.
-    Each modality primarily depends on one or two state factors.
+    Each modality depends only on its A_dependency factors.
     """
     A = []
 
-    # -- A[0]: o_resource (3 x 216) — depends on phase --
-    a_res = np.full((len(ObsResource), NUM_STATES), 0.1)
-    for p, h, t, r, s in _all_states():
+    # -- A[0]: o_resource (3 x 6) — depends on phase --
+    a_res = np.full((len(ObsResource), NUM_PHASES), 0.1)
+    for p in Phase:
         if p == Phase.MINE:
-            a_res[ObsResource.AT, s] = 0.7
-            a_res[ObsResource.NEAR, s] = 0.2
+            a_res[ObsResource.AT, p] = 0.7
+            a_res[ObsResource.NEAR, p] = 0.2
         elif p == Phase.EXPLORE:
-            a_res[ObsResource.NONE, s] = 0.6
-            a_res[ObsResource.NEAR, s] = 0.3
+            a_res[ObsResource.NONE, p] = 0.6
+            a_res[ObsResource.NEAR, p] = 0.3
         else:
-            a_res[ObsResource.NONE, s] = 0.7
-            a_res[ObsResource.NEAR, s] = 0.2
-        a_res[:, s] /= a_res[:, s].sum()
+            a_res[ObsResource.NONE, p] = 0.7
+            a_res[ObsResource.NEAR, p] = 0.2
+        a_res[:, p] /= a_res[:, p].sum()
     A.append(a_res)
 
-    # -- A[1]: o_station (4 x 216) — depends on phase --
-    a_sta = np.full((len(ObsStation), NUM_STATES), 0.05)
-    for p, h, t, r, s in _all_states():
+    # -- A[1]: o_station (4 x 6) — depends on phase --
+    a_sta = np.full((len(ObsStation), NUM_PHASES), 0.05)
+    for p in Phase:
         if p == Phase.DEPOSIT:
-            a_sta[ObsStation.HUB, s] = 0.6
+            a_sta[ObsStation.HUB, p] = 0.6
         elif p in (Phase.CRAFT, Phase.GEAR):
-            a_sta[ObsStation.CRAFT, s] = 0.6
+            a_sta[ObsStation.CRAFT, p] = 0.6
         elif p == Phase.CAPTURE:
-            a_sta[ObsStation.JUNCTION, s] = 0.6
+            a_sta[ObsStation.JUNCTION, p] = 0.6
         else:
-            a_sta[ObsStation.NONE, s] = 0.7
-        a_sta[:, s] /= a_sta[:, s].sum()
+            a_sta[ObsStation.NONE, p] = 0.7
+        a_sta[:, p] /= a_sta[:, p].sum()
     A.append(a_sta)
 
-    # -- A[2]: o_inventory (3 x 216) — near-deterministic from hand --
-    a_inv = np.full((len(ObsInventory), NUM_STATES), 0.02)
-    for p, h, t, r, s in _all_states():
-        a_inv[int(h), s] = 0.96
-        a_inv[:, s] /= a_inv[:, s].sum()
+    # -- A[2]: o_inventory (3 x 3) — depends on hand, near-deterministic --
+    a_inv = np.full((len(ObsInventory), NUM_HANDS), 0.02)
+    for h in Hand:
+        a_inv[int(h), h] = 0.96
+        a_inv[:, h] /= a_inv[:, h].sum()
     A.append(a_inv)
 
-    # -- A[3]: o_contest (3 x 216) — near-deterministic from target_mode --
-    a_con = np.full((len(ObsContest), NUM_STATES), 0.05)
-    for p, h, t, r, s in _all_states():
-        a_con[int(t), s] = 0.90
-        a_con[:, s] /= a_con[:, s].sum()
+    # -- A[3]: o_contest (3 x 3) — depends on target_mode, near-deterministic --
+    a_con = np.full((len(ObsContest), NUM_TARGET_MODES), 0.05)
+    for t in TargetMode:
+        a_con[int(t), t] = 0.90
+        a_con[:, t] /= a_con[:, t].sum()
     A.append(a_con)
 
-    # -- A[4]: o_social (4 x 216) — weakly informative --
-    a_soc = np.full((len(ObsSocial), NUM_STATES), 0.15)
-    for p, h, t, r, s in _all_states():
-        # Slight bias: capturer/support more likely near allies
-        if r in (Role.CAPTURER, Role.SUPPORT):
-            a_soc[ObsSocial.ALLY_NEAR, s] = 0.3
-        else:
-            a_soc[ObsSocial.ALONE, s] = 0.3
-        # Contested junctions → enemies likely
-        if t == TargetMode.CONTESTED:
-            a_soc[ObsSocial.BOTH_NEAR, s] = 0.3
-        elif t == TargetMode.LOST:
-            a_soc[ObsSocial.ENEMY_NEAR, s] = 0.3
-        a_soc[:, s] /= a_soc[:, s].sum()
+    # -- A[4]: o_social (4 x 4 x 3) — depends on role, target_mode --
+    # A_dependencies[4] = [3, 2] → shape (4, 4, 3) = (n_social, n_role, n_target)
+    a_soc = np.full((len(ObsSocial), NUM_ROLES, NUM_TARGET_MODES), 0.15)
+    for r in Role:
+        for t in TargetMode:
+            if r in (Role.CAPTURER, Role.SUPPORT):
+                a_soc[ObsSocial.ALLY_NEAR, r, t] = 0.3
+            else:
+                a_soc[ObsSocial.ALONE, r, t] = 0.3
+            if t == TargetMode.CONTESTED:
+                a_soc[ObsSocial.BOTH_NEAR, r, t] = 0.3
+            elif t == TargetMode.LOST:
+                a_soc[ObsSocial.ENEMY_NEAR, r, t] = 0.3
+            a_soc[:, r, t] /= a_soc[:, r, t].sum()
     A.append(a_soc)
 
-    # -- A[5]: o_role_signal (2 x 216) — depends on role --
-    a_role = np.full((len(ObsRoleSignal), NUM_STATES), 0.3)
-    for p, h, t, r, s in _all_states():
-        # Support role more likely to see same-role allies (flexible)
+    # -- A[5]: o_role_signal (2 x 4) — depends on role --
+    a_role = np.full((len(ObsRoleSignal), NUM_ROLES), 0.3)
+    for r in Role:
         if r == Role.SUPPORT:
-            a_role[ObsRoleSignal.SAME_ROLE, s] = 0.6
+            a_role[ObsRoleSignal.SAME_ROLE, r] = 0.6
         else:
-            a_role[ObsRoleSignal.DIFFERENT_ROLE, s] = 0.6
-        a_role[:, s] /= a_role[:, s].sum()
+            a_role[ObsRoleSignal.DIFFERENT_ROLE, r] = 0.6
+        a_role[:, r] /= a_role[:, r].sum()
     A.append(a_role)
 
     return A
 
 
 # ---------------------------------------------------------------------------
-# B matrices (transition model) — ACTION-DEPENDENT
+# B matrices (transition model) — factored, action-dependent
 # ---------------------------------------------------------------------------
 
 def build_uniform_B() -> list[np.ndarray]:
-    """Identity transition matrix (agent stays in current state)."""
-    B = np.zeros((NUM_STATES, NUM_STATES, NUM_ACTIONS))
-    for a in range(NUM_ACTIONS):
-        B[:, :, a] = np.eye(NUM_STATES)
-    return [B]
+    """Identity transition matrices (agent stays in current state), factored."""
+    B = []
+    for f, deps in enumerate(B_DEPENDENCIES):
+        dep_dims = tuple(NUM_STATE_FACTORS[d] for d in deps)
+        shape = (NUM_STATE_FACTORS[f],) + dep_dims + (NUM_ACTIONS,)
+        b = np.zeros(shape)
+        # Set identity: for each dep combo and action, self-transition = 1.0
+        for a in range(NUM_ACTIONS):
+            for idx in np.ndindex(*dep_dims):
+                # The factor's own current-state index within deps
+                own_pos = deps.index(f)
+                own_val = idx[own_pos]
+                b[(own_val,) + idx + (a,)] = 1.0
+        B.append(b)
+    return B
 
 
 def build_default_B() -> list[np.ndarray]:
-    """Hand-crafted transition matrices with action-dependent dynamics.
+    """Hand-crafted factored transition matrices.
 
-    Each of the 13 task-level policies produces distinct state transitions.
-    This is the critical fix: primitive movement actions produce action-
-    independent B (same transitions for all actions), but task-level
-    policies produce action-dependent B (different transitions per task).
-
-    The B matrix is block-sparse: most task policies only affect phase
-    and hand, while role self-transitions and target_mode changes are
-    task-specific.
+    Returns [B_phase, B_hand, B_target, B_role] where:
+      B_phase:  (6, 6, 3, 13)  P(phase' | phase, hand, action)
+      B_hand:   (3, 6, 3, 13)  P(hand'  | phase, hand, action)
+      B_target: (3, 3, 13)     P(target' | target, action)
+      B_role:   (4, 4, 13)     P(role'  | role, action) — identity
     """
-    B = np.zeros((NUM_STATES, NUM_STATES, NUM_ACTIONS))
+    n_p, n_h, n_t, n_r = NUM_PHASES, NUM_HANDS, NUM_TARGET_MODES, NUM_ROLES
+    n_a = NUM_ACTIONS
 
-    for p, h, t, r, s in _all_states():
-        for a in TaskPolicy:
-            _set_task_transitions(B, s, p, h, t, r, int(a))
+    B_phase = np.zeros((n_p, n_p, n_h, n_a))
+    B_hand = np.zeros((n_h, n_p, n_h, n_a))
+    B_target = np.zeros((n_t, n_t, n_a))
+    B_role = np.zeros((n_r, n_r, n_a))
 
-    return [B]
+    # Role never changes
+    for a in range(n_a):
+        B_role[:, :, a] = np.eye(n_r)
+
+    # Fill phase/hand transitions for each action
+    for a in TaskPolicy:
+        _fill_phase_hand(B_phase, B_hand, int(a))
+        _fill_target(B_target, int(a))
+
+    # Normalize columns
+    _normalize_B_factor(B_phase, dims=(n_p, n_h), axes=2)
+    _normalize_B_factor(B_hand, dims=(n_p, n_h), axes=2)
+    for t in range(n_t):
+        for a in range(n_a):
+            s = B_target[:, t, a].sum()
+            if s > 0:
+                B_target[:, t, a] /= s
+            else:
+                B_target[t, t, a] = 1.0
+
+    return [B_phase, B_hand, B_target, B_role]
 
 
-def _set_task_transitions(B, s, p, h, t, r, a):
-    """Set transition probabilities for one (state, task_policy) pair.
+def _normalize_B_factor(B, dims, axes):
+    """Normalize B factor columns (first axis sums to 1)."""
+    n_a = B.shape[-1]
+    for a in range(n_a):
+        for idx in np.ndindex(*dims):
+            col = B[(slice(None),) + idx + (a,)]
+            s = col.sum()
+            if s > 0:
+                B[(slice(None),) + idx + (a,)] = col / s
+            else:
+                # Default: self-transition (if factor's own state is in deps)
+                B[(idx[0],) + idx + (a,)] = 1.0
 
-    Convention: role never changes within an episode (self-transition).
-    Target_mode can change based on capture/contest outcomes.
-    Phase and hand change based on economy-chain task policies.
+
+def _fill_phase_hand(B_p, B_h, a):
+    """Set phase and hand transition probabilities for action a."""
+    P = Phase
+    H = Hand
+
+    for p in Phase:
+        for h in Hand:
+            if a == TaskPolicy.NAV_RESOURCE:
+                if h == H.EMPTY:
+                    B_p[P.MINE, p, h, a] += 0.6
+                    B_p[P.EXPLORE, p, h, a] += 0.3
+                    B_p[p, p, h, a] += 0.1
+                else:
+                    B_p[p, p, h, a] += 0.8
+                    B_p[P.EXPLORE, p, h, a] += 0.2
+                B_h[h, p, h, a] += 1.0
+
+            elif a == TaskPolicy.MINE:
+                if p == P.MINE and h == H.EMPTY:
+                    B_p[P.MINE, p, h, a] += 1.0
+                    B_h[H.HOLDING_RESOURCE, p, h, a] += 0.7
+                    B_h[H.EMPTY, p, h, a] += 0.3
+                elif p == P.MINE and h == H.HOLDING_RESOURCE:
+                    B_p[P.MINE, p, h, a] += 0.9
+                    B_p[P.DEPOSIT, p, h, a] += 0.1
+                    B_h[h, p, h, a] += 1.0
+                else:
+                    B_p[p, p, h, a] += 0.9
+                    B_p[P.EXPLORE, p, h, a] += 0.1
+                    B_h[h, p, h, a] += 1.0
+
+            elif a == TaskPolicy.NAV_DEPOT:
+                if h == H.HOLDING_RESOURCE:
+                    B_p[P.DEPOSIT, p, h, a] += 0.6
+                    B_p[p, p, h, a] += 0.4
+                else:
+                    B_p[p, p, h, a] += 0.8
+                    B_p[P.DEPOSIT, p, h, a] += 0.2
+                B_h[h, p, h, a] += 1.0
+
+            elif a == TaskPolicy.DEPOSIT:
+                if p == P.DEPOSIT and h == H.HOLDING_RESOURCE:
+                    B_p[P.CRAFT, p, h, a] += 0.5
+                    B_p[P.DEPOSIT, p, h, a] += 0.5
+                    B_h[H.EMPTY, p, h, a] += 0.7
+                    B_h[H.HOLDING_RESOURCE, p, h, a] += 0.3
+                else:
+                    B_p[p, p, h, a] += 0.9
+                    B_p[P.EXPLORE, p, h, a] += 0.1
+                    B_h[h, p, h, a] += 1.0
+
+            elif a == TaskPolicy.NAV_CRAFT:
+                if h == H.EMPTY:
+                    B_p[P.CRAFT, p, h, a] += 0.5
+                    B_p[p, p, h, a] += 0.4
+                    B_p[P.EXPLORE, p, h, a] += 0.1
+                else:
+                    B_p[p, p, h, a] += 0.8
+                    B_p[P.CRAFT, p, h, a] += 0.2
+                B_h[h, p, h, a] += 1.0
+
+            elif a == TaskPolicy.CRAFT:
+                if p == P.CRAFT and h == H.EMPTY:
+                    B_p[P.CRAFT, p, h, a] += 1.0
+                    B_h[H.HOLDING_GEAR, p, h, a] += 0.6
+                    B_h[H.EMPTY, p, h, a] += 0.4
+                elif p == P.CRAFT and h == H.HOLDING_GEAR:
+                    B_p[P.CRAFT, p, h, a] += 0.8
+                    B_p[P.GEAR, p, h, a] += 0.2
+                    B_h[h, p, h, a] += 1.0
+                else:
+                    B_p[p, p, h, a] += 0.9
+                    B_p[P.EXPLORE, p, h, a] += 0.1
+                    B_h[h, p, h, a] += 1.0
+
+            elif a == TaskPolicy.NAV_GEAR:
+                if h in (H.EMPTY, H.HOLDING_GEAR):
+                    B_p[P.GEAR, p, h, a] += 0.5
+                    B_p[p, p, h, a] += 0.4
+                    B_p[P.CRAFT, p, h, a] += 0.1
+                else:
+                    B_p[p, p, h, a] += 0.8
+                    B_p[P.GEAR, p, h, a] += 0.2
+                B_h[h, p, h, a] += 1.0
+
+            elif a == TaskPolicy.ACQUIRE_GEAR:
+                if p == P.GEAR:
+                    B_p[P.GEAR, p, h, a] += 1.0
+                    B_h[H.HOLDING_GEAR, p, h, a] += 0.7
+                    B_h[h, p, h, a] += 0.3
+                else:
+                    B_p[p, p, h, a] += 0.9
+                    B_p[P.GEAR, p, h, a] += 0.1
+                    B_h[h, p, h, a] += 1.0
+
+            elif a == TaskPolicy.NAV_JUNCTION:
+                if h == H.HOLDING_GEAR:
+                    B_p[P.CAPTURE, p, h, a] += 0.6
+                    B_p[p, p, h, a] += 0.4
+                else:
+                    B_p[p, p, h, a] += 0.8
+                    B_p[P.CAPTURE, p, h, a] += 0.2
+                B_h[h, p, h, a] += 1.0
+
+            elif a == TaskPolicy.CAPTURE:
+                if p == P.CAPTURE and h == H.HOLDING_GEAR:
+                    B_p[P.EXPLORE, p, h, a] += 0.4
+                    B_p[P.CAPTURE, p, h, a] += 0.6
+                    B_h[H.EMPTY, p, h, a] += 0.4
+                    B_h[H.HOLDING_GEAR, p, h, a] += 0.6
+                else:
+                    B_p[p, p, h, a] += 0.9
+                    B_p[P.EXPLORE, p, h, a] += 0.1
+                    B_h[h, p, h, a] += 1.0
+
+            elif a == TaskPolicy.EXPLORE:
+                B_p[p, p, h, a] += 0.7
+                B_p[P.EXPLORE, p, h, a] += 0.2
+                B_p[P.MINE, p, h, a] += 0.1
+                B_h[h, p, h, a] += 0.8
+                B_h[H.EMPTY, p, h, a] += 0.2
+
+            elif a == TaskPolicy.YIELD:
+                B_p[p, p, h, a] += 0.9
+                B_p[P.EXPLORE, p, h, a] += 0.1
+                B_h[h, p, h, a] += 1.0
+
+            elif a == TaskPolicy.WAIT:
+                B_p[p, p, h, a] += 0.95
+                B_p[P.EXPLORE, p, h, a] += 0.05
+                B_h[h, p, h, a] += 1.0
+
+
+def _fill_target(B_t, a):
+    """Set target_mode transition probabilities for action a.
+
+    Target mode changes only for NAV_JUNCTION and CAPTURE.
     """
-    si = state_index
+    T = TargetMode
 
-    if a == TaskPolicy.NAV_RESOURCE:
-        # Navigate toward extractor → transition toward MINE phase
-        if h == Hand.EMPTY:
-            B[si(Phase.MINE, Hand.EMPTY, t, r), s, a] = 0.6
-            B[si(Phase.EXPLORE, Hand.EMPTY, t, r), s, a] = 0.3
-            B[s, s, a] = 0.1
-        else:
-            # Can't mine if holding something — mostly self-transition
-            B[s, s, a] = 0.8
-            B[si(Phase.EXPLORE, h, t, r), s, a] = 0.2
-
-    elif a == TaskPolicy.MINE:
-        # Extract resources → hand changes to HOLDING_RESOURCE
-        if p == Phase.MINE and h == Hand.EMPTY:
-            B[si(Phase.MINE, Hand.HOLDING_RESOURCE, t, r), s, a] = 0.7
-            B[si(Phase.MINE, Hand.EMPTY, t, r), s, a] = 0.3
-        elif p == Phase.MINE and h == Hand.HOLDING_RESOURCE:
-            # Already holding — stay
-            B[s, s, a] = 0.9
-            B[si(Phase.DEPOSIT, Hand.HOLDING_RESOURCE, t, r), s, a] = 0.1
-        else:
-            # Not at mine — mostly self-transition
-            B[s, s, a] = 0.9
-            B[si(Phase.EXPLORE, h, t, r), s, a] = 0.1
-
-    elif a == TaskPolicy.NAV_DEPOT:
-        # Navigate toward hub → transition to DEPOSIT phase
-        if h == Hand.HOLDING_RESOURCE:
-            B[si(Phase.DEPOSIT, Hand.HOLDING_RESOURCE, t, r), s, a] = 0.6
-            B[s, s, a] = 0.3
-            B[si(p, Hand.HOLDING_RESOURCE, t, r), s, a] = 0.1
-        else:
-            B[s, s, a] = 0.8
-            B[si(Phase.DEPOSIT, h, t, r), s, a] = 0.2
-
-    elif a == TaskPolicy.DEPOSIT:
-        # Deposit resources at hub → hand becomes EMPTY
-        if p == Phase.DEPOSIT and h == Hand.HOLDING_RESOURCE:
-            B[si(Phase.CRAFT, Hand.EMPTY, t, r), s, a] = 0.5
-            B[si(Phase.DEPOSIT, Hand.EMPTY, t, r), s, a] = 0.2
-            B[si(Phase.DEPOSIT, Hand.HOLDING_RESOURCE, t, r), s, a] = 0.3
-        else:
-            B[s, s, a] = 0.9
-            B[si(Phase.EXPLORE, h, t, r), s, a] = 0.1
-
-    elif a == TaskPolicy.NAV_CRAFT:
-        # Navigate toward craft station → transition to CRAFT phase
-        if h == Hand.EMPTY:
-            B[si(Phase.CRAFT, Hand.EMPTY, t, r), s, a] = 0.5
-            B[s, s, a] = 0.4
-            B[si(Phase.EXPLORE, Hand.EMPTY, t, r), s, a] = 0.1
-        else:
-            B[s, s, a] = 0.8
-            B[si(Phase.CRAFT, h, t, r), s, a] = 0.2
-
-    elif a == TaskPolicy.CRAFT:
-        # Craft gear → hand changes to HOLDING_GEAR
-        if p == Phase.CRAFT and h == Hand.EMPTY:
-            B[si(Phase.CRAFT, Hand.HOLDING_GEAR, t, r), s, a] = 0.6
-            B[si(Phase.CRAFT, Hand.EMPTY, t, r), s, a] = 0.4
-        elif p == Phase.CRAFT and h == Hand.HOLDING_GEAR:
-            B[s, s, a] = 0.8
-            B[si(Phase.GEAR, Hand.HOLDING_GEAR, t, r), s, a] = 0.2
-        else:
-            B[s, s, a] = 0.9
-            B[si(Phase.EXPLORE, h, t, r), s, a] = 0.1
-
-    elif a == TaskPolicy.NAV_GEAR:
-        # Navigate to gear pickup → transition to GEAR phase
-        if h in (Hand.EMPTY, Hand.HOLDING_GEAR):
-            B[si(Phase.GEAR, Hand.HOLDING_GEAR, t, r), s, a] = 0.5
-            B[s, s, a] = 0.4
-            B[si(Phase.CRAFT, h, t, r), s, a] = 0.1
-        else:
-            B[s, s, a] = 0.8
-            B[si(Phase.GEAR, h, t, r), s, a] = 0.2
-
-    elif a == TaskPolicy.ACQUIRE_GEAR:
-        # Pick up gear → hand becomes HOLDING_GEAR
-        if p == Phase.GEAR:
-            B[si(Phase.GEAR, Hand.HOLDING_GEAR, t, r), s, a] = 0.7
-            B[si(Phase.GEAR, h, t, r), s, a] = 0.3
-        else:
-            B[s, s, a] = 0.9
-            B[si(Phase.GEAR, h, t, r), s, a] = 0.1
-
-    elif a == TaskPolicy.NAV_JUNCTION:
-        # Navigate toward junction → transition to CAPTURE phase
-        # Target_mode may change (approach contested junction)
-        if h == Hand.HOLDING_GEAR:
-            if t == TargetMode.FREE:
-                B[si(Phase.CAPTURE, Hand.HOLDING_GEAR, TargetMode.FREE, r), s, a] = 0.5
-                B[si(Phase.CAPTURE, Hand.HOLDING_GEAR, TargetMode.CONTESTED, r), s, a] = 0.1
-            elif t == TargetMode.CONTESTED:
-                B[si(Phase.CAPTURE, Hand.HOLDING_GEAR, TargetMode.CONTESTED, r), s, a] = 0.5
-                B[si(Phase.CAPTURE, Hand.HOLDING_GEAR, TargetMode.FREE, r), s, a] = 0.1
-            else:  # LOST
-                B[si(Phase.CAPTURE, Hand.HOLDING_GEAR, TargetMode.CONTESTED, r), s, a] = 0.4
-                B[si(Phase.CAPTURE, Hand.HOLDING_GEAR, TargetMode.LOST, r), s, a] = 0.2
-            B[s, s, a] = 0.4
-        else:
-            B[s, s, a] = 0.8
-            B[si(Phase.CAPTURE, h, t, r), s, a] = 0.2
+    if a == TaskPolicy.NAV_JUNCTION:
+        # Approaching junction — might discover contest status
+        B_t[T.FREE, T.FREE, a] = 0.8
+        B_t[T.CONTESTED, T.FREE, a] = 0.2
+        B_t[T.FREE, T.CONTESTED, a] = 0.2
+        B_t[T.CONTESTED, T.CONTESTED, a] = 0.7
+        B_t[T.LOST, T.CONTESTED, a] = 0.1
+        B_t[T.CONTESTED, T.LOST, a] = 0.4
+        B_t[T.LOST, T.LOST, a] = 0.6
 
     elif a == TaskPolicy.CAPTURE:
-        # Capture junction → cycle resets to EXPLORE/EMPTY
-        # Target_mode may improve (CONTESTED→FREE, LOST→CONTESTED)
-        if p == Phase.CAPTURE and h == Hand.HOLDING_GEAR:
-            if t == TargetMode.FREE:
-                B[si(Phase.EXPLORE, Hand.EMPTY, TargetMode.FREE, r), s, a] = 0.5
-                B[si(Phase.CAPTURE, Hand.HOLDING_GEAR, TargetMode.FREE, r), s, a] = 0.5
-            elif t == TargetMode.CONTESTED:
-                B[si(Phase.EXPLORE, Hand.EMPTY, TargetMode.FREE, r), s, a] = 0.3
-                B[si(Phase.CAPTURE, Hand.HOLDING_GEAR, TargetMode.CONTESTED, r), s, a] = 0.5
-                B[si(Phase.CAPTURE, Hand.HOLDING_GEAR, TargetMode.LOST, r), s, a] = 0.2
-            else:  # LOST
-                B[si(Phase.CAPTURE, Hand.HOLDING_GEAR, TargetMode.CONTESTED, r), s, a] = 0.4
-                B[si(Phase.CAPTURE, Hand.HOLDING_GEAR, TargetMode.LOST, r), s, a] = 0.5
-                B[si(Phase.EXPLORE, Hand.EMPTY, TargetMode.LOST, r), s, a] = 0.1
-        else:
-            B[s, s, a] = 0.9
-            B[si(Phase.EXPLORE, h, t, r), s, a] = 0.1
+        # Capture attempt — may improve contest status
+        B_t[T.FREE, T.FREE, a] = 1.0
+        B_t[T.FREE, T.CONTESTED, a] = 0.4
+        B_t[T.CONTESTED, T.CONTESTED, a] = 0.4
+        B_t[T.LOST, T.CONTESTED, a] = 0.2
+        B_t[T.CONTESTED, T.LOST, a] = 0.3
+        B_t[T.LOST, T.LOST, a] = 0.7
 
-    elif a == TaskPolicy.EXPLORE:
-        # Exploration — self-transition with slow drift
-        B[s, s, a] = 0.7
-        B[si(Phase.EXPLORE, Hand.EMPTY, t, r), s, a] = 0.2
-        B[si(Phase.MINE, Hand.EMPTY, t, r), s, a] = 0.1
-
-    elif a == TaskPolicy.YIELD:
-        # Give way — self-transition (stay put, let teammate act)
-        B[s, s, a] = 0.9
-        B[si(Phase.EXPLORE, h, t, r), s, a] = 0.1
-
-    elif a == TaskPolicy.WAIT:
-        # Wait — near-complete self-transition
-        B[s, s, a] = 0.95
-        B[si(Phase.EXPLORE, h, t, r), s, a] = 0.05
-
-    # Normalise column
-    col_sum = B[:, s, a].sum()
-    if col_sum > 0:
-        B[:, s, a] /= col_sum
+    else:
+        # All other actions: target_mode unchanged (identity)
+        for t in T:
+            B_t[t, t, a] = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -369,18 +415,61 @@ def build_C() -> list[np.ndarray]:
     return [c_res, c_sta, c_inv, c_con, c_soc, c_role]
 
 
+def build_C_miner() -> list[np.ndarray]:
+    """Preferences for miner role — maximize resource gathering and depositing.
+
+    Miners focus on the extractor→hub loop: find resources, mine them,
+    deposit at hub, repeat. Avoids junctions and combat.
+    """
+    c_res = np.array([0.0, 1.0, 3.0])           # AT resource is best
+    c_sta = np.array([0.0, 2.0, 0.5, 0.0])      # HUB best (deposit), ignore junction
+    c_inv = np.array([-0.5, 2.0, 0.0])           # prefer HOLDING_RESOURCE, penalize EMPTY
+    c_con = np.array([0.5, 0.0, 0.0])            # prefer FREE (avoid combat)
+    c_soc = np.array([0.0, 0.5, -0.5, 0.0])     # ALONE, ALLY, ENEMY, BOTH
+    c_role = np.array([0.3, 0.0])                # SAME_ROLE, DIFFERENT
+    return [c_res, c_sta, c_inv, c_con, c_soc, c_role]
+
+
+def build_C_aligner() -> list[np.ndarray]:
+    """Preferences for aligner role — maximize junction capture.
+
+    Aligners focus on the hub→craft→junction chain: craft gear at stations,
+    then navigate to junctions and capture them. Strongly prefers junctions.
+    """
+    c_res = np.array([0.0, 0.0, 0.5])           # don't care much about resources
+    c_sta = np.array([0.0, 1.0, 2.0, 4.0])      # JUNCTION is best, CRAFT second
+    c_inv = np.array([0.0, 0.5, 3.0])            # HOLDING_GEAR is best
+    c_con = np.array([2.0, -0.5, -2.0])          # strongly prefer FREE junctions
+    c_soc = np.array([0.0, 1.0, -1.0, 0.0])     # prefer allies, avoid enemies
+    c_role = np.array([0.3, 0.0])                # SAME_ROLE, DIFFERENT
+    return [c_res, c_sta, c_inv, c_con, c_soc, c_role]
+
+
 # ---------------------------------------------------------------------------
-# D vector (initial state prior)
+# D vectors (initial state prior) — factored
 # ---------------------------------------------------------------------------
 
 def build_D() -> list[np.ndarray]:
-    """Initial state prior: spread across EXPLORE/EMPTY/FREE + all roles."""
-    D = np.full(NUM_STATES, 0.001)
-    # Equal prior across roles in EXPLORE/EMPTY/FREE
-    for r in Role:
-        D[state_index(Phase.EXPLORE, Hand.EMPTY, TargetMode.FREE, r)] = 0.2
-    D /= D.sum()
-    return [D]
+    """Initial state prior, factored over 4 state factors."""
+    # Phase prior: peaked on EXPLORE
+    d_phase = np.full(NUM_PHASES, 0.02)
+    d_phase[Phase.EXPLORE] = 0.9
+    d_phase /= d_phase.sum()
+
+    # Hand prior: peaked on EMPTY
+    d_hand = np.full(NUM_HANDS, 0.02)
+    d_hand[Hand.EMPTY] = 0.96
+    d_hand /= d_hand.sum()
+
+    # Target mode prior: peaked on FREE
+    d_target = np.full(NUM_TARGET_MODES, 0.05)
+    d_target[TargetMode.FREE] = 0.9
+    d_target /= d_target.sum()
+
+    # Role prior: uniform (agent doesn't know its role yet)
+    d_role = np.ones(NUM_ROLES) / NUM_ROLES
+
+    return [d_phase, d_hand, d_target, d_role]
 
 
 # ---------------------------------------------------------------------------
@@ -388,21 +477,21 @@ def build_D() -> list[np.ndarray]:
 # ---------------------------------------------------------------------------
 
 class CogsGuardPOMDP:
-    """CogsGuard POMDP generative model.
+    """CogsGuard POMDP generative model (factored).
 
-    Wraps A/B/C/D matrices and provides utilities for creating pymdp agents,
-    loading fitted parameters, and inspecting the model.
+    Uses a factored state representation: [phase(6), hand(3), target_mode(3), role(4)]
+    with dependency-aware A and B matrices for pymdp 1.0.
 
     Parameters
     ----------
     A : list[np.ndarray] | None
         Observation likelihood matrices. Default: hand-crafted.
     B : list[np.ndarray] | None
-        Transition matrices. Default: hand-crafted.
+        Transition matrices (4 factors). Default: hand-crafted.
     C : list[np.ndarray] | None
         Preference vectors. Default: economy-chain preferences.
     D : list[np.ndarray] | None
-        Initial state prior. Default: EXPLORE/EMPTY/FREE.
+        Initial state prior (4 factors). Default: peaked on EXPLORE/EMPTY/FREE.
     """
 
     def __init__(self, A=None, B=None, C=None, D=None):
@@ -412,8 +501,34 @@ class CogsGuardPOMDP:
         self.D = D if D is not None else build_D()
 
     @classmethod
+    def for_role(cls, role: str) -> "CogsGuardPOMDP":
+        """Create a role-specialized POMDP with tuned C preferences.
+
+        Parameters
+        ----------
+        role : str
+            "miner" (extractor→hub loop) or "aligner" (craft→junction capture).
+            Any other value returns the default (generalist) model.
+        """
+        if role == "miner":
+            D = build_D()
+            # Miner: role prior peaked on GATHERER
+            D[3] = np.full(NUM_ROLES, 0.02)
+            D[3][Role.GATHERER] = 0.94
+            D[3] /= D[3].sum()
+            return cls(C=build_C_miner(), D=D)
+        elif role == "aligner":
+            D = build_D()
+            # Aligner: role prior peaked on CAPTURER
+            D[3] = np.full(NUM_ROLES, 0.02)
+            D[3][Role.CAPTURER] = 0.94
+            D[3] /= D[3].sum()
+            return cls(C=build_C_aligner(), D=D)
+        return cls()
+
+    @classmethod
     def uniform(cls) -> "CogsGuardPOMDP":
-        """Model with uniform (uninformative) A and B matrices."""
+        """Model with uniform (uninformative) A and identity B matrices."""
         return cls(A=build_uniform_A(), B=build_uniform_B())
 
     @classmethod
@@ -424,7 +539,7 @@ class CogsGuardPOMDP:
         """
         data = np.load(str(path))
         A = [data[f"A_{i}"] for i in range(len(NUM_OBS))]
-        B = [data["B_0"]]
+        B = [data[f"B_{i}"] for i in range(len(B_DEPENDENCIES))]
         return cls(A=A, B=B)
 
     def save(self, path: str | Path):
@@ -439,29 +554,47 @@ class CogsGuardPOMDP:
     def create_agent(self, **kwargs):
         """Create a ``pymdp.agent.Agent`` (JAX) from this generative model.
 
-        Uses the JAX-based Agent from inferactively-pymdp v1.0.
-        Numpy A/B/C/D are auto-converted to JAX arrays by the constructor.
-
-        Additional keyword arguments are forwarded to the Agent constructor
-        (e.g. ``policy_len``, ``inference_algo``, ``use_states_info_gain``).
+        Uses factored state representation with constrained policies
+        (all 4 factors share the same 13-action control space).
         """
+        import jax.numpy as jnp
         from pymdp.agent import Agent
 
+        A = [jnp.array(a) for a in self.A]
+        B = [jnp.array(b) for b in self.B]
+        C = [jnp.array(c) for c in self.C]
+        D = [jnp.array(d) for d in self.D]
+
+        # Constrained policies: all 4 factors take the SAME action.
+        # policy_len=2 → shape (169, 2, 4) — 13*13 two-step policies
+        policy_len = kwargs.pop("policy_len", 2)
+        pol_list = []
+        if policy_len == 1:
+            for a1 in range(NUM_ACTIONS):
+                pol_list.append([[a1, a1, a1, a1]])
+        else:
+            for a1 in range(NUM_ACTIONS):
+                for a2 in range(NUM_ACTIONS):
+                    pol_list.append([[a1, a1, a1, a1], [a2, a2, a2, a2]])
+        policies = jnp.array(pol_list)
+
         defaults = {
-            "policy_len": 2,
+            "A_dependencies": A_DEPENDENCIES,
+            "B_dependencies": B_DEPENDENCIES,
+            "num_controls": [NUM_ACTIONS, NUM_ACTIONS, NUM_ACTIONS, NUM_ACTIONS],
+            "policies": policies,
+            "sampling_mode": "full",
+            "policy_len": policy_len,
             "inference_algo": "fpi",
+            "num_iter": 16,
+            "use_utility": True,
             "use_states_info_gain": True,
             "use_param_info_gain": False,
             "action_selection": "deterministic",
+            "gamma": 16.0,
         }
         defaults.update(kwargs)
-        return Agent(
-            A=self.A,
-            B=self.B,
-            C=self.C,
-            D=self.D,
-            **defaults,
-        )
+        return Agent(A=A, B=B, C=C, D=D, **defaults)
 
     def summary(self) -> str:
         """Human-readable model summary."""
@@ -471,19 +604,18 @@ class CogsGuardPOMDP:
             f"{n}({s})" for n, s in zip(obs_names, NUM_OBS)
         )
         lines = [
-            "CogsGuard POMDP",
-            f"  States:    {NUM_STATES} (phase={NUM_PHASES} x hand={NUM_HANDS}"
-            f" x target_mode={NUM_TARGET_MODES} x role={NUM_ROLES})",
+            "CogsGuard POMDP (factored)",
+            f"  State factors: {NUM_STATE_FACTORS} "
+            f"(phase={NUM_PHASES} x hand={NUM_HANDS}"
+            f" x target_mode={NUM_TARGET_MODES} x role={NUM_ROLES})"
+            f" = {NUM_STATES} total states",
             f"  Obs:       {len(self.A)} modalities — {obs_desc}",
             f"  Actions:   {NUM_ACTIONS} task-level policies ({', '.join(ACTION_NAMES)})",
             f"  A shapes:  {[a.shape for a in self.A]}",
             f"  B shapes:  {[b.shape for b in self.B]}",
             f"  C shapes:  {[c.shape for c in self.C]}",
             f"  D shapes:  {[d.shape for d in self.D]}",
+            f"  A_deps:    {A_DEPENDENCIES}",
+            f"  B_deps:    {B_DEPENDENCIES}",
         ]
-        # Sample state labels
-        lines.append("  State labels (first 12):")
-        for s in range(min(12, NUM_STATES)):
-            lines.append(f"    {s:3d}: {state_label(s)}")
-        lines.append(f"    ...")
         return "\n".join(lines)

@@ -201,32 +201,34 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
         # 2. Discretize -> 6-tuple (o_res, o_sta, o_inv, o_contest, o_social, o_role)
         disc_obs = self._discretizer.discretize_obs(obs_array)
 
-        # 3. Convert to jax arrays with (batch, T) dims for JAX Agent
+        # 3. Convert to jax arrays — shape (batch=1, T=1) per modality
+        # pymdp FPI takes x[-1] along time dim, so T=1 is required
         jax_obs = [jnp.array([[int(o)]]) for o in disc_obs]
 
-        # 4. Belief update via pymdp JAX
+        # 4. Belief update via pymdp JAX (factored)
         qs = state.agent.infer_states(jax_obs, empirical_prior=state.empirical_prior)
 
         # 5. Policy inference — EFE over 13 task-level policies
         q_pi, efe = state.agent.infer_policies(qs)
 
-        # 6. Select best task policy
-        task_policy = int(jnp.argmax(q_pi[0]))
+        # 6. Select best task policy via sample_action
+        sampled = state.agent.sample_action(q_pi)  # (batch=1, n_factors=4)
+        task_policy = int(sampled[0, 0])  # all factors share same action
 
         # 7. Execute selected task policy via navigator
         action, state = self._execute_task_policy(task_policy, obs, state)
 
-        # 8. Update empirical prior with selected task policy
-        pomdp_action = jnp.array([[task_policy]])
-        result = state.agent.update_empirical_prior(pomdp_action, qs)
-        # pymdp alpha returns (pred, qs), v1.0.0 returns just pred
-        state.empirical_prior = result[0] if isinstance(result, tuple) else result
+        # 8. Update empirical prior (4 factors, same action for all)
+        pomdp_action = jnp.array([[task_policy, task_policy, task_policy, task_policy]])
+        pred, _qs = state.agent.update_empirical_prior(pomdp_action, qs)
+        state.empirical_prior = pred
         state.qs = qs
 
-        # Track for logging
-        beliefs = np.asarray(qs[0][0, -1, :])
-        best_state = int(np.argmax(beliefs))
-        state.last_phase, state.last_hand, _, _ = state_factors(best_state)
+        # Track for logging — beliefs are per-factor, shape (batch, T, n_states_f)
+        phase_beliefs = np.asarray(qs[0][0, -1])  # last timestep
+        hand_beliefs = np.asarray(qs[1][0, -1])
+        state.last_phase = int(np.argmax(phase_beliefs))
+        state.last_hand = int(np.argmax(hand_beliefs))
         state.last_task_policy = task_policy
         state.step_count += 1
 
@@ -450,20 +452,24 @@ class AIFPolicy(_MultiAgentPolicy):
 
         self._discretizer = ObservationDiscretizer(feat_names, tag_categories)
 
-        # Load fitted model if path provided, otherwise hand-crafted
-        if model_path:
-            self._pomdp = CogsGuardPOMDP.from_fitted(model_path)
-        else:
-            self._pomdp = CogsGuardPOMDP()
-
+        # Load fitted model if path provided, otherwise use role-specialization
+        self._model_path = model_path
         self._agents: dict[int, _StatefulAgentPolicy] = {}
+
+    def _pomdp_for_agent(self, agent_id: int) -> CogsGuardPOMDP:
+        """Create role-specific POMDP: even agents mine, odd agents align."""
+        if self._model_path:
+            return CogsGuardPOMDP.from_fitted(self._model_path)
+        role = "miner" if agent_id % 2 == 0 else "aligner"
+        return CogsGuardPOMDP.for_role(role)
 
     def agent_policy(self, agent_id: int) -> _StatefulAgentPolicy:
         if agent_id not in self._agents:
+            pomdp = self._pomdp_for_agent(agent_id)
             impl = AIFCogPolicyImpl(
                 self._policy_env_info,
                 agent_id,
-                self._pomdp,
+                pomdp,
                 self._discretizer,
             )
             self._agents[agent_id] = _StatefulAgentPolicy(

@@ -35,7 +35,10 @@ from aif_meta_cogames.aif_agent.discretizer import (
     ObservationDiscretizer,
 )
 from aif_meta_cogames.aif_agent.generative_model import (
+    A_DEPENDENCIES,
+    B_DEPENDENCIES,
     CogsGuardPOMDP,
+    NUM_STATE_FACTORS,
     build_default_A,
     build_default_B,
     build_C,
@@ -395,40 +398,88 @@ class TestGenerativeModel:
     def test_A_shapes(self):
         A = build_default_A()
         assert len(A) == 6
-        for m, a in enumerate(A):
-            assert a.shape == (NUM_OBS[m], NUM_STATES)
+        # Each A[m] shape: (n_obs_m, *dep_factor_dims)
+        expected_shapes = [
+            (3, 6),       # resource depends on phase
+            (4, 6),       # station depends on phase
+            (3, 3),       # inventory depends on hand
+            (3, 3),       # contest depends on target_mode
+            (4, 4, 3),   # social depends on role, target_mode
+            (2, 4),       # role_signal depends on role
+        ]
+        for m, (a, expected) in enumerate(zip(A, expected_shapes)):
+            assert a.shape == expected, f"A[{m}] shape {a.shape} != {expected}"
 
     def test_A_normalised(self):
         A = build_default_A()
-        for a in A:
+        for m, a in enumerate(A):
+            # Columns (first axis) should sum to 1
             col_sums = a.sum(axis=0)
-            np.testing.assert_allclose(col_sums, 1.0, atol=1e-10)
+            np.testing.assert_allclose(col_sums, 1.0, atol=1e-10,
+                                       err_msg=f"A[{m}] columns not normalised")
 
-    def test_B_shape(self):
+    def test_B_shapes(self):
         B = build_default_B()
-        assert len(B) == 1
-        assert B[0].shape == (NUM_STATES, NUM_STATES, NUM_ACTIONS)
+        assert len(B) == 4  # 4 state factors
+        # B[f] shape: (n_states_f', *dep_dims, n_actions)
+        expected_shapes = [
+            (6, 6, 3, 13),   # phase: (p', p, h, actions)
+            (3, 6, 3, 13),   # hand: (h', p, h, actions)
+            (3, 3, 13),      # target: (t', t, actions)
+            (4, 4, 13),      # role: (r', r, actions)
+        ]
+        for f, (b, expected) in enumerate(zip(B, expected_shapes)):
+            assert b.shape == expected, f"B[{f}] shape {b.shape} != {expected}"
 
     def test_B_normalised(self):
         B = build_default_B()
-        for s in range(NUM_STATES):
+        # B_phase: columns over (phase, hand, action)
+        for p in range(NUM_PHASES):
+            for h in range(NUM_HANDS):
+                for a in range(NUM_ACTIONS):
+                    col_sum = B[0][:, p, h, a].sum()
+                    assert abs(col_sum - 1.0) < 1e-10, (
+                        f"B_phase column p={p}, h={h}, a={TASK_POLICY_NAMES[a]} "
+                        f"sums to {col_sum}"
+                    )
+        # B_hand: columns over (phase, hand, action)
+        for p in range(NUM_PHASES):
+            for h in range(NUM_HANDS):
+                for a in range(NUM_ACTIONS):
+                    col_sum = B[1][:, p, h, a].sum()
+                    assert abs(col_sum - 1.0) < 1e-10, (
+                        f"B_hand column p={p}, h={h}, a={TASK_POLICY_NAMES[a]} "
+                        f"sums to {col_sum}"
+                    )
+        # B_target: columns over (target, action)
+        for t in range(NUM_TARGET_MODES):
             for a in range(NUM_ACTIONS):
-                col_sum = B[0][:, s, a].sum()
+                col_sum = B[2][:, t, a].sum()
                 assert abs(col_sum - 1.0) < 1e-10, (
-                    f"B column for state={state_label(s)}, action={TASK_POLICY_NAMES[a]} "
+                    f"B_target column t={t}, a={TASK_POLICY_NAMES[a]} "
                     f"sums to {col_sum}"
                 )
+        # B_role: identity for all actions
+        for r in range(NUM_ROLES):
+            for a in range(NUM_ACTIONS):
+                col_sum = B[3][:, r, a].sum()
+                assert abs(col_sum - 1.0) < 1e-10
 
     def test_B_is_action_dependent(self):
         """B must be action-dependent — different task policies produce different transitions."""
-        B = build_default_B()[0]
-        s = state_index(Phase.EXPLORE, Hand.EMPTY, TargetMode.FREE, Role.GATHERER)
-        # NAV_RESOURCE should have different transitions than WAIT
-        nav_col = B[:, s, TaskPolicy.NAV_RESOURCE]
-        wait_col = B[:, s, TaskPolicy.WAIT]
+        B_phase = build_default_B()[0]
+        # NAV_RESOURCE should differ from WAIT for EXPLORE/EMPTY
+        nav_col = B_phase[:, Phase.EXPLORE, Hand.EMPTY, TaskPolicy.NAV_RESOURCE]
+        wait_col = B_phase[:, Phase.EXPLORE, Hand.EMPTY, TaskPolicy.WAIT]
         assert not np.allclose(nav_col, wait_col), (
-            "B must be action-dependent: NAV_RESOURCE and WAIT should differ"
+            "B_phase must be action-dependent: NAV_RESOURCE and WAIT should differ"
         )
+
+    def test_B_role_is_identity(self):
+        """Role should never change (identity transition for all actions)."""
+        B_role = build_default_B()[3]
+        for a in range(NUM_ACTIONS):
+            np.testing.assert_allclose(B_role[:, :, a], np.eye(NUM_ROLES), atol=1e-10)
 
     def test_C_shapes(self):
         C = build_C()
@@ -436,23 +487,19 @@ class TestGenerativeModel:
         for m, c in enumerate(C):
             assert c.shape == (NUM_OBS[m],)
 
-    def test_D_shape_and_normalisation(self):
+    def test_D_shapes_and_normalisation(self):
         D = build_D()
-        assert len(D) == 1
-        assert D[0].shape == (NUM_STATES,)
-        np.testing.assert_allclose(D[0].sum(), 1.0, atol=1e-10)
+        assert len(D) == 4  # 4 state factors
+        expected_sizes = NUM_STATE_FACTORS  # [6, 3, 3, 4]
+        for f, d in enumerate(D):
+            assert d.shape == (expected_sizes[f],), f"D[{f}] shape {d.shape}"
+            np.testing.assert_allclose(d.sum(), 1.0, atol=1e-10)
 
     def test_D_peaks_at_explore_empty_free(self):
         D = build_D()
-        # Should have highest mass across EXPLORE/EMPTY/FREE for all roles
-        explore_empty_free = [
-            state_index(Phase.EXPLORE, Hand.EMPTY, TargetMode.FREE, r)
-            for r in Role
-        ]
-        for s in explore_empty_free:
-            assert D[0][s] > D[0].mean(), (
-                f"D[{state_label(s)}] should be above average"
-            )
+        assert D[0][Phase.EXPLORE] > D[0].mean()     # phase peaks at EXPLORE
+        assert D[1][Hand.EMPTY] > D[1].mean()         # hand peaks at EMPTY
+        assert D[2][TargetMode.FREE] > D[2].mean()    # target peaks at FREE
 
     def test_uniform_A_is_uniform(self):
         A = build_uniform_A()
@@ -469,9 +516,9 @@ class TestCogsGuardPOMDP:
     def test_default_construction(self):
         model = CogsGuardPOMDP()
         assert len(model.A) == 6
-        assert len(model.B) == 1
+        assert len(model.B) == 4  # 4 state factors
         assert len(model.C) == 6
-        assert len(model.D) == 1
+        assert len(model.D) == 4  # 4 state factors
 
     def test_uniform_construction(self):
         model = CogsGuardPOMDP.uniform()
@@ -487,11 +534,12 @@ class TestCogsGuardPOMDP:
         loaded = CogsGuardPOMDP.from_fitted(save_path)
         for m in range(6):
             np.testing.assert_array_almost_equal(model.A[m], loaded.A[m])
-        np.testing.assert_array_almost_equal(model.B[0], loaded.B[0])
+        for f in range(4):
+            np.testing.assert_array_almost_equal(model.B[f], loaded.B[f])
 
     def test_summary(self):
         model = CogsGuardPOMDP()
         text = model.summary()
         assert "216" in text
-        assert "EXPLORE/EMPTY/FREE/GATHERER" in text
+        assert "factored" in text.lower()
         assert "13" in text

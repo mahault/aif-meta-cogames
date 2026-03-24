@@ -36,10 +36,13 @@ except ImportError:
 from aif_meta_cogames.aif_agent.discretizer import (
     Hand,
     Phase,
-    state_factors,
-    state_index,
+    Role,
+    TargetMode,
 )
-from aif_meta_cogames.aif_agent.generative_model import CogsGuardPOMDP
+from aif_meta_cogames.aif_agent.generative_model import (
+    CogsGuardPOMDP,
+    NUM_STATE_FACTORS,
+)
 
 
 class TestBuildTagCategories:
@@ -112,51 +115,51 @@ class TestBuildTagCategories:
 
 
 class TestGoalSelectionLogic:
-    """Test the navigation target selection from beliefs."""
+    """Test the navigation target selection from factored beliefs."""
 
     def test_holding_gear_goes_to_junction(self):
         """When belief says HOLDING_GEAR, target should be junction."""
-        qs = np.zeros(18)
-        qs[state_index(Phase.CAPTURE, Hand.HOLDING_GEAR)] = 0.9
-        qs[state_index(Phase.EXPLORE, Hand.EMPTY)] = 0.1
+        phase_qs = np.zeros(6)
+        phase_qs[Phase.CAPTURE] = 0.9
+        phase_qs[Phase.EXPLORE] = 0.1
+        hand_qs = np.zeros(3)
+        hand_qs[Hand.HOLDING_GEAR] = 1.0
 
-        best = int(np.argmax(qs))
-        phase, hand = state_factors(best)
-        assert phase == Phase.CAPTURE
-        assert hand == Hand.HOLDING_GEAR
+        assert int(np.argmax(phase_qs)) == Phase.CAPTURE
+        assert int(np.argmax(hand_qs)) == Hand.HOLDING_GEAR
 
     def test_holding_resource_goes_to_hub(self):
         """When belief says HOLDING_RESOURCE, target should be hub."""
-        qs = np.zeros(18)
-        qs[state_index(Phase.DEPOSIT, Hand.HOLDING_RESOURCE)] = 0.9
-        qs[state_index(Phase.EXPLORE, Hand.EMPTY)] = 0.1
+        phase_qs = np.zeros(6)
+        phase_qs[Phase.DEPOSIT] = 0.9
+        phase_qs[Phase.EXPLORE] = 0.1
+        hand_qs = np.zeros(3)
+        hand_qs[Hand.HOLDING_RESOURCE] = 1.0
 
-        best = int(np.argmax(qs))
-        phase, hand = state_factors(best)
-        assert phase == Phase.DEPOSIT
-        assert hand == Hand.HOLDING_RESOURCE
+        assert int(np.argmax(phase_qs)) == Phase.DEPOSIT
+        assert int(np.argmax(hand_qs)) == Hand.HOLDING_RESOURCE
 
     def test_empty_explore_goes_to_extractor(self):
         """When empty-handed and exploring, target should be extractor."""
-        qs = np.zeros(18)
-        qs[state_index(Phase.EXPLORE, Hand.EMPTY)] = 0.95
-        qs[state_index(Phase.MINE, Hand.EMPTY)] = 0.05
+        phase_qs = np.zeros(6)
+        phase_qs[Phase.EXPLORE] = 0.95
+        phase_qs[Phase.MINE] = 0.05
+        hand_qs = np.zeros(3)
+        hand_qs[Hand.EMPTY] = 1.0
 
-        best = int(np.argmax(qs))
-        phase, hand = state_factors(best)
-        assert phase == Phase.EXPLORE
-        assert hand == Hand.EMPTY
+        assert int(np.argmax(phase_qs)) == Phase.EXPLORE
+        assert int(np.argmax(hand_qs)) == Hand.EMPTY
 
     def test_craft_phase_goes_to_craft_station(self):
         """When in CRAFT phase with empty hand, target craft station."""
-        qs = np.zeros(18)
-        qs[state_index(Phase.CRAFT, Hand.EMPTY)] = 0.8
-        qs[state_index(Phase.EXPLORE, Hand.EMPTY)] = 0.2
+        phase_qs = np.zeros(6)
+        phase_qs[Phase.CRAFT] = 0.8
+        phase_qs[Phase.EXPLORE] = 0.2
+        hand_qs = np.zeros(3)
+        hand_qs[Hand.EMPTY] = 1.0
 
-        best = int(np.argmax(qs))
-        phase, hand = state_factors(best)
-        assert phase == Phase.CRAFT
-        assert hand == Hand.EMPTY
+        assert int(np.argmax(phase_qs)) == Phase.CRAFT
+        assert int(np.argmax(hand_qs)) == Hand.EMPTY
 
 
 @pytest.mark.skipif(not HAS_PYMDP, reason="pymdp (JAX) not installed")
@@ -167,64 +170,79 @@ class TestPOMDPAgentCreation:
         model = CogsGuardPOMDP()
         agent = model.create_agent(policy_len=2, use_states_info_gain=True)
 
-        # JAX Agent has batch dimension on A/B matrices
-        assert len(agent.A) == 3  # 3 observation modalities
-        assert agent.A[0].shape == (1, 3, 18)   # (batch, o_resource, states)
-        assert agent.A[1].shape == (1, 4, 18)   # (batch, o_station, states)
-        assert agent.A[2].shape == (1, 3, 18)   # (batch, o_inventory, states)
-        assert agent.B[0].shape == (1, 18, 18, 5)  # (batch, s', s, actions)
+        # JAX Agent adds batch dimension to A/B matrices
+        assert len(agent.A) == 6  # 6 observation modalities
+        # A shapes: (batch, n_obs, *dep_factor_dims)
+        assert agent.A[0].shape == (1, 3, 6)   # (batch, o_resource, phase)
+        assert agent.A[1].shape == (1, 4, 6)   # (batch, o_station, phase)
+        assert agent.A[2].shape == (1, 3, 3)   # (batch, o_inventory, hand)
+        assert agent.A[3].shape == (1, 3, 3)   # (batch, o_contest, target_mode)
+        assert agent.A[4].shape == (1, 4, 4, 3)  # (batch, o_social, role, target_mode)
+        assert agent.A[5].shape == (1, 2, 4)   # (batch, o_role_signal, role)
+
+        # B shapes: (batch, n_states_f', *dep_dims, n_controls_f)
+        assert len(agent.B) == 4  # 4 state factors
+        assert agent.B[0].shape == (1, 6, 6, 3, 13)  # phase: (batch, p', p, h, actions)
+        assert agent.B[1].shape == (1, 3, 6, 3, 13)  # hand: (batch, h', p, h, actions)
+        assert agent.B[2].shape == (1, 3, 3, 13)      # target: (batch, t', t, actions)
+        assert agent.B[3].shape == (1, 4, 4, 13)      # role: (batch, r', r, actions)
 
     def test_agent_inference_loop(self):
         """Test the full pymdp JAX inference cycle."""
         model = CogsGuardPOMDP()
         agent = model.create_agent(policy_len=2, use_states_info_gain=True)
 
-        # Observe: NONE resource, NONE station, EMPTY inventory
-        # Shape: (batch=1, T=1) per modality — Agent converts to one-hot
-        obs = [jnp.array([[0]]), jnp.array([[0]]), jnp.array([[0]])]
+        # Observe: all zeros (NONE/NONE/EMPTY/FREE/ALONE/SAME)
+        # Shape: (batch=1,) per modality
+        obs = [jnp.array([[0]]) for _ in range(6)]
         qs = agent.infer_states(obs, empirical_prior=agent.D)
 
-        # qs[0] shape: (batch=1, T=1, n_states=18)
-        assert qs[0].shape == (1, 1, 18)
+        # qs is a list of 4 factors
+        assert len(qs) == 4
+        # Each qs[f] shape: (batch=1, T=1, n_states_f)
+        assert qs[0].shape[0] == 1  # batch
+        assert qs[0].shape[-1] == 6  # phase states
+        assert qs[1].shape[-1] == 3  # hand states
 
         # Compute EFE
         q_pi, G = agent.infer_policies(qs)
         assert q_pi is not None
         assert G is not None
 
-        # Sample action (deterministic, no rng_key needed)
+        # Sample action
         action = agent.sample_action(q_pi)
-        # action shape: (batch=1, num_factors=1)
-        assert action.shape == (1, 1)
-        assert 0 <= int(action[0, 0]) < 5
+        # action shape: (batch=1, num_factors=4)
+        assert action.shape == (1, 4)
+        # All factors should have same action (constrained policies)
+        assert int(action[0, 0]) == int(action[0, 1])
+        assert int(action[0, 0]) == int(action[0, 2])
+        assert int(action[0, 0]) == int(action[0, 3])
+        assert 0 <= int(action[0, 0]) < 13
 
     def test_agent_belief_update(self):
         """Beliefs should shift when observations change."""
         model = CogsGuardPOMDP()
         agent = model.create_agent(policy_len=2, use_states_info_gain=True)
 
-        # Initial: observe nothing (expect EXPLORE/EMPTY to dominate)
-        obs_none = [jnp.array([[0]]), jnp.array([[0]]), jnp.array([[0]])]
+        # Initial: observe nothing (expect EXPLORE to dominate phase beliefs)
+        obs_none = [jnp.array([[0]]) for _ in range(6)]
         qs = agent.infer_states(obs_none, empirical_prior=agent.D)
-        qs_initial = np.asarray(qs[0][0, -1, :]).copy()
+        phase_initial = np.asarray(qs[0][0, -1]).copy()  # (n_states_f=6,)
 
         # Update empirical prior
         q_pi, _G = agent.infer_policies(qs)
         action = agent.sample_action(q_pi)
-        result = agent.update_empirical_prior(action, qs)
-        # pymdp alpha returns (pred, qs), released v1.0.0 returns just pred
-        empirical_prior = result[0] if isinstance(result, tuple) else result
+        pred, _ = agent.update_empirical_prior(action, qs)
 
-        # Now observe: AT extractor, NONE station, HAS_RESOURCE
-        obs_mining = [jnp.array([[2]]), jnp.array([[0]]), jnp.array([[1]])]
-        qs2 = agent.infer_states(obs_mining, empirical_prior=empirical_prior)
-        qs_mining = np.asarray(qs2[0][0, -1, :]).copy()
+        # Now observe: AT extractor (o_res=2), NONE station, HAS_RESOURCE (o_inv=1)
+        # contest=FREE(0), social=ALONE(0), role=SAME(0)
+        obs_mining = [jnp.array([[2]]), jnp.array([[0]]), jnp.array([[1]]),
+                      jnp.array([[0]]), jnp.array([[0]]), jnp.array([[0]])]
+        qs2 = agent.infer_states(obs_mining, empirical_prior=pred)
+        phase_after = np.asarray(qs2[0][0, -1]).copy()  # (n_states_f=6,)
 
-        # Belief should have shifted -- MINE states should have higher prob
-        mine_states = [state_index(Phase.MINE, h) for h in Hand]
-        p_mine_initial = sum(qs_initial[s] for s in mine_states)
-        p_mine_after = sum(qs_mining[s] for s in mine_states)
-        assert p_mine_after > p_mine_initial
+        # MINE phase should have higher probability after seeing AT extractor
+        assert phase_after[Phase.MINE] > phase_initial[Phase.MINE]
 
     def test_empirical_prior_propagation(self):
         """Empirical prior should propagate beliefs through B matrix."""
@@ -232,21 +250,24 @@ class TestPOMDPAgentCreation:
         agent = model.create_agent(policy_len=2, use_states_info_gain=True)
 
         # Initial inference
-        obs = [jnp.array([[0]]), jnp.array([[0]]), jnp.array([[0]])]
+        obs = [jnp.array([[0]]) for _ in range(6)]
         qs = agent.infer_states(obs, empirical_prior=agent.D)
 
         # Propagate through B
-        action = jnp.array([[0]])  # noop
-        result = agent.update_empirical_prior(action, qs)
-        empirical_prior = result[0] if isinstance(result, tuple) else result
+        action = jnp.array([[0, 0, 0, 0]])  # NAV_RESOURCE for all factors
+        pred, _ = agent.update_empirical_prior(action, qs)
 
-        # empirical_prior should be a list with one element per factor
-        assert len(empirical_prior) == 1
-        # shape: (batch=1, n_states=18)
-        assert empirical_prior[0].shape == (1, 18)
-        # Should be a valid probability distribution
-        total = float(jnp.sum(empirical_prior[0]))
-        assert abs(total - 1.0) < 1e-5
+        # empirical_prior should be a list with 4 elements (one per factor)
+        assert len(pred) == 4
+        # Each factor's prior: (batch=1, n_states_f)
+        assert pred[0].shape == (1, 6)   # phase
+        assert pred[1].shape == (1, 3)   # hand
+        assert pred[2].shape == (1, 3)   # target_mode
+        assert pred[3].shape == (1, 4)   # role
+        # Should be valid probability distributions
+        for f_pred in pred:
+            total = float(jnp.sum(f_pred))
+            assert abs(total - 1.0) < 1e-4
 
 
 class TestObsToArray:
