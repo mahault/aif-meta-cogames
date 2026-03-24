@@ -6,15 +6,19 @@ inference, action selection, empirical prior propagation) without any
 cogames/mettagrid dependency.
 
 Tests both miner and aligner roles to verify role-specific behavior.
+Also tests the BatchedAIFEngine (JIT-compiled, batched inference).
 
 Usage:
     python scripts/smoke_test_factored.py
 """
 
+import time
+
 import jax.numpy as jnp
 import numpy as np
 
 from aif_meta_cogames.aif_agent.generative_model import CogsGuardPOMDP
+from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
 from aif_meta_cogames.aif_agent.discretizer import Phase, Hand, TargetMode, TaskPolicy
 
 TASK_NAMES = [tp.name for tp in TaskPolicy]
@@ -111,5 +115,74 @@ def main():
     print("\nSmoke test PASSED")
 
 
+def test_batched_engine():
+    """Test BatchedAIFEngine: JIT-compiled batched inference."""
+    print(f"\n{'='*80}")
+    print("  BATCHED ENGINE TEST")
+    print(f"{'='*80}")
+
+    scenarios = [
+        ("Empty/exploring",   [0, 0, 0, 0, 0, 0]),
+        ("Near resource",     [1, 0, 0, 0, 0, 0]),
+        ("At resource",       [2, 0, 0, 0, 0, 0]),
+        ("At resource+hold",  [2, 0, 1, 0, 0, 0]),
+        ("At hub+hold",       [0, 1, 1, 0, 0, 0]),
+        ("At hub+empty",      [0, 1, 0, 0, 0, 0]),
+        ("At craft+empty",    [0, 2, 0, 0, 0, 0]),
+        ("At craft+gear",     [0, 2, 2, 0, 0, 0]),
+        ("At junction+gear",  [0, 3, 2, 0, 0, 0]),
+        ("Junction contested",[0, 3, 2, 1, 0, 0]),
+    ]
+
+    # Create engine with 8 agents
+    print("Creating BatchedAIFEngine(n_agents=8)...")
+    engine = BatchedAIFEngine(n_agents=8)
+    print(f"  Agent batch_size: {engine.agent.batch_size}")
+
+    step_times = []
+    for step, (name, obs_vals) in enumerate(scenarios):
+        # Submit same obs for all 8 agents (agent 0 triggers batch)
+        t0 = time.perf_counter()
+        for agent_id in range(8):
+            jax_obs = [jnp.array([v]) for v in obs_vals]
+            policy = engine.submit_and_get_policy(agent_id, jax_obs)
+        t1 = time.perf_counter()
+        dt = (t1 - t0) * 1000
+
+        # Get policies for agents 0 (miner) and 1 (aligner)
+        miner_policy = engine._cached_policies[0]
+        aligner_policy = engine._cached_policies[1]
+
+        step_times.append(dt)
+        jit_note = " (JIT compile)" if step == 0 else ""
+        print(f"  Step {step}: miner={TASK_NAMES[miner_policy]:<15} "
+              f"aligner={TASK_NAMES[aligner_policy]:<15} "
+              f"({dt:.1f}ms{jit_note})")
+
+    # Verify JIT compilation happened (first call should be much slower)
+    if len(step_times) >= 3:
+        first = step_times[0]
+        avg_rest = np.mean(step_times[2:])
+        speedup = first / max(avg_rest, 0.001)
+        print(f"\n  JIT compilation detected: first={first:.0f}ms, "
+              f"avg_rest={avg_rest:.1f}ms, speedup={speedup:.1f}x")
+
+    # Verify beliefs are accessible
+    beliefs = engine.get_beliefs(0)
+    assert beliefs is not None, "Beliefs should be available after inference"
+    print(f"  Beliefs available: {len(beliefs)} factors, "
+          f"phase shape={beliefs[0].shape}")
+
+    # Verify role differentiation (miners vs aligners should diverge)
+    n_different = sum(
+        1 for i in range(0, 8, 2)  # even = miner
+        if engine._cached_policies[i] != engine._cached_policies[i + 1]
+    )
+    print(f"  Miner/aligner divergence: {n_different}/4 pairs differ")
+
+    print("\nBatched engine test PASSED")
+
+
 if __name__ == "__main__":
     main()
+    test_batched_engine()

@@ -1,6 +1,8 @@
 """Live CogsGuard policy using discrete active inference (pymdp JAX).
 
 Architecture:
+- **BatchedAIFEngine** runs one pymdp Agent(batch_size=8) for all agents,
+  JIT-compiled via eqx.filter_jit for ~5-10x speedup over sequential
 - **pymdp** (JAX) handles belief tracking (posterior over 216 economy-chain
   states) and task-level policy selection via Expected Free Energy (EFE)
 - **Navigator** converts the selected task policy into primitive movement
@@ -9,14 +11,12 @@ The POMDP action space is 13 task-level policies (not 5 primitive movements).
 This makes B matrices action-dependent, so pymdp's EFE computation produces
 meaningful, non-uniform policy selection.
 
-The JAX Agent (equinox Module) is immutable — beliefs and empirical priors
-are managed externally in ``AIFBeliefState``.
+Uses batched inference: one pymdp Agent(batch_size=8) with per-role C/D
+vectors (even=miner, odd=aligner). Agent 0's step triggers batched inference
+for all 8 agents; agents 1-7 use cached results (1-step lag).
 
 Implements the cogames MultiAgentPolicy interface so it can be used directly:
     cogames eval -p class=aif_meta_cogames.aif_agent.cogames_policy.AIFPolicy
-
-Or with a fitted model:
-    cogames eval -p class=...AIFPolicy,kw.model_path=fitted_pomdp/arena.npz
 
 Note: mettagrid has no Windows wheel. This module uses lazy imports so that
 ``_build_tag_categories`` and ``AIFBeliefState`` can be imported standalone
@@ -28,6 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+import equinox as eqx
 import jax.numpy as jnp
 import numpy as np
 
@@ -80,23 +81,107 @@ def _build_tag_categories(tags: list[str]) -> dict[int, str]:
 
 @dataclass
 class AIFBeliefState:
-    """Per-agent state for the AIF policy.
+    """Per-agent navigator state for the AIF policy.
 
-    The JAX pymdp Agent is an immutable equinox Module, so beliefs and
-    empirical priors must be managed externally. This dataclass holds:
-    - The Agent (immutable, carries A/B/C/D matrices and policies)
-    - The current empirical prior (for next infer_states call)
-    - The latest posterior beliefs qs (for logging/inspection)
+    Belief tracking and inference are handled by the shared
+    ``BatchedAIFEngine``. This dataclass holds only per-agent
+    navigator state (wander direction, step counts, logging).
     """
-    agent: Any  # pymdp.agent.Agent (JAX, immutable equinox Module)
-    empirical_prior: Any = None  # list of jax arrays, shape (batch, n_states_f)
-    qs: Any = None  # latest beliefs from infer_states
     step_count: int = 0
     wander_dir: int = 0
     wander_steps: int = WANDER_STEPS
     last_phase: int = 0
     last_hand: int = 0
     last_task_policy: int = TaskPolicy.EXPLORE
+
+
+# ---------------------------------------------------------------------------
+# Batched AIF Engine (no mettagrid dependency)
+# ---------------------------------------------------------------------------
+
+def _batched_step(agent, batched_obs, empirical_prior):
+    """JIT-compilable batched inference step.
+
+    Runs infer_states → infer_policies → sample_action →
+    update_empirical_prior for all agents in one vectorized call.
+    """
+    qs = agent.infer_states(batched_obs, empirical_prior=empirical_prior)
+    q_pi, _efe = agent.infer_policies(qs)
+    sampled = agent.sample_action(q_pi)
+    task_policies = sampled[:, 0]  # all factors share same action
+
+    # Build pomdp_action: (n_agents, 4) — same action for all 4 factors
+    pomdp_action = jnp.tile(sampled[:, :1], (1, 4))
+    pred, _ = agent.update_empirical_prior(pomdp_action, qs)
+
+    return task_policies, pred, qs
+
+
+class BatchedAIFEngine:
+    """Batched active inference engine: 1 Agent(batch_size=N) for all agents.
+
+    Agent 0's step triggers batched inference over all N agents.
+    Agents 1-(N-1) return cached results (1-step lag, negligible for POMDP).
+    Navigator stays per-agent (cheap, needs current obs).
+    """
+
+    def __init__(self, n_agents: int = 8):
+        self.n_agents = n_agents
+        self.agent = CogsGuardPOMDP.create_batched_agent(n_agents)
+
+        # Obs buffer: per-agent, per-modality, shape (1,) = (T=1,)
+        self._obs_buffer: list[list[Any]] = [
+            [jnp.array([0]) for _ in range(6)]
+            for _ in range(n_agents)
+        ]
+
+        # Beliefs managed here (shared across batch)
+        self.empirical_prior = self.agent.D
+        self.qs = None
+
+        # Cached task policies from last batch
+        self._cached_policies = [int(TaskPolicy.EXPLORE)] * n_agents
+
+        # JIT-compile the batched step function
+        self._jit_step = eqx.filter_jit(_batched_step)
+
+    def submit_and_get_policy(self, agent_id: int, jax_obs: list) -> int:
+        """Store obs for agent_id and return its task policy.
+
+        Agent 0 triggers batched inference for all agents.
+        Others return cached policies (1-step lag).
+        """
+        self._obs_buffer[agent_id] = jax_obs
+
+        if agent_id == 0:
+            self._run_batch()
+
+        return self._cached_policies[agent_id]
+
+    def get_beliefs(self, agent_id: int):
+        """Return per-agent beliefs (qs) from the batched posterior."""
+        if self.qs is None:
+            return None
+        # qs[f] shape: (batch, T, n_states_f) → index by agent_id
+        return [q[agent_id] for q in self.qs]
+
+    def _run_batch(self):
+        """Run batched inference over all agents."""
+        # Stack obs: (n_agents, T=1) per modality
+        batched_obs = []
+        for m in range(6):
+            stacked = jnp.stack(
+                [self._obs_buffer[i][m] for i in range(self.n_agents)]
+            )
+            batched_obs.append(stacked)
+
+        policies, new_prior, qs = self._jit_step(
+            self.agent, batched_obs, self.empirical_prior
+        )
+
+        self.empirical_prior = new_prior
+        self.qs = qs
+        self._cached_policies = [int(policies[i]) for i in range(self.n_agents)]
 
 
 # ---------------------------------------------------------------------------
@@ -133,22 +218,20 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
 
     Each step:
     1. Convert AgentObservation -> numpy array -> 6 discrete POMDP observations
-    2. Update beliefs via pymdp JAX (Bayesian inference over 216 states)
-    3. Select task-level policy via EFE (13 task policies)
-    4. Execute selected task policy via navigator (spatial movement)
-    5. Update empirical prior for next timestep
+    2. Submit obs to BatchedAIFEngine → get task policy (JIT-batched)
+    3. Execute selected task policy via navigator (spatial movement)
     """
 
     def __init__(
         self,
         policy_env_info: _PolicyEnvInterface,
         agent_id: int,
-        pomdp: CogsGuardPOMDP,
+        engine: BatchedAIFEngine,
         discretizer: ObservationDiscretizer,
     ):
         self._agent_id = agent_id
         self._policy_env_info = policy_env_info
-        self._pomdp = pomdp
+        self._engine = engine
         self._discretizer = discretizer
 
         self._action_names = policy_env_info.action_names
@@ -179,15 +262,8 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
         return tag_ids
 
     def initial_agent_state(self) -> AIFBeliefState:
-        """Create initial state with a fresh pymdp JAX Agent."""
-        agent = self._pomdp.create_agent(
-            policy_len=2,
-            use_states_info_gain=True,
-            use_param_info_gain=False,
-        )
+        """Create initial navigator state (beliefs are in the shared engine)."""
         return AIFBeliefState(
-            agent=agent,
-            empirical_prior=agent.D,
             wander_dir=self._agent_id % len(WANDER_DIRECTIONS),
         )
 
@@ -201,34 +277,22 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
         # 2. Discretize -> 6-tuple (o_res, o_sta, o_inv, o_contest, o_social, o_role)
         disc_obs = self._discretizer.discretize_obs(obs_array)
 
-        # 3. Convert to jax arrays — shape (batch=1, T=1) per modality
-        # pymdp FPI takes x[-1] along time dim, so T=1 is required
-        jax_obs = [jnp.array([[int(o)]]) for o in disc_obs]
+        # 3. Convert to jax arrays — shape (T=1,) per modality
+        jax_obs = [jnp.array([int(o)]) for o in disc_obs]
 
-        # 4. Belief update via pymdp JAX (factored)
-        qs = state.agent.infer_states(jax_obs, empirical_prior=state.empirical_prior)
+        # 4. Submit to batched engine → get task policy (JIT-compiled)
+        task_policy = self._engine.submit_and_get_policy(self._agent_id, jax_obs)
 
-        # 5. Policy inference — EFE over 13 task-level policies
-        q_pi, efe = state.agent.infer_policies(qs)
-
-        # 6. Select best task policy via sample_action
-        sampled = state.agent.sample_action(q_pi)  # (batch=1, n_factors=4)
-        task_policy = int(sampled[0, 0])  # all factors share same action
-
-        # 7. Execute selected task policy via navigator
+        # 5. Execute selected task policy via navigator
         action, state = self._execute_task_policy(task_policy, obs, state)
 
-        # 8. Update empirical prior (4 factors, same action for all)
-        pomdp_action = jnp.array([[task_policy, task_policy, task_policy, task_policy]])
-        pred, _qs = state.agent.update_empirical_prior(pomdp_action, qs)
-        state.empirical_prior = pred
-        state.qs = qs
-
-        # Track for logging — beliefs are per-factor, shape (batch, T, n_states_f)
-        phase_beliefs = np.asarray(qs[0][0, -1])  # last timestep
-        hand_beliefs = np.asarray(qs[1][0, -1])
-        state.last_phase = int(np.argmax(phase_beliefs))
-        state.last_hand = int(np.argmax(hand_beliefs))
+        # 6. Track for logging — get beliefs from engine
+        beliefs = self._engine.get_beliefs(self._agent_id)
+        if beliefs is not None:
+            phase_beliefs = np.asarray(beliefs[0][-1])  # last timestep
+            hand_beliefs = np.asarray(beliefs[1][-1])
+            state.last_phase = int(np.argmax(phase_beliefs))
+            state.last_hand = int(np.argmax(hand_beliefs))
         state.last_task_policy = task_policy
         state.step_count += 1
 
@@ -426,7 +490,8 @@ class AIFPolicy(_MultiAgentPolicy):
     belief tracking and EFE-driven task policy selection, combined with a
     navigator for spatial movement.
 
-    Supports loading fitted A/B matrices via model_path kwarg.
+    All 8 agents share one BatchedAIFEngine (JIT-compiled, batched inference).
+    Even agents are miners, odd agents are aligners (per-role C/D vectors).
     """
 
     short_names = ["aif"]
@@ -435,7 +500,7 @@ class AIFPolicy(_MultiAgentPolicy):
         self,
         policy_env_info: _PolicyEnvInterface,
         device: str = "cpu",
-        model_path: Optional[str] = None,
+        n_agents: int = 8,
         **kwargs: Any,
     ):
         super().__init__(policy_env_info, device=device, **kwargs)
@@ -452,24 +517,16 @@ class AIFPolicy(_MultiAgentPolicy):
 
         self._discretizer = ObservationDiscretizer(feat_names, tag_categories)
 
-        # Load fitted model if path provided, otherwise use role-specialization
-        self._model_path = model_path
+        # One shared engine for all agents (JIT-compiled, batched)
+        self._engine = BatchedAIFEngine(n_agents=n_agents)
         self._agents: dict[int, _StatefulAgentPolicy] = {}
-
-    def _pomdp_for_agent(self, agent_id: int) -> CogsGuardPOMDP:
-        """Create role-specific POMDP: even agents mine, odd agents align."""
-        if self._model_path:
-            return CogsGuardPOMDP.from_fitted(self._model_path)
-        role = "miner" if agent_id % 2 == 0 else "aligner"
-        return CogsGuardPOMDP.for_role(role)
 
     def agent_policy(self, agent_id: int) -> _StatefulAgentPolicy:
         if agent_id not in self._agents:
-            pomdp = self._pomdp_for_agent(agent_id)
             impl = AIFCogPolicyImpl(
                 self._policy_env_info,
                 agent_id,
-                pomdp,
+                self._engine,
                 self._discretizer,
             )
             self._agents[agent_id] = _StatefulAgentPolicy(

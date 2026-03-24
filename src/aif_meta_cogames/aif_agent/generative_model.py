@@ -596,6 +596,50 @@ class CogsGuardPOMDP:
         defaults.update(kwargs)
         return Agent(A=A, B=B, C=C, D=D, **defaults)
 
+    @staticmethod
+    def create_batched_agent(n_agents: int = 8, **kwargs):
+        """Create one ``Agent(batch_size=n_agents)`` with per-role C/D.
+
+        Even-indexed agents are miners, odd-indexed are aligners.
+        A and B matrices are shared (same model structure).
+        C and D are replaced after construction with per-batch values
+        using ``eqx.tree_at`` (the Agent constructor always broadcasts
+        to batch_size, so we override afterward).
+        """
+        import equinox as eqx
+        import jax.numpy as jnp
+
+        pomdp_miner = CogsGuardPOMDP.for_role("miner")
+        pomdp_aligner = CogsGuardPOMDP.for_role("aligner")
+
+        # Create agent with uniform C/D (constructor adds batch dim)
+        base = CogsGuardPOMDP()
+        agent = base.create_agent(batch_size=n_agents, **kwargs)
+
+        # Build per-batch C: (n_agents, n_obs_m)
+        C_batched = []
+        for m in range(len(NUM_OBS)):
+            per_agent = []
+            for i in range(n_agents):
+                c = pomdp_miner.C[m] if i % 2 == 0 else pomdp_aligner.C[m]
+                per_agent.append(c)
+            C_batched.append(jnp.array(np.stack(per_agent)))
+
+        # Build per-batch D: (n_agents, n_states_f)
+        D_batched = []
+        for f in range(len(NUM_STATE_FACTORS)):
+            per_agent = []
+            for i in range(n_agents):
+                d = pomdp_miner.D[f] if i % 2 == 0 else pomdp_aligner.D[f]
+                per_agent.append(d)
+            D_batched.append(jnp.array(np.stack(per_agent)))
+
+        # Replace C and D with per-batch versions
+        agent = eqx.tree_at(lambda a: a.C, agent, C_batched)
+        agent = eqx.tree_at(lambda a: a.D, agent, D_batched)
+
+        return agent
+
     def summary(self) -> str:
         """Human-readable model summary."""
         obs_names = ["resource", "station", "inventory",
