@@ -204,6 +204,17 @@ class BatchedAIFEngine:
                 and self._step_count % self.learn_interval == 0):
             self._update_B(batched_obs, qs, pomdp_action)
 
+        # Periodic logging (every 500 steps)
+        if self._step_count % 500 == 0:
+            actions = [int(policies[i]) for i in range(self.n_agents)]
+            from .discretizer import TASK_POLICY_NAMES
+            action_names = [TASK_POLICY_NAMES[a] for a in actions]
+            pB_info = ""
+            if self.learn_B and hasattr(self.agent, 'pB') and self.agent.pB is not None:
+                pB_sum = sum(float(pb.sum()) for pb in self.agent.pB)
+                pB_info = f", pB_total={pB_sum:.0f}"
+            print(f"[AIF step={self._step_count}] actions={action_names}{pB_info}")
+
         # Store for next learning step
         self._prev_qs = qs
         self._prev_obs = batched_obs
