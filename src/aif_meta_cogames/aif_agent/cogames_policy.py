@@ -227,8 +227,10 @@ class BatchedAIFEngine:
 
         self.agent = self.agent.infer_parameters(
             beliefs_A=beliefs_T2,
-            outcomes=obs_T2,
+            observations=obs_T2,
             actions=actions_T1,
+            beliefs_B=beliefs_T2,
+            lr_pA=0.0,
             lr_pB=1.0,
         )
 
