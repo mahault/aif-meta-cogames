@@ -576,7 +576,7 @@ class CogsGuardPOMDP:
 
         # Build pB (Dirichlet concentration) for online B-learning
         pB_scale = kwargs.pop("pB_scale", 5.0)
-        learn_B = kwargs.get("learn_B", False)
+        learn_B = kwargs.pop("learn_B", False)  # pop so it doesn't reach Agent()
         pB = None
         if learn_B:
             pB = [jnp.array(b * pB_scale + 0.1) for b in self.B]

@@ -570,7 +570,7 @@ class AIFPolicy(_MultiAgentPolicy):
 
         # One shared engine for all agents (JIT-compiled, batched)
         self._engine = BatchedAIFEngine(
-            n_agents=n_agents, learn_B=False, policy_len=2
+            n_agents=n_agents, learn_B=True, policy_len=2
         )
         self._agents: dict[int, _StatefulAgentPolicy] = {}
 
