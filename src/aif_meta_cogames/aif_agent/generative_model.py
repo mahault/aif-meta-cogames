@@ -576,7 +576,7 @@ class CogsGuardPOMDP:
 
         # Build pB (Dirichlet concentration) for online B-learning
         pB_scale = kwargs.pop("pB_scale", 5.0)
-        learn_B = kwargs.pop("learn_B", False)  # pop so it doesn't reach Agent()
+        learn_B = kwargs.pop("learn_B", False)  # pop to avoid double-passing; added to defaults below
         pB = None
         if learn_B:
             pB = [jnp.array(b * pB_scale + 0.1) for b in self.B]
@@ -593,6 +593,7 @@ class CogsGuardPOMDP:
             "use_utility": True,
             "use_states_info_gain": True,
             "use_param_info_gain": learn_B,
+            "learn_B": learn_B,
             "action_selection": "deterministic",
             "gamma": 8.0,
         }
