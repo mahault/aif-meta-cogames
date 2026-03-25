@@ -84,31 +84,31 @@ def build_default_A() -> list[np.ndarray]:
     A = []
 
     # -- A[0]: o_resource (3 x 6) — depends on phase --
-    a_res = np.full((len(ObsResource), NUM_PHASES), 0.1)
+    a_res = np.full((len(ObsResource), NUM_PHASES), 0.05)
     for p in Phase:
         if p == Phase.MINE:
-            a_res[ObsResource.AT, p] = 0.7
-            a_res[ObsResource.NEAR, p] = 0.2
+            a_res[ObsResource.AT, p] = 0.85
+            a_res[ObsResource.NEAR, p] = 0.10
         elif p == Phase.EXPLORE:
-            a_res[ObsResource.NONE, p] = 0.6
-            a_res[ObsResource.NEAR, p] = 0.3
+            a_res[ObsResource.NONE, p] = 0.80
+            a_res[ObsResource.NEAR, p] = 0.15
         else:
-            a_res[ObsResource.NONE, p] = 0.7
-            a_res[ObsResource.NEAR, p] = 0.2
+            a_res[ObsResource.NONE, p] = 0.85
+            a_res[ObsResource.NEAR, p] = 0.10
         a_res[:, p] /= a_res[:, p].sum()
     A.append(a_res)
 
     # -- A[1]: o_station (4 x 6) — depends on phase --
-    a_sta = np.full((len(ObsStation), NUM_PHASES), 0.05)
+    a_sta = np.full((len(ObsStation), NUM_PHASES), 0.03)
     for p in Phase:
         if p == Phase.DEPOSIT:
-            a_sta[ObsStation.HUB, p] = 0.6
+            a_sta[ObsStation.HUB, p] = 0.85
         elif p in (Phase.CRAFT, Phase.GEAR):
-            a_sta[ObsStation.CRAFT, p] = 0.6
+            a_sta[ObsStation.CRAFT, p] = 0.85
         elif p == Phase.CAPTURE:
-            a_sta[ObsStation.JUNCTION, p] = 0.6
+            a_sta[ObsStation.JUNCTION, p] = 0.85
         else:
-            a_sta[ObsStation.NONE, p] = 0.7
+            a_sta[ObsStation.NONE, p] = 0.85
         a_sta[:, p] /= a_sta[:, p].sum()
     A.append(a_sta)
 
@@ -128,27 +128,27 @@ def build_default_A() -> list[np.ndarray]:
 
     # -- A[4]: o_social (4 x 4 x 3) — depends on role, target_mode --
     # A_dependencies[4] = [3, 2] → shape (4, 4, 3) = (n_social, n_role, n_target)
-    a_soc = np.full((len(ObsSocial), NUM_ROLES, NUM_TARGET_MODES), 0.15)
+    a_soc = np.full((len(ObsSocial), NUM_ROLES, NUM_TARGET_MODES), 0.05)
     for r in Role:
         for t in TargetMode:
             if r in (Role.CAPTURER, Role.SUPPORT):
-                a_soc[ObsSocial.ALLY_NEAR, r, t] = 0.3
+                a_soc[ObsSocial.ALLY_NEAR, r, t] = 0.5
             else:
-                a_soc[ObsSocial.ALONE, r, t] = 0.3
+                a_soc[ObsSocial.ALONE, r, t] = 0.5
             if t == TargetMode.CONTESTED:
-                a_soc[ObsSocial.BOTH_NEAR, r, t] = 0.3
+                a_soc[ObsSocial.BOTH_NEAR, r, t] = 0.5
             elif t == TargetMode.LOST:
-                a_soc[ObsSocial.ENEMY_NEAR, r, t] = 0.3
+                a_soc[ObsSocial.ENEMY_NEAR, r, t] = 0.5
             a_soc[:, r, t] /= a_soc[:, r, t].sum()
     A.append(a_soc)
 
     # -- A[5]: o_role_signal (2 x 4) — depends on role --
-    a_role = np.full((len(ObsRoleSignal), NUM_ROLES), 0.3)
+    a_role = np.full((len(ObsRoleSignal), NUM_ROLES), 0.1)
     for r in Role:
         if r == Role.SUPPORT:
-            a_role[ObsRoleSignal.SAME_ROLE, r] = 0.6
+            a_role[ObsRoleSignal.SAME_ROLE, r] = 0.9
         else:
-            a_role[ObsRoleSignal.DIFFERENT_ROLE, r] = 0.6
+            a_role[ObsRoleSignal.DIFFERENT_ROLE, r] = 0.9
         a_role[:, r] /= a_role[:, r].sum()
     A.append(a_role)
 
@@ -421,9 +421,9 @@ def build_C_miner() -> list[np.ndarray]:
     Miners focus on the extractor→hub loop: find resources, mine them,
     deposit at hub, repeat. Avoids junctions and combat.
     """
-    c_res = np.array([0.0, 1.0, 3.0])           # AT resource is best
-    c_sta = np.array([0.0, 2.0, 0.5, 0.0])      # HUB best (deposit), ignore junction
-    c_inv = np.array([-0.5, 2.0, 0.0])           # prefer HOLDING_RESOURCE, penalize EMPTY
+    c_res = np.array([-1.0, 1.0, 3.0])          # penalize NONE, AT resource best
+    c_sta = np.array([-0.5, 2.5, 0.5, 0.0])     # penalize NONE, HUB best
+    c_inv = np.array([-1.0, 2.5, 0.0])           # penalize EMPTY strongly
     c_con = np.array([0.5, 0.0, 0.0])            # prefer FREE (avoid combat)
     c_soc = np.array([0.0, 0.5, -0.5, 0.0])     # ALONE, ALLY, ENEMY, BOTH
     c_role = np.array([0.3, 0.0])                # SAME_ROLE, DIFFERENT
@@ -436,10 +436,10 @@ def build_C_aligner() -> list[np.ndarray]:
     Aligners focus on the hub→craft→junction chain: craft gear at stations,
     then navigate to junctions and capture them. Strongly prefers junctions.
     """
-    c_res = np.array([0.0, 0.0, 0.5])           # don't care much about resources
-    c_sta = np.array([0.0, 1.0, 2.0, 4.0])      # JUNCTION is best, CRAFT second
-    c_inv = np.array([0.0, 0.5, 3.0])            # HOLDING_GEAR is best
-    c_con = np.array([2.0, -0.5, -2.0])          # strongly prefer FREE junctions
+    c_res = np.array([-0.5, 0.0, 0.5])          # penalize NONE
+    c_sta = np.array([-0.5, 1.0, 2.5, 5.0])     # penalize NONE, JUNCTION strongest
+    c_inv = np.array([-0.5, 0.5, 3.5])           # penalize EMPTY, GEAR best
+    c_con = np.array([2.5, -1.0, -3.0])          # FREE strong, LOST very bad
     c_soc = np.array([0.0, 1.0, -1.0, 0.0])     # prefer allies, avoid enemies
     c_role = np.array([0.3, 0.0])                # SAME_ROLE, DIFFERENT
     return [c_res, c_sta, c_inv, c_con, c_soc, c_role]
@@ -566,17 +566,20 @@ class CogsGuardPOMDP:
         D = [jnp.array(d) for d in self.D]
 
         # Constrained policies: all 4 factors take the SAME action.
-        # policy_len=2 → shape (169, 2, 4) — 13*13 two-step policies
+        import itertools
         policy_len = kwargs.pop("policy_len", 2)
-        pol_list = []
-        if policy_len == 1:
-            for a1 in range(NUM_ACTIONS):
-                pol_list.append([[a1, a1, a1, a1]])
-        else:
-            for a1 in range(NUM_ACTIONS):
-                for a2 in range(NUM_ACTIONS):
-                    pol_list.append([[a1, a1, a1, a1], [a2, a2, a2, a2]])
+        pol_list = [
+            [[a] * 4 for a in seq]
+            for seq in itertools.product(range(NUM_ACTIONS), repeat=policy_len)
+        ]
         policies = jnp.array(pol_list)
+
+        # Build pB (Dirichlet concentration) for online B-learning
+        pB_scale = kwargs.pop("pB_scale", 5.0)
+        learn_B = kwargs.get("learn_B", False)
+        pB = None
+        if learn_B:
+            pB = [jnp.array(b * pB_scale + 0.1) for b in self.B]
 
         defaults = {
             "A_dependencies": A_DEPENDENCIES,
@@ -589,10 +592,12 @@ class CogsGuardPOMDP:
             "num_iter": 16,
             "use_utility": True,
             "use_states_info_gain": True,
-            "use_param_info_gain": False,
+            "use_param_info_gain": learn_B,
             "action_selection": "deterministic",
-            "gamma": 16.0,
+            "gamma": 8.0,
         }
+        if pB is not None:
+            defaults["pB"] = pB
         defaults.update(kwargs)
         return Agent(A=A, B=B, C=C, D=D, **defaults)
 

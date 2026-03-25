@@ -114,7 +114,7 @@ def _batched_step(agent, batched_obs, empirical_prior):
     pomdp_action = jnp.tile(sampled[:, :1], (1, 4))
     pred, _ = agent.update_empirical_prior(pomdp_action, qs)
 
-    return task_policies, pred, qs
+    return task_policies, pred, qs, pomdp_action
 
 
 class BatchedAIFEngine:
@@ -125,9 +125,15 @@ class BatchedAIFEngine:
     Navigator stays per-agent (cheap, needs current obs).
     """
 
-    def __init__(self, n_agents: int = 8):
+    def __init__(self, n_agents: int = 8, learn_B: bool = False,
+                 learn_interval: int = 10, policy_len: int = 2):
         self.n_agents = n_agents
-        self.agent = CogsGuardPOMDP.create_batched_agent(n_agents)
+        self.learn_B = learn_B
+        self.learn_interval = learn_interval
+        self._step_count = 0
+        self.agent = CogsGuardPOMDP.create_batched_agent(
+            n_agents, learn_B=learn_B, policy_len=policy_len
+        )
 
         # Obs buffer: per-agent, per-modality, shape (1,) = (T=1,)
         self._obs_buffer: list[list[Any]] = [
@@ -142,8 +148,17 @@ class BatchedAIFEngine:
         # Cached task policies from last batch
         self._cached_policies = [int(TaskPolicy.EXPLORE)] * n_agents
 
+        # Learning buffers
+        self._prev_qs = None
+        self._prev_obs = None
+        self._prev_actions = None
+
         # JIT-compile the batched step function
         self._jit_step = eqx.filter_jit(_batched_step)
+
+        # Warmup JIT compilation (avoids timeout on first eval step)
+        dummy_obs = [jnp.zeros((n_agents, 1), dtype=jnp.int32) for _ in range(6)]
+        self._jit_step(self.agent, dummy_obs, self.empirical_prior)
 
     def submit_and_get_policy(self, agent_id: int, jax_obs: list) -> int:
         """Store obs for agent_id and return its task policy.
@@ -175,13 +190,47 @@ class BatchedAIFEngine:
             )
             batched_obs.append(stacked)
 
-        policies, new_prior, qs = self._jit_step(
+        policies, new_prior, qs, pomdp_action = self._jit_step(
             self.agent, batched_obs, self.empirical_prior
         )
 
         self.empirical_prior = new_prior
         self.qs = qs
         self._cached_policies = [int(policies[i]) for i in range(self.n_agents)]
+
+        # Online B-learning
+        self._step_count += 1
+        if (self.learn_B and self._prev_qs is not None
+                and self._step_count % self.learn_interval == 0):
+            self._update_B(batched_obs, qs, pomdp_action)
+
+        # Store for next learning step
+        self._prev_qs = qs
+        self._prev_obs = batched_obs
+        self._prev_actions = pomdp_action
+
+    def _update_B(self, curr_obs, curr_qs, curr_actions):
+        """Update B matrices via online Dirichlet learning.
+
+        Constructs a T=2 temporal buffer from previous and current beliefs,
+        then calls pymdp's infer_parameters to update pB.
+        """
+        beliefs_T2 = [
+            jnp.concatenate([self._prev_qs[f], curr_qs[f]], axis=1)
+            for f in range(len(curr_qs))
+        ]
+        obs_T2 = [
+            jnp.concatenate([self._prev_obs[m], curr_obs[m]], axis=1)
+            for m in range(len(curr_obs))
+        ]
+        actions_T1 = self._prev_actions[:, None, :]
+
+        self.agent = self.agent.infer_parameters(
+            beliefs_A=beliefs_T2,
+            outcomes=obs_T2,
+            actions=actions_T1,
+            lr_pB=1.0,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -518,7 +567,9 @@ class AIFPolicy(_MultiAgentPolicy):
         self._discretizer = ObservationDiscretizer(feat_names, tag_categories)
 
         # One shared engine for all agents (JIT-compiled, batched)
-        self._engine = BatchedAIFEngine(n_agents=n_agents)
+        self._engine = BatchedAIFEngine(
+            n_agents=n_agents, learn_B=True, policy_len=3
+        )
         self._agents: dict[int, _StatefulAgentPolicy] = {}
 
     def agent_policy(self, agent_id: int) -> _StatefulAgentPolicy:
