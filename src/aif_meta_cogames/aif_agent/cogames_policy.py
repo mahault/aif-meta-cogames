@@ -30,7 +30,7 @@ for testing, while the full policy classes require mettagrid at runtime.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import equinox as eqx
@@ -164,13 +164,12 @@ class SpatialMemory:
         return best
 
     def is_stuck(self) -> bool:
-        """Detect stuck from position history."""
+        """Detect stuck from position history (conservative threshold)."""
         h = self.position_history
-        if len(h) < 6:
+        if len(h) < 20:
             return False
-        if len(set(h[-6:])) <= 2:
-            return True
-        if len(h) >= 20 and h[:-10].count(h[-1]) >= 2:
+        # Oscillating between ≤2 positions for 20 steps
+        if len(set(h[-20:])) <= 2:
             return True
         return False
 
@@ -362,13 +361,10 @@ class OptionExecutor:
 
     @staticmethod
     def _mine_cycle(o_res, o_sta, o_inv):
-        """MINE_CYCLE: NAV_RESOURCE -> MINE -> NAV_DEPOT (auto-deposit at dist=0)."""
-        if o_inv == ObsInventory.EMPTY:
-            if o_res >= ObsResource.AT:
-                return TaskPolicy.MINE  # AT = dist ≤ 1, close enough
-            return TaskPolicy.NAV_RESOURCE
-        elif o_inv == ObsInventory.HAS_RESOURCE:
+        """MINE_CYCLE: NAV_RESOURCE until pickup -> NAV_DEPOT until deposit."""
+        if o_inv == ObsInventory.HAS_RESOURCE:
             return TaskPolicy.NAV_DEPOT  # Navigate to hub (auto-deposits at dist=0)
+        # Keep navigating to extractor — auto-extracts at dist=0 (noop via dr==dc==0)
         return TaskPolicy.NAV_RESOURCE
 
     @staticmethod
@@ -748,36 +744,21 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
             return self._navigate_to_tags(
                 self._extractor_tags, obs, state, category="extractor")
 
-        elif task_policy == TaskPolicy.MINE:
-            return self._action("noop"), state
-
         elif task_policy == TaskPolicy.NAV_DEPOT:
             return self._navigate_to_tags(
                 self._hub_tags, obs, state, category="hub")
-
-        elif task_policy == TaskPolicy.DEPOSIT:
-            return self._action("noop"), state
 
         elif task_policy == TaskPolicy.NAV_CRAFT:
             return self._navigate_to_tags(
                 self._craft_tags, obs, state, category="craft")
 
-        elif task_policy == TaskPolicy.CRAFT:
-            return self._action("noop"), state
-
         elif task_policy == TaskPolicy.NAV_GEAR:
             return self._navigate_to_tags(
                 self._craft_tags, obs, state, category="craft")
 
-        elif task_policy == TaskPolicy.ACQUIRE_GEAR:
-            return self._action("noop"), state
-
         elif task_policy == TaskPolicy.NAV_JUNCTION:
             return self._navigate_to_tags(
                 self._junction_tags, obs, state, category="junction")
-
-        elif task_policy == TaskPolicy.CAPTURE:
-            return self._action("noop"), state
 
         elif task_policy == TaskPolicy.EXPLORE:
             return self._wander(state)
@@ -785,7 +766,10 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
         elif task_policy == TaskPolicy.YIELD:
             return self._wander(state)
 
-        elif task_policy == TaskPolicy.WAIT:
+        elif task_policy in (
+            TaskPolicy.MINE, TaskPolicy.DEPOSIT, TaskPolicy.CRAFT,
+            TaskPolicy.ACQUIRE_GEAR, TaskPolicy.CAPTURE, TaskPolicy.WAIT,
+        ):
             return self._action("noop"), state
 
         else:
@@ -879,7 +863,12 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
         target: Optional[tuple[int, int]],
         state: AIFBeliefState,
     ) -> tuple[_Action, AIFBeliefState]:
-        """Move toward target, avoiding walls and detecting stuck state."""
+        """Move toward target, avoiding walls and detecting stuck state.
+
+        Interaction in CogsGuard uses 'bumping': move INTO an entity to
+        interact (extract, craft, capture).  So at dist=1 we keep moving
+        toward the target instead of nooping.
+        """
         mem = state.spatial_memory
 
         # Stuck detection and recovery
@@ -893,7 +882,9 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
         dc = target[1] - self._center[1]
 
         if dr == 0 and dc == 0:
-            return self._action("noop"), state
+            # On top of the target — bump in last wander direction to interact
+            direction = WANDER_DIRECTIONS[state.wander_dir]
+            return self._action(direction), state
 
         # Compute direction priority: primary, secondary, perpendiculars
         if abs(dr) >= abs(dc):
@@ -902,6 +893,10 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
         else:
             primary = "move_east" if dc > 0 else "move_west"
             secondary = ("move_south" if dr > 0 else "move_north") if dr != 0 else primary
+
+        # At dist=1: bump directly into target (no wall avoidance — it IS the target)
+        if abs(dr) + abs(dc) == 1:
+            return self._action(primary), state
 
         candidates = [primary]
         if secondary != primary:

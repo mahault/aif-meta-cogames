@@ -413,15 +413,19 @@ class ObservationDiscretizer:
     # -- State inference ----------------------------------------------------
 
     def infer_hand(self, obs: np.ndarray) -> int:
-        """Infer Hand state from global inventory tokens.
+        """Infer Hand state from inventory tokens.
 
         Checks gear first (higher priority if agent has both gear and
         resource features simultaneously).
+
+        Inventory tokens may use LOC_GLOBAL (254) or the center-cell
+        encoding (6<<4|6 = 102) depending on the mettagrid version.
         """
+        loc_center = (6 << 4) | 6   # 102
         has_resource = False
         for i in range(obs.shape[0]):
             loc, feat_id, value = int(obs[i, 0]), int(obs[i, 1]), int(obs[i, 2])
-            if loc != LOC_GLOBAL or value == 0:
+            if (loc != LOC_GLOBAL and loc != loc_center) or value == 0:
                 continue
             if feat_id in self._gear_feat_ids:
                 return Hand.HOLDING_GEAR

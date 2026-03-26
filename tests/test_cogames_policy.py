@@ -356,12 +356,13 @@ class TestOptionExecutor:
                ObsContest.FREE, 0, 0]
         assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_RESOURCE
 
-    def test_mine_cycle_mine_at_resource(self):
+    def test_mine_cycle_at_resource_still_navigates(self):
+        """At resource: keep navigating (auto-extracts at dist=0 via bumping)."""
         executor = OptionExecutor(n_agents=1)
         executor.set_option(0, MacroOption.MINE_CYCLE)
         obs = [ObsResource.AT, ObsStation.NONE, ObsInventory.EMPTY,
                ObsContest.FREE, 0, 0]
-        assert executor.get_task_policy(0, obs) == TaskPolicy.MINE
+        assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_RESOURCE
 
     def test_mine_cycle_nav_depot_with_resource(self):
         executor = OptionExecutor(n_agents=1)
@@ -590,8 +591,8 @@ class TestSpatialMemory:
     def test_stuck_detection_oscillation(self):
         from aif_meta_cogames.aif_agent.cogames_policy import SpatialMemory
         mem = SpatialMemory()
-        # Oscillate between two positions for 6 steps
-        for _ in range(3):
+        # Oscillate between two positions for 20 steps
+        for _ in range(10):
             mem.position_history.append((10, 10))
             mem.position_history.append((10, 11))
         assert mem.is_stuck()
@@ -599,21 +600,18 @@ class TestSpatialMemory:
     def test_stuck_detection_single_position(self):
         from aif_meta_cogames.aif_agent.cogames_policy import SpatialMemory
         mem = SpatialMemory()
-        for _ in range(6):
+        for _ in range(20):
             mem.position_history.append((10, 10))
         assert mem.is_stuck()
 
-    def test_stuck_detection_revisit(self):
+    def test_stuck_detection_not_yet(self):
+        """Not stuck if oscillating for fewer than 20 steps."""
         from aif_meta_cogames.aif_agent.cogames_policy import SpatialMemory
         mem = SpatialMemory()
-        # Build up 20+ history with revisitation
-        for i in range(10):
-            mem.position_history.append((10, 10 + i))
-        mem.position_history.append((10, 10))  # revisit start
-        for i in range(10):
-            mem.position_history.append((10, 20 + i))
-        mem.position_history.append((10, 10))  # revisit again
-        assert mem.is_stuck()
+        for _ in range(3):
+            mem.position_history.append((10, 10))
+            mem.position_history.append((10, 11))
+        assert not mem.is_stuck()
 
     def test_not_stuck_when_moving(self):
         from aif_meta_cogames.aif_agent.cogames_policy import SpatialMemory
@@ -627,4 +625,4 @@ class TestSpatialMemory:
         mem = SpatialMemory()
         mem.position_history.append((10, 10))
         mem.position_history.append((10, 10))
-        assert not mem.is_stuck()  # Only 2 entries, need 6
+        assert not mem.is_stuck()  # Only 2 entries, need 20
