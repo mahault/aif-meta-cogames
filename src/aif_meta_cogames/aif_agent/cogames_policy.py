@@ -63,7 +63,7 @@ from .generative_model import CogsGuardPOMDP
 GEAR_NAMES = ("aligner", "scrambler", "miner", "scout")
 RESOURCE_NAMES = ("carbon", "oxygen", "germanium", "silicon")
 WANDER_DIRECTIONS = ("move_east", "move_south", "move_west", "move_north")
-WANDER_STEPS = 8
+WANDER_STEPS = 15
 
 DIRECTION_DELTAS = {
     "move_north": (-1, 0), "move_south": (1, 0),
@@ -266,15 +266,17 @@ class OptionExecutor:
 
     TIMEOUTS = {
         MacroOption.MINE_CYCLE: 80,
-        MacroOption.CRAFT_CYCLE: 60,
-        MacroOption.CAPTURE_CYCLE: 80,
-        MacroOption.EXPLORE: 30,
+        MacroOption.CRAFT_CYCLE: 200,
+        MacroOption.CAPTURE_CYCLE: 200,
+        MacroOption.EXPLORE: 50,
         MacroOption.DEFEND: 60,
     }
 
     def __init__(self, n_agents: int):
         self.n_agents = n_agents
         self.states = [OptionState() for _ in range(n_agents)]
+        # Role: even=miner, odd=aligner
+        self._is_aligner = [i % 2 == 1 for i in range(n_agents)]
 
     def get_task_policy(self, agent_id: int, obs_ints: list[int]) -> int:
         """Map current option + observation -> task policy."""
@@ -328,9 +330,14 @@ class OptionExecutor:
             if o_inv != ObsInventory.HAS_GEAR and st.steps_in_option > 5:
                 return True
         elif option == MacroOption.EXPLORE:
-            # Found resource or station
-            if o_res >= ObsResource.AT or o_sta > ObsStation.NONE:
-                return True
+            # Miners: any resource or station ends exploration
+            # Aligners: only craft/junction (hub is useless for exploration)
+            if self._is_aligner[agent_id]:
+                if o_sta >= ObsStation.CRAFT:
+                    return True
+            else:
+                if o_res >= ObsResource.AT or o_sta > ObsStation.NONE:
+                    return True
         elif option == MacroOption.DEFEND:
             # Junction secured for 10+ steps
             if o_sta == ObsStation.JUNCTION and o_contest == ObsContest.FREE:
@@ -369,10 +376,16 @@ class OptionExecutor:
 
     @staticmethod
     def _craft_cycle(o_sta, o_inv):
-        """CRAFT_CYCLE: NAV_CRAFT (auto-crafts at dist=0) -> acquire gear."""
+        """CRAFT_CYCLE: hub (get hearts) -> craft station (craft gear).
+
+        Aligners need hearts from the hub before crafting. Bumping a craft
+        station without hearts does nothing.
+        """
         if o_inv == ObsInventory.HAS_GEAR:
             return TaskPolicy.WAIT
-        return TaskPolicy.NAV_CRAFT  # Navigate to craft station (auto-crafts at dist=0)
+        if o_inv == ObsInventory.HAS_RESOURCE:
+            return TaskPolicy.NAV_CRAFT  # Have hearts, go craft gear
+        return TaskPolicy.NAV_DEPOT  # Need hearts from hub first
 
     @staticmethod
     def _capture_cycle(o_sta, o_inv):

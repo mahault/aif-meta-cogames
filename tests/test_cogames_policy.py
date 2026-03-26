@@ -379,18 +379,19 @@ class TestOptionExecutor:
                ObsContest.FREE, 0, 0]
         assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_DEPOT
 
-    def test_craft_cycle_nav_craft(self):
+    def test_craft_cycle_empty_goes_to_hub(self):
+        """No hearts: go to hub first (dinky aligner chain)."""
         executor = OptionExecutor(n_agents=1)
         executor.set_option(0, MacroOption.CRAFT_CYCLE)
         obs = [ObsResource.NONE, ObsStation.NONE, ObsInventory.EMPTY,
                ObsContest.FREE, 0, 0]
-        assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_CRAFT
+        assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_DEPOT
 
-    def test_craft_cycle_nav_craft_at_station(self):
-        """Even at CRAFT station, use NAV_CRAFT (auto-crafts at dist=0)."""
+    def test_craft_cycle_with_resource_goes_to_craft(self):
+        """Has hearts (resource): go to craft station."""
         executor = OptionExecutor(n_agents=1)
         executor.set_option(0, MacroOption.CRAFT_CYCLE)
-        obs = [ObsResource.NONE, ObsStation.CRAFT, ObsInventory.EMPTY,
+        obs = [ObsResource.NONE, ObsStation.NONE, ObsInventory.HAS_RESOURCE,
                ObsContest.FREE, 0, 0]
         assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_CRAFT
 
@@ -440,8 +441,8 @@ class TestOptionTermination:
         executor.set_option(0, MacroOption.EXPLORE)
         obs = [ObsResource.NONE, ObsStation.NONE, ObsInventory.EMPTY,
                ObsContest.FREE, 0, 0]
-        # Tick 30 times (EXPLORE timeout)
-        for _ in range(30):
+        # Tick 50 times (EXPLORE timeout)
+        for _ in range(50):
             executor.tick(0, obs)
         assert executor.check_termination(0, obs) is True
 
@@ -452,12 +453,29 @@ class TestOptionTermination:
                         ObsContest.FREE, 0, 0]
         assert executor.check_termination(0, obs_resource) is True
 
-    def test_explore_terminates_on_station(self):
-        executor = OptionExecutor(n_agents=1)
+    def test_explore_terminates_on_station_miner(self):
+        """Miner (agent 0) terminates EXPLORE on any station (including HUB)."""
+        executor = OptionExecutor(n_agents=2)
         executor.set_option(0, MacroOption.EXPLORE)
         obs_station = [ObsResource.NONE, ObsStation.HUB, ObsInventory.EMPTY,
                        ObsContest.FREE, 0, 0]
         assert executor.check_termination(0, obs_station) is True
+
+    def test_explore_aligner_ignores_hub(self):
+        """Aligner (agent 1) does NOT terminate EXPLORE on HUB."""
+        executor = OptionExecutor(n_agents=2)
+        executor.set_option(1, MacroOption.EXPLORE)
+        obs_hub = [ObsResource.NONE, ObsStation.HUB, ObsInventory.EMPTY,
+                   ObsContest.FREE, 0, 0]
+        assert executor.check_termination(1, obs_hub) is False
+
+    def test_explore_aligner_terminates_on_craft(self):
+        """Aligner (agent 1) terminates EXPLORE on CRAFT station."""
+        executor = OptionExecutor(n_agents=2)
+        executor.set_option(1, MacroOption.EXPLORE)
+        obs_craft = [ObsResource.NONE, ObsStation.CRAFT, ObsInventory.EMPTY,
+                     ObsContest.FREE, 0, 0]
+        assert executor.check_termination(1, obs_craft) is True
 
     def test_mine_cycle_terminates_on_deposit(self):
         executor = OptionExecutor(n_agents=1)

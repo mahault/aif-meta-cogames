@@ -190,9 +190,10 @@ TASK_POLICY_NAMES = [tp.name for tp in TaskPolicy]
 # Feature and tag constants for CogsGuard
 # ---------------------------------------------------------------------------
 
-# Inventory feature names indicating held resources
+# Inventory feature names indicating held resources (includes hearts for aligners)
 RESOURCE_INVENTORY = frozenset([
     "inv:carbon", "inv:oxygen", "inv:germanium", "inv:silicon",
+    "inv:heart",
 ])
 
 # Inventory feature names indicating held gear
