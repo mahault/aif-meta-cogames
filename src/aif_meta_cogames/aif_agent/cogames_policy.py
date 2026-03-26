@@ -34,8 +34,11 @@ import numpy as np
 
 from .discretizer import (
     Hand,
+    NUM_OBS,
+    NUM_TASK_POLICIES,
     ObservationDiscretizer,
     Phase,
+    TASK_POLICY_NAMES,
     TaskPolicy,
     state_factors,
 )
@@ -99,14 +102,22 @@ class AIFBeliefState:
 # Batched AIF Engine (no mettagrid dependency)
 # ---------------------------------------------------------------------------
 
-def _batched_step(agent, batched_obs, empirical_prior):
+def _batched_step(agent, batched_obs, empirical_prior, e_bias):
     """JIT-compilable batched inference step.
 
     Runs infer_states → infer_policies → sample_action →
     update_empirical_prior for all agents in one vectorized call.
+
+    e_bias: (n_agents, n_policies) habit prior applied to q_pi.
+            All-ones = no bias.
     """
     qs = agent.infer_states(batched_obs, empirical_prior=empirical_prior)
     q_pi, _efe = agent.infer_policies(qs)
+
+    # Apply E-vector habit bias to policy posterior
+    q_pi = q_pi * e_bias
+    q_pi = q_pi / jnp.sum(q_pi, axis=-1, keepdims=True)
+
     sampled = agent.sample_action(q_pi)
     task_policies = sampled[:, 0]  # all factors share same action
 
@@ -123,14 +134,28 @@ class BatchedAIFEngine:
     Agent 0's step triggers batched inference over all N agents.
     Agents 1-(N-1) return cached results (1-step lag, negligible for POMDP).
     Navigator stays per-agent (cheap, needs current obs).
+
+    Learning mechanisms:
+    - **B-learning**: Online Dirichlet updates to transition model (pB)
+    - **C-from-reward**: Update C preferences from intrinsic reward signal
+    - **E-vector**: Habit prior that reinforces successful task policies
     """
 
     def __init__(self, n_agents: int = 8, learn_B: bool = False,
-                 learn_interval: int = 10, policy_len: int = 2):
+                 learn_interval: int = 50, policy_len: int = 2,
+                 learn_C: bool = False, learn_E: bool = False,
+                 c_learning_rate: float = 0.1, e_learning_rate: float = 0.05,
+                 c_update_interval: int = 200):
         self.n_agents = n_agents
         self.learn_B = learn_B
         self.learn_interval = learn_interval
+        self.learn_C = learn_C
+        self.learn_E = learn_E
+        self.c_learning_rate = c_learning_rate
+        self.e_learning_rate = e_learning_rate
+        self.c_update_interval = c_update_interval
         self._step_count = 0
+
         self.agent = CogsGuardPOMDP.create_batched_agent(
             n_agents, learn_B=learn_B, policy_len=policy_len
         )
@@ -148,17 +173,31 @@ class BatchedAIFEngine:
         # Cached task policies from last batch
         self._cached_policies = [int(TaskPolicy.EXPLORE)] * n_agents
 
-        # Learning buffers
+        # B-learning buffers
         self._prev_qs = None
         self._prev_obs = None
         self._prev_actions = None
+
+        # C-from-reward and E-vector learning buffers
+        if learn_C or learn_E:
+            self._prev_discrete_obs = [[0] * 6 for _ in range(n_agents)]
+            # Per-role (0=miner, 1=aligner) reward accumulators
+            self._c_reward_sum = [np.zeros((2, n)) for n in NUM_OBS]
+            self._c_reward_count = [np.zeros((2, n)) for n in NUM_OBS]
+            # Per-role action reward tracking for E-vector
+            self._e_action_reward_sum = np.zeros((2, NUM_TASK_POLICIES))
+            self._e_action_reward_count = np.zeros((2, NUM_TASK_POLICIES))
+
+        # E-vector habit bias: (n_agents, n_policies), all-ones = neutral
+        n_policies = self.agent.policies.shape[0]
+        self._e_bias = jnp.ones((n_agents, n_policies))
 
         # JIT-compile the batched step function
         self._jit_step = eqx.filter_jit(_batched_step)
 
         # Warmup JIT compilation (avoids timeout on first eval step)
         dummy_obs = [jnp.zeros((n_agents, 1), dtype=jnp.int32) for _ in range(6)]
-        self._jit_step(self.agent, dummy_obs, self.empirical_prior)
+        self._jit_step(self.agent, dummy_obs, self.empirical_prior, self._e_bias)
 
     def submit_and_get_policy(self, agent_id: int, jax_obs: list) -> int:
         """Store obs for agent_id and return its task policy.
@@ -166,6 +205,14 @@ class BatchedAIFEngine:
         Agent 0 triggers batched inference for all agents.
         Others return cached policies (1-step lag).
         """
+        # Accumulate reward data for C/E learning
+        if self.learn_C or self.learn_E:
+            curr_obs_ints = [int(o[0]) for o in jax_obs]
+            prev_obs_ints = self._prev_discrete_obs[agent_id]
+            reward = self._compute_intrinsic_reward(curr_obs_ints, prev_obs_ints)
+            self._accumulate_reward(agent_id, curr_obs_ints, reward)
+            self._prev_discrete_obs[agent_id] = curr_obs_ints
+
         self._obs_buffer[agent_id] = jax_obs
 
         if agent_id == 0:
@@ -180,6 +227,72 @@ class BatchedAIFEngine:
         # qs[f] shape: (batch, T, n_states_f) → index by agent_id
         return [q[agent_id] for q in self.qs]
 
+    # ------------------------------------------------------------------
+    # Intrinsic reward (economy chain progress)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_intrinsic_reward(curr_obs, prev_obs):
+        """Compute intrinsic reward from observation transitions.
+
+        Measures economy chain progress:
+        - Inventory gain (picked up resource/gear) → high reward
+        - Arriving at station → moderate reward
+        - Junction contest improvement → highest reward
+        - Idle (no obs change) → penalty
+        """
+        reward = 0.0
+
+        # Inventory change (obs[2]): EMPTY=0, RESOURCE=1, GEAR=2
+        inv_delta = curr_obs[2] - prev_obs[2]
+        if inv_delta > 0:
+            reward += 3.0 * inv_delta  # acquired resource or gear
+        elif inv_delta < 0 and curr_obs[1] > 0:
+            reward += 2.0  # deposited/used at station (productive)
+
+        # Arrived at station (obs[1]): NONE=0, HUB=1, CRAFT=2, JUNCTION=3
+        if curr_obs[1] > 0 and prev_obs[1] == 0:
+            reward += 1.0 + curr_obs[1] * 0.5
+
+        # Resource proximity (obs[0]): NONE=0, NEAR=1, AT=2
+        if curr_obs[0] > prev_obs[0]:
+            reward += 0.5
+
+        # Contest improvement (obs[3]): FREE=0, CONTESTED=1, LOST=2
+        if prev_obs[3] > 0 and curr_obs[3] < prev_obs[3]:
+            reward += 5.0  # improved junction control
+        elif curr_obs[3] > prev_obs[3]:
+            reward -= 1.0
+
+        # Idle penalty
+        if curr_obs == prev_obs:
+            reward -= 0.3
+
+        return reward
+
+    def _accumulate_reward(self, agent_id, obs_vals, reward):
+        """Accumulate obs-reward and action-reward data for C/E learning."""
+        role_idx = 0 if agent_id % 2 == 0 else 1  # 0=miner, 1=aligner
+
+        # C-from-reward: which obs values correlate with reward
+        if self.learn_C:
+            for m in range(6):
+                v = obs_vals[m]
+                if v < NUM_OBS[m]:
+                    self._c_reward_sum[m][role_idx, v] += reward
+                    self._c_reward_count[m][role_idx, v] += 1
+
+        # E-vector: which prior actions correlate with reward
+        if self.learn_E and self._step_count > 0:
+            prev_action = self._cached_policies[agent_id]
+            if prev_action < NUM_TASK_POLICIES:
+                self._e_action_reward_sum[role_idx, prev_action] += reward
+                self._e_action_reward_count[role_idx, prev_action] += 1
+
+    # ------------------------------------------------------------------
+    # Batch inference
+    # ------------------------------------------------------------------
+
     def _run_batch(self):
         """Run batched inference over all agents."""
         # Stack obs: (n_agents, T=1) per modality
@@ -191,7 +304,7 @@ class BatchedAIFEngine:
             batched_obs.append(stacked)
 
         policies, new_prior, qs, pomdp_action = self._jit_step(
-            self.agent, batched_obs, self.empirical_prior
+            self.agent, batched_obs, self.empirical_prior, self._e_bias
         )
 
         self.empirical_prior = new_prior
@@ -204,21 +317,37 @@ class BatchedAIFEngine:
                 and self._step_count % self.learn_interval == 0):
             self._update_B(batched_obs, qs, pomdp_action)
 
+        # C-from-reward and E-vector updates
+        if ((self.learn_C or self.learn_E)
+                and self._step_count > 0
+                and self._step_count % self.c_update_interval == 0):
+            if self.learn_C:
+                self._update_C_from_reward()
+            if self.learn_E:
+                self._update_E_from_reward()
+
         # Periodic logging (every 500 steps)
         if self._step_count % 500 == 0:
             actions = [int(policies[i]) for i in range(self.n_agents)]
-            from .discretizer import TASK_POLICY_NAMES
             action_names = [TASK_POLICY_NAMES[a] for a in actions]
-            pB_info = ""
+            extras = []
             if self.learn_B and hasattr(self.agent, 'pB') and self.agent.pB is not None:
                 pB_sum = sum(float(pb.sum()) for pb in self.agent.pB)
-                pB_info = f", pB_total={pB_sum:.0f}"
-            print(f"[AIF step={self._step_count}] actions={action_names}{pB_info}")
+                extras.append(f"pB={pB_sum:.0f}")
+            if self.learn_E:
+                e_range = float(self._e_bias.max() - self._e_bias.min())
+                extras.append(f"E_range={e_range:.2f}")
+            extra_str = f", {', '.join(extras)}" if extras else ""
+            print(f"[AIF step={self._step_count}] actions={action_names}{extra_str}")
 
         # Store for next learning step
         self._prev_qs = qs
         self._prev_obs = batched_obs
         self._prev_actions = pomdp_action
+
+    # ------------------------------------------------------------------
+    # B-learning (Dirichlet updates)
+    # ------------------------------------------------------------------
 
     def _update_B(self, curr_obs, curr_qs, curr_actions):
         """Update B matrices via online Dirichlet learning.
@@ -244,6 +373,88 @@ class BatchedAIFEngine:
             lr_pA=0.0,
             lr_pB=1.0,
         )
+
+    # ------------------------------------------------------------------
+    # C-from-reward learning
+    # ------------------------------------------------------------------
+
+    def _update_C_from_reward(self):
+        """Update C preferences from accumulated reward-observation correlations.
+
+        For each modality m and obs value v, computes:
+            C_new[m][v] = mean(reward when obs[m] == v)
+        Then applies EMA: C = (1-lr) * C_old + lr * C_new
+        """
+        lr = self.c_learning_rate
+        new_C = []
+
+        for m in range(6):
+            per_agent = []
+            for i in range(self.n_agents):
+                role_idx = 0 if i % 2 == 0 else 1
+                old_c = np.array(self.agent.C[m][i])
+                c_new = np.copy(old_c)
+
+                for v in range(NUM_OBS[m]):
+                    count = self._c_reward_count[m][role_idx, v]
+                    if count > 5:  # minimum samples for reliable estimate
+                        mean_reward = self._c_reward_sum[m][role_idx, v] / count
+                        c_new[v] = (1 - lr) * old_c[v] + lr * mean_reward
+
+                per_agent.append(c_new)
+            new_C.append(jnp.array(np.stack(per_agent)))
+
+        self.agent = eqx.tree_at(lambda a: a.C, self.agent, new_C)
+
+        # Clear accumulators
+        self._c_reward_sum = [np.zeros((2, n)) for n in NUM_OBS]
+        self._c_reward_count = [np.zeros((2, n)) for n in NUM_OBS]
+
+    # ------------------------------------------------------------------
+    # E-vector habit learning
+    # ------------------------------------------------------------------
+
+    def _update_E_from_reward(self):
+        """Update E-vector (habit prior) from action-reward correlations.
+
+        Reinforces policies whose first action correlates with high reward.
+        E[π] ∝ exp(mean_reward[first_action_of_π])
+        Applied as multiplicative bias on q_pi in _batched_step.
+        """
+        n_policies = self.agent.policies.shape[0]
+        new_e = np.ones((self.n_agents, n_policies))
+
+        for i in range(self.n_agents):
+            role_idx = 0 if i % 2 == 0 else 1
+
+            # Mean reward per action for this role
+            action_values = np.zeros(NUM_TASK_POLICIES)
+            for a in range(NUM_TASK_POLICIES):
+                count = self._e_action_reward_count[role_idx, a]
+                if count > 3:
+                    action_values[a] = (
+                        self._e_action_reward_sum[role_idx, a] / count
+                    )
+
+            # Map action values to policies (by first action)
+            for pi_idx in range(n_policies):
+                first_action = int(self.agent.policies[pi_idx, 0, 0])
+                new_e[i, pi_idx] = np.exp(
+                    np.clip(action_values[first_action], -5, 5)
+                )
+
+            # Normalize so mean = 1 (neutral baseline)
+            new_e[i] /= new_e[i].mean()
+
+        # EMA update
+        lr = self.e_learning_rate
+        old_e = np.array(self._e_bias)
+        updated_e = (1 - lr) * old_e + lr * new_e
+        self._e_bias = jnp.array(updated_e)
+
+        # Clear accumulators
+        self._e_action_reward_sum = np.zeros((2, NUM_TASK_POLICIES))
+        self._e_action_reward_count = np.zeros((2, NUM_TASK_POLICIES))
 
 
 # ---------------------------------------------------------------------------
@@ -581,7 +792,10 @@ class AIFPolicy(_MultiAgentPolicy):
 
         # One shared engine for all agents (JIT-compiled, batched)
         self._engine = BatchedAIFEngine(
-            n_agents=n_agents, learn_B=True, policy_len=2
+            n_agents=n_agents, learn_B=True, learn_C=True, learn_E=True,
+            policy_len=2, learn_interval=50,
+            c_learning_rate=0.1, e_learning_rate=0.05,
+            c_update_interval=200,
         )
         self._agents: dict[int, _StatefulAgentPolicy] = {}
 
