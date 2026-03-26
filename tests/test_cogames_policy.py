@@ -370,12 +370,13 @@ class TestOptionExecutor:
                ObsContest.FREE, 0, 0]
         assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_DEPOT
 
-    def test_mine_cycle_deposit_at_hub(self):
+    def test_mine_cycle_nav_depot_at_hub(self):
+        """Even at HUB, use NAV_DEPOT (auto-deposits at dist=0)."""
         executor = OptionExecutor(n_agents=1)
         executor.set_option(0, MacroOption.MINE_CYCLE)
         obs = [ObsResource.NONE, ObsStation.HUB, ObsInventory.HAS_RESOURCE,
                ObsContest.FREE, 0, 0]
-        assert executor.get_task_policy(0, obs) == TaskPolicy.DEPOSIT
+        assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_DEPOT
 
     def test_craft_cycle_nav_craft(self):
         executor = OptionExecutor(n_agents=1)
@@ -384,12 +385,13 @@ class TestOptionExecutor:
                ObsContest.FREE, 0, 0]
         assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_CRAFT
 
-    def test_craft_cycle_craft_at_station(self):
+    def test_craft_cycle_nav_craft_at_station(self):
+        """Even at CRAFT station, use NAV_CRAFT (auto-crafts at dist=0)."""
         executor = OptionExecutor(n_agents=1)
         executor.set_option(0, MacroOption.CRAFT_CYCLE)
         obs = [ObsResource.NONE, ObsStation.CRAFT, ObsInventory.EMPTY,
                ObsContest.FREE, 0, 0]
-        assert executor.get_task_policy(0, obs) == TaskPolicy.CRAFT
+        assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_CRAFT
 
     def test_capture_cycle_nav_junction(self):
         executor = OptionExecutor(n_agents=1)
@@ -398,12 +400,13 @@ class TestOptionExecutor:
                ObsContest.FREE, 0, 0]
         assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_JUNCTION
 
-    def test_capture_cycle_capture_at_junction(self):
+    def test_capture_cycle_nav_junction_at_junction(self):
+        """Even at JUNCTION, use NAV_JUNCTION (auto-captures at dist=0)."""
         executor = OptionExecutor(n_agents=1)
         executor.set_option(0, MacroOption.CAPTURE_CYCLE)
         obs = [ObsResource.NONE, ObsStation.JUNCTION, ObsInventory.HAS_GEAR,
                ObsContest.FREE, 0, 0]
-        assert executor.get_task_policy(0, obs) == TaskPolicy.CAPTURE
+        assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_JUNCTION
 
     def test_capture_cycle_no_gear_waits(self):
         executor = OptionExecutor(n_agents=1)
@@ -419,12 +422,13 @@ class TestOptionExecutor:
                ObsContest.FREE, 0, 0]
         assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_JUNCTION
 
-    def test_defend_capture_at_junction(self):
+    def test_defend_nav_junction_at_junction(self):
+        """Even at JUNCTION, use NAV_JUNCTION (auto-captures at dist=0)."""
         executor = OptionExecutor(n_agents=1)
         executor.set_option(0, MacroOption.DEFEND)
         obs = [ObsResource.NONE, ObsStation.JUNCTION, ObsInventory.EMPTY,
                ObsContest.FREE, 0, 0]
-        assert executor.get_task_policy(0, obs) == TaskPolicy.CAPTURE
+        assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_JUNCTION
 
 
 class TestOptionTermination:

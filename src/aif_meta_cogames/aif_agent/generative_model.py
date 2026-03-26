@@ -109,7 +109,13 @@ def build_default_A() -> list[np.ndarray]:
             a_sta[ObsStation.CRAFT, p] = 0.85
         elif p == Phase.CAPTURE:
             a_sta[ObsStation.JUNCTION, p] = 0.85
-        else:
+        elif p == Phase.MINE:
+            # Miners work near extractors which are near hubs —
+            # elevated HUB probability makes MINE observationally
+            # distinct from EXPLORE on the station modality.
+            a_sta[ObsStation.NONE, p] = 0.55
+            a_sta[ObsStation.HUB, p] = 0.30
+        else:  # EXPLORE
             a_sta[ObsStation.NONE, p] = 0.85
         a_sta[:, p] /= a_sta[:, p].sum()
     A.append(a_sta)
@@ -592,8 +598,8 @@ def build_C_miner() -> list[np.ndarray]:
     deposit at hub, repeat. Avoids junctions and combat.
     """
     c_res = np.array([-1.0, 1.0, 3.0])          # penalize NONE, AT resource best
-    c_sta = np.array([-0.5, 2.5, 0.5, 0.0])     # penalize NONE, HUB best
-    c_inv = np.array([-1.0, 2.5, 0.0])           # penalize EMPTY strongly
+    c_sta = np.array([-1.0, 4.0, -1.0, -1.0])   # HUB best, penalize craft/junction
+    c_inv = np.array([-2.0, 4.0, -2.0])          # penalize EMPTY and GEAR
     c_con = np.array([0.5, 0.0, 0.0])            # prefer FREE (avoid combat)
     c_soc = np.array([0.0, 0.5, -0.5, 0.0])     # ALONE, ALLY, ENEMY, BOTH
     c_role = np.array([0.3, 0.0])                # SAME_ROLE, DIFFERENT
@@ -607,8 +613,8 @@ def build_C_aligner() -> list[np.ndarray]:
     then navigate to junctions and capture them. Strongly prefers junctions.
     """
     c_res = np.array([-0.5, 0.0, 0.5])          # penalize NONE
-    c_sta = np.array([-0.5, 1.0, 2.5, 5.0])     # penalize NONE, JUNCTION strongest
-    c_inv = np.array([-0.5, 0.5, 3.5])           # penalize EMPTY, GEAR best
+    c_sta = np.array([-1.0, 0.0, 3.0, 7.0])     # JUNCTION strongest, penalize NONE
+    c_inv = np.array([-1.0, -1.0, 5.0])          # penalize EMPTY and RESOURCE
     c_con = np.array([2.5, -1.0, -3.0])          # FREE strong, LOST very bad
     c_soc = np.array([0.0, 1.0, -1.0, 0.0])     # prefer allies, avoid enemies
     c_role = np.array([0.3, 0.0])                # SAME_ROLE, DIFFERENT
@@ -897,6 +903,35 @@ class CogsGuardPOMDP:
 
         agent = eqx.tree_at(lambda a: a.C, agent, C_batched)
         agent = eqx.tree_at(lambda a: a.D, agent, D_batched)
+
+        # Per-role E-vector (habit prior over option policies).
+        # q(π) ∝ σ(-G(π)) · E(π) — biases option selection by role
+        # without disabling epistemic drive.
+        # 25 policies: [0-4]=MINE first, [5-9]=CRAFT first,
+        # [10-14]=CAPTURE first, [15-19]=EXPLORE first, [20-24]=DEFEND first.
+        n_policies = policies.shape[0]
+        E_miner = np.ones(n_policies)
+        E_aligner = np.ones(n_policies)
+
+        E_miner[0:5] = 3.0    # MINE first
+        E_miner[15:20] = 2.0  # EXPLORE first (find resources)
+        E_miner[5:10] = 0.3   # CRAFT first (not miner's job)
+        E_miner[10:15] = 0.3  # CAPTURE first (not miner's job)
+
+        E_aligner[5:10] = 3.0   # CRAFT first
+        E_aligner[10:15] = 3.0  # CAPTURE first
+        E_aligner[0:5] = 0.3    # MINE first (not aligner's job)
+
+        E_miner /= E_miner.sum()
+        E_aligner /= E_aligner.sum()
+
+        E_batched = []
+        for i in range(n_agents):
+            e = E_miner if i % 2 == 0 else E_aligner
+            E_batched.append(e)
+        E_batched = jnp.array(np.stack(E_batched))
+
+        agent = eqx.tree_at(lambda a: a.E, agent, E_batched)
 
         return agent
 

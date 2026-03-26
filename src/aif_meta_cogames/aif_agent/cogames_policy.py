@@ -252,41 +252,33 @@ class OptionExecutor:
 
     @staticmethod
     def _mine_cycle(o_res, o_sta, o_inv):
-        """MINE_CYCLE: NAV_RESOURCE -> MINE -> NAV_DEPOT -> DEPOSIT."""
+        """MINE_CYCLE: NAV_RESOURCE -> MINE -> NAV_DEPOT (auto-deposit at dist=0)."""
         if o_inv == ObsInventory.EMPTY:
             if o_res >= ObsResource.AT:
-                return TaskPolicy.MINE
+                return TaskPolicy.MINE  # AT = dist ≤ 1, close enough
             return TaskPolicy.NAV_RESOURCE
         elif o_inv == ObsInventory.HAS_RESOURCE:
-            if o_sta == ObsStation.HUB:
-                return TaskPolicy.DEPOSIT
-            return TaskPolicy.NAV_DEPOT
+            return TaskPolicy.NAV_DEPOT  # Navigate to hub (auto-deposits at dist=0)
         return TaskPolicy.NAV_RESOURCE
 
     @staticmethod
     def _craft_cycle(o_sta, o_inv):
-        """CRAFT_CYCLE: NAV_CRAFT -> CRAFT -> acquire gear."""
+        """CRAFT_CYCLE: NAV_CRAFT (auto-crafts at dist=0) -> acquire gear."""
         if o_inv == ObsInventory.HAS_GEAR:
             return TaskPolicy.WAIT
-        if o_sta == ObsStation.CRAFT:
-            return TaskPolicy.CRAFT
-        return TaskPolicy.NAV_CRAFT
+        return TaskPolicy.NAV_CRAFT  # Navigate to craft station (auto-crafts at dist=0)
 
     @staticmethod
     def _capture_cycle(o_sta, o_inv):
-        """CAPTURE_CYCLE: requires gear, NAV_JUNCTION -> CAPTURE."""
+        """CAPTURE_CYCLE: requires gear, NAV_JUNCTION (auto-captures at dist=0)."""
         if o_inv != ObsInventory.HAS_GEAR:
             return TaskPolicy.WAIT
-        if o_sta == ObsStation.JUNCTION:
-            return TaskPolicy.CAPTURE
-        return TaskPolicy.NAV_JUNCTION
+        return TaskPolicy.NAV_JUNCTION  # Navigate to junction (auto-captures at dist=0)
 
     @staticmethod
     def _defend(o_sta):
         """DEFEND: go to junction and hold it."""
-        if o_sta == ObsStation.JUNCTION:
-            return TaskPolicy.CAPTURE
-        return TaskPolicy.NAV_JUNCTION
+        return TaskPolicy.NAV_JUNCTION  # Navigate to junction (auto-captures at dist=0)
 
 
 # ---------------------------------------------------------------------------
