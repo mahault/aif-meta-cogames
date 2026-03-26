@@ -65,6 +65,115 @@ RESOURCE_NAMES = ("carbon", "oxygen", "germanium", "silicon")
 WANDER_DIRECTIONS = ("move_east", "move_south", "move_west", "move_north")
 WANDER_STEPS = 8
 
+DIRECTION_DELTAS = {
+    "move_north": (-1, 0), "move_south": (1, 0),
+    "move_east": (0, 1), "move_west": (0, -1),
+}
+OPPOSITES = {
+    "move_north": "move_south", "move_south": "move_north",
+    "move_east": "move_west", "move_west": "move_east",
+}
+
+
+# ---------------------------------------------------------------------------
+# Spatial memory (persistent world model for navigation)
+# ---------------------------------------------------------------------------
+
+class SpatialMemory:
+    """Persistent spatial memory for navigation on partially-observed maps.
+
+    Tracks absolute position (from lp:* observation tokens), walls,
+    stations, and explored territory.  Enables navigating toward
+    remembered targets when they're outside the 13x13 observation window.
+    """
+
+    def __init__(self):
+        self.position: Optional[tuple[int, int]] = None
+        self.walls: set[tuple[int, int]] = set()
+        self.stations: dict[tuple[int, int], str] = {}
+        self.explored: set[tuple[int, int]] = set()
+        self.position_history: list[tuple[int, int]] = []
+
+    def update(self, obs: Any, center: tuple[int, int],
+               wall_tag_ids: set[int], station_tag_map: dict[int, str]):
+        """Update memory from current observation tokens."""
+        # 1. Parse lp:* tokens for absolute position (offset from spawn)
+        lp_row, lp_col, has_lp = 0, 0, False
+        for token in obs.tokens:
+            name = token.feature.name
+            if name == "lp:south":
+                lp_row = int(token.value); has_lp = True
+            elif name == "lp:north":
+                lp_row = -int(token.value); has_lp = True
+            elif name == "lp:east":
+                lp_col = int(token.value); has_lp = True
+            elif name == "lp:west":
+                lp_col = -int(token.value); has_lp = True
+
+        if has_lp:
+            self.position = (lp_row, lp_col)
+        if self.position is None:
+            return
+
+        # Track position history for stuck detection
+        self.position_history.append(self.position)
+        if len(self.position_history) > 30:
+            self.position_history.pop(0)
+
+        # 2. Scan spatial tokens for walls and stations
+        cr, cc = center
+        for token in obs.tokens:
+            if token.feature.name != "tag":
+                continue
+            loc = token.location
+            if loc is None:
+                continue
+            abs_pos = (self.position[0] + loc[0] - cr,
+                       self.position[1] + loc[1] - cc)
+            val = token.value
+            if val in wall_tag_ids:
+                self.walls.add(abs_pos)
+            elif val in station_tag_map:
+                self.stations[abs_pos] = station_tag_map[val]
+
+        # 3. Mark observed area as explored
+        for dr in range(-cr, cr + 1):
+            for dc in range(-cc, cc + 1):
+                self.explored.add((self.position[0] + dr,
+                                   self.position[1] + dc))
+
+    def is_wall_adjacent(self, direction: str) -> bool:
+        """Check if moving in direction hits a known wall."""
+        if self.position is None:
+            return False
+        dr, dc = DIRECTION_DELTAS.get(direction, (0, 0))
+        return (self.position[0] + dr, self.position[1] + dc) in self.walls
+
+    def find_nearest_station(self, category: str) -> Optional[tuple[int, int]]:
+        """Find nearest remembered station of given category (absolute pos)."""
+        if self.position is None:
+            return None
+        best, best_dist = None, float("inf")
+        for pos, cat in self.stations.items():
+            if cat != category:
+                continue
+            dist = abs(pos[0] - self.position[0]) + abs(pos[1] - self.position[1])
+            if dist < best_dist:
+                best_dist = dist
+                best = pos
+        return best
+
+    def is_stuck(self) -> bool:
+        """Detect stuck from position history."""
+        h = self.position_history
+        if len(h) < 6:
+            return False
+        if len(set(h[-6:])) <= 2:
+            return True
+        if len(h) >= 20 and h[:-10].count(h[-1]) >= 2:
+            return True
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Mettagrid-independent utilities
@@ -108,6 +217,7 @@ class AIFBeliefState:
     last_phase: int = 0
     last_hand: int = 0
     last_task_policy: int = TaskPolicy.EXPLORE
+    spatial_memory: Optional[SpatialMemory] = None
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +647,18 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
         self._junction_tags = self._resolve_tag_ids(["junction"])
         self._heart_source_tags = self._resolve_tag_ids(["hub", "chest"])
 
+        # Spatial memory support: wall tags + station tag map
+        self._wall_tags = self._resolve_tag_ids(["wall"])
+        self._station_tag_map: dict[int, str] = {}
+        for tid in self._extractor_tags:
+            self._station_tag_map[tid] = "extractor"
+        for tid in self._hub_tags:
+            self._station_tag_map[tid] = "hub"
+        for tid in self._craft_tags:
+            self._station_tag_map[tid] = "craft"
+        for tid in self._junction_tags:
+            self._station_tag_map[tid] = "junction"
+
     def _resolve_tag_ids(self, names: list[str]) -> set[int]:
         """Resolve tag names to tag value IDs (handles type: prefix)."""
         tag_ids: set[int] = set()
@@ -552,12 +674,20 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
         """Create initial navigator state (beliefs are in the shared engine)."""
         return AIFBeliefState(
             wander_dir=self._agent_id % len(WANDER_DIRECTIONS),
+            spatial_memory=SpatialMemory(),
         )
 
     def step_with_state(
         self, obs: _AgentObservation, state: AIFBeliefState
     ) -> tuple[_Action, AIFBeliefState]:
         """Run one step of the AIF agent."""
+        # 0. Update spatial memory from raw observation
+        if state.spatial_memory is None:
+            state.spatial_memory = SpatialMemory()
+        state.spatial_memory.update(
+            obs, self._center, self._wall_tags, self._station_tag_map
+        )
+
         # 1. Convert AgentObservation -> numpy array
         obs_array = self._obs_to_array(obs)
 
@@ -615,45 +745,44 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
         to do it (spatial movement toward the right target).
         """
         if task_policy == TaskPolicy.NAV_RESOURCE:
-            return self._navigate_to_tags(self._extractor_tags, obs, state)
+            return self._navigate_to_tags(
+                self._extractor_tags, obs, state, category="extractor")
 
         elif task_policy == TaskPolicy.MINE:
-            # At extractor -- interact (noop to mine)
             return self._action("noop"), state
 
         elif task_policy == TaskPolicy.NAV_DEPOT:
-            return self._navigate_to_tags(self._hub_tags, obs, state)
+            return self._navigate_to_tags(
+                self._hub_tags, obs, state, category="hub")
 
         elif task_policy == TaskPolicy.DEPOSIT:
-            # At hub -- interact (noop to deposit)
             return self._action("noop"), state
 
         elif task_policy == TaskPolicy.NAV_CRAFT:
-            return self._navigate_to_tags(self._craft_tags, obs, state)
+            return self._navigate_to_tags(
+                self._craft_tags, obs, state, category="craft")
 
         elif task_policy == TaskPolicy.CRAFT:
-            # At craft station -- interact (noop to craft)
             return self._action("noop"), state
 
         elif task_policy == TaskPolicy.NAV_GEAR:
-            return self._navigate_to_tags(self._craft_tags, obs, state)
+            return self._navigate_to_tags(
+                self._craft_tags, obs, state, category="craft")
 
         elif task_policy == TaskPolicy.ACQUIRE_GEAR:
-            # At gear station -- interact (noop to pick up)
             return self._action("noop"), state
 
         elif task_policy == TaskPolicy.NAV_JUNCTION:
-            return self._navigate_to_tags(self._junction_tags, obs, state)
+            return self._navigate_to_tags(
+                self._junction_tags, obs, state, category="junction")
 
         elif task_policy == TaskPolicy.CAPTURE:
-            # At junction -- interact (noop to capture)
             return self._action("noop"), state
 
         elif task_policy == TaskPolicy.EXPLORE:
             return self._wander(state)
 
         elif task_policy == TaskPolicy.YIELD:
-            # Move away from nearest agent (simple: opposite of nearest)
             return self._wander(state)
 
         elif task_policy == TaskPolicy.WAIT:
@@ -667,10 +796,28 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
         tag_ids: set[int],
         obs: _AgentObservation,
         state: AIFBeliefState,
+        category: Optional[str] = None,
     ) -> tuple[_Action, AIFBeliefState]:
-        """Navigate toward the closest entity with matching tags."""
+        """Navigate toward nearest entity with matching tags.
+
+        Falls back to spatial memory when target is outside the 13x13 view.
+        """
+        # 1. Visible target (egocentric)
         target_loc = self._closest_tag_location(obs, tag_ids)
-        return self._move_toward(target_loc, state)
+        if target_loc is not None:
+            return self._move_toward(target_loc, state)
+
+        # 2. Remembered target (spatial memory)
+        mem = state.spatial_memory
+        if mem is not None and mem.position is not None and category:
+            station_pos = mem.find_nearest_station(category)
+            if station_pos is not None:
+                ego_r = station_pos[0] - mem.position[0] + self._center[0]
+                ego_c = station_pos[1] - mem.position[1] + self._center[1]
+                return self._move_toward((ego_r, ego_c), state)
+
+        # 3. Nothing known — wander
+        return self._wander(state)
 
     # ------------------------------------------------------------------
     # Inventory parsing (adapted from starter_agent.py)
@@ -732,7 +879,13 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
         target: Optional[tuple[int, int]],
         state: AIFBeliefState,
     ) -> tuple[_Action, AIFBeliefState]:
-        """Move toward target location, or wander if no target visible."""
+        """Move toward target, avoiding walls and detecting stuck state."""
+        mem = state.spatial_memory
+
+        # Stuck detection and recovery
+        if mem is not None and mem.is_stuck():
+            return self._break_stuck(state)
+
         if target is None:
             return self._wander(state)
 
@@ -742,19 +895,62 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
         if dr == 0 and dc == 0:
             return self._action("noop"), state
 
+        # Compute direction priority: primary, secondary, perpendiculars
         if abs(dr) >= abs(dc):
-            direction = "move_south" if dr > 0 else "move_north"
+            primary = "move_south" if dr > 0 else "move_north"
+            secondary = ("move_east" if dc > 0 else "move_west") if dc != 0 else primary
         else:
-            direction = "move_east" if dc > 0 else "move_west"
+            primary = "move_east" if dc > 0 else "move_west"
+            secondary = ("move_south" if dr > 0 else "move_north") if dr != 0 else primary
 
-        return self._action(direction), state
+        candidates = [primary]
+        if secondary != primary:
+            candidates.append(secondary)
+        for d in DIRECTION_DELTAS:
+            if d not in candidates and d != OPPOSITES.get(primary):
+                candidates.append(d)
+        opp = OPPOSITES.get(primary)
+        if opp and opp not in candidates:
+            candidates.append(opp)
+
+        # Try each direction, skip known walls
+        for direction in candidates:
+            if mem is not None and mem.is_wall_adjacent(direction):
+                continue
+            return self._action(direction), state
+
+        return self._action("noop"), state  # surrounded by walls
+
+    def _break_stuck(self, state: AIFBeliefState) -> tuple[_Action, AIFBeliefState]:
+        """Break stuck state with random non-wall direction."""
+        import random
+        mem = state.spatial_memory
+        dirs = list(DIRECTION_DELTAS.keys())
+        random.shuffle(dirs)
+        for d in dirs:
+            if mem is None or not mem.is_wall_adjacent(d):
+                if mem is not None:
+                    mem.position_history.clear()
+                state.wander_dir = (state.wander_dir + 1) % len(WANDER_DIRECTIONS)
+                state.wander_steps = WANDER_STEPS
+                return self._action(d), state
+        return self._action("noop"), state
 
     def _wander(self, state: AIFBeliefState) -> tuple[_Action, AIFBeliefState]:
-        """Wander in a rectangular pattern when no target is visible."""
+        """Wander in a rectangular pattern, avoiding walls."""
         if state.wander_steps <= 0:
             state.wander_dir = (state.wander_dir + 1) % len(WANDER_DIRECTIONS)
             state.wander_steps = WANDER_STEPS
+
         direction = WANDER_DIRECTIONS[state.wander_dir]
+        mem = state.spatial_memory
+
+        if mem is not None and mem.is_wall_adjacent(direction):
+            # Wall ahead — rotate to next direction
+            state.wander_dir = (state.wander_dir + 1) % len(WANDER_DIRECTIONS)
+            state.wander_steps = WANDER_STEPS
+            direction = WANDER_DIRECTIONS[state.wander_dir]
+
         state.wander_steps -= 1
         return self._action(direction), state
 

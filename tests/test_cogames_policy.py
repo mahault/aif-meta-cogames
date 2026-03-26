@@ -531,3 +531,100 @@ class TestHierarchicalEngine:
         # Options should have steps > 0 (persisting)
         for i in range(2):
             assert engine.option_executor.states[i].steps_in_option > 0
+
+
+class TestSpatialMemory:
+    """Test spatial memory for navigation."""
+
+    def test_wall_tracking(self):
+        from aif_meta_cogames.aif_agent.cogames_policy import SpatialMemory
+        mem = SpatialMemory()
+        mem.position = (10, 10)
+        mem.walls.add((10, 11))
+        mem.walls.add((9, 10))
+        assert (10, 11) in mem.walls
+        assert (10, 12) not in mem.walls
+
+    def test_is_wall_adjacent(self):
+        from aif_meta_cogames.aif_agent.cogames_policy import SpatialMemory
+        mem = SpatialMemory()
+        mem.position = (10, 10)
+        mem.walls.add((10, 11))  # wall to the east
+        mem.walls.add((9, 10))   # wall to the north
+        assert mem.is_wall_adjacent("move_east")
+        assert mem.is_wall_adjacent("move_north")
+        assert not mem.is_wall_adjacent("move_south")
+        assert not mem.is_wall_adjacent("move_west")
+
+    def test_is_wall_adjacent_no_position(self):
+        from aif_meta_cogames.aif_agent.cogames_policy import SpatialMemory
+        mem = SpatialMemory()
+        # No position set → should return False
+        assert not mem.is_wall_adjacent("move_east")
+
+    def test_station_memory(self):
+        from aif_meta_cogames.aif_agent.cogames_policy import SpatialMemory
+        mem = SpatialMemory()
+        mem.position = (10, 10)
+        mem.stations[(50, 50)] = "hub"
+        mem.stations[(20, 20)] = "extractor"
+        mem.stations[(30, 30)] = "craft"
+        nearest_ext = mem.find_nearest_station("extractor")
+        assert nearest_ext == (20, 20)
+        nearest_hub = mem.find_nearest_station("hub")
+        assert nearest_hub == (50, 50)
+
+    def test_find_nearest_station_no_match(self):
+        from aif_meta_cogames.aif_agent.cogames_policy import SpatialMemory
+        mem = SpatialMemory()
+        mem.position = (10, 10)
+        mem.stations[(20, 20)] = "hub"
+        assert mem.find_nearest_station("junction") is None
+
+    def test_find_nearest_station_no_position(self):
+        from aif_meta_cogames.aif_agent.cogames_policy import SpatialMemory
+        mem = SpatialMemory()
+        mem.stations[(20, 20)] = "hub"
+        assert mem.find_nearest_station("hub") is None
+
+    def test_stuck_detection_oscillation(self):
+        from aif_meta_cogames.aif_agent.cogames_policy import SpatialMemory
+        mem = SpatialMemory()
+        # Oscillate between two positions for 6 steps
+        for _ in range(3):
+            mem.position_history.append((10, 10))
+            mem.position_history.append((10, 11))
+        assert mem.is_stuck()
+
+    def test_stuck_detection_single_position(self):
+        from aif_meta_cogames.aif_agent.cogames_policy import SpatialMemory
+        mem = SpatialMemory()
+        for _ in range(6):
+            mem.position_history.append((10, 10))
+        assert mem.is_stuck()
+
+    def test_stuck_detection_revisit(self):
+        from aif_meta_cogames.aif_agent.cogames_policy import SpatialMemory
+        mem = SpatialMemory()
+        # Build up 20+ history with revisitation
+        for i in range(10):
+            mem.position_history.append((10, 10 + i))
+        mem.position_history.append((10, 10))  # revisit start
+        for i in range(10):
+            mem.position_history.append((10, 20 + i))
+        mem.position_history.append((10, 10))  # revisit again
+        assert mem.is_stuck()
+
+    def test_not_stuck_when_moving(self):
+        from aif_meta_cogames.aif_agent.cogames_policy import SpatialMemory
+        mem = SpatialMemory()
+        for i in range(10):
+            mem.position_history.append((10, 10 + i))
+        assert not mem.is_stuck()
+
+    def test_not_stuck_short_history(self):
+        from aif_meta_cogames.aif_agent.cogames_policy import SpatialMemory
+        mem = SpatialMemory()
+        mem.position_history.append((10, 10))
+        mem.position_history.append((10, 10))
+        assert not mem.is_stuck()  # Only 2 entries, need 6
