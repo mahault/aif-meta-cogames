@@ -145,7 +145,7 @@ class BatchedAIFEngine:
                  learn_interval: int = 50, policy_len: int = 2,
                  learn_C: bool = False, learn_E: bool = False,
                  c_learning_rate: float = 0.1, e_learning_rate: float = 0.05,
-                 c_update_interval: int = 200):
+                 c_update_interval: int = 200, e_start_step: int = 500):
         self.n_agents = n_agents
         self.learn_B = learn_B
         self.learn_interval = learn_interval
@@ -154,6 +154,7 @@ class BatchedAIFEngine:
         self.c_learning_rate = c_learning_rate
         self.e_learning_rate = e_learning_rate
         self.c_update_interval = c_update_interval
+        self.e_start_step = e_start_step
         self._step_count = 0
 
         self.agent = CogsGuardPOMDP.create_batched_agent(
@@ -323,7 +324,7 @@ class BatchedAIFEngine:
                 and self._step_count % self.c_update_interval == 0):
             if self.learn_C:
                 self._update_C_from_reward()
-            if self.learn_E:
+            if self.learn_E and self._step_count >= self.e_start_step:
                 self._update_E_from_reward()
 
         # Periodic logging (every 500 steps)
@@ -791,11 +792,12 @@ class AIFPolicy(_MultiAgentPolicy):
         self._discretizer = ObservationDiscretizer(feat_names, tag_categories)
 
         # One shared engine for all agents (JIT-compiled, batched)
+        # v6: disable C-from-reward (hand-crafted C is well-tuned),
+        # keep E-vector with delayed start and lower lr
         self._engine = BatchedAIFEngine(
-            n_agents=n_agents, learn_B=True, learn_C=True, learn_E=True,
+            n_agents=n_agents, learn_B=True, learn_C=False, learn_E=True,
             policy_len=2, learn_interval=50,
-            c_learning_rate=0.1, e_learning_rate=0.05,
-            c_update_interval=200,
+            e_learning_rate=0.02, c_update_interval=200,
         )
         self._agents: dict[int, _StatefulAgentPolicy] = {}
 
