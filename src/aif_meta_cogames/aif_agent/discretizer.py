@@ -92,6 +92,21 @@ class TaskPolicy(IntEnum):
     WAIT = 12            # Wait / noop
 
 
+class MacroOption(IntEnum):
+    """Macro-level options — the strategic POMDP action space.
+
+    Each option is a temporally-extended reactive policy (state machine)
+    that sequences multiple TaskPolicy actions toward a subgoal.
+    The strategic POMDP selects among these options; option state machines
+    in OptionExecutor handle the task-level sequencing.
+    """
+    MINE_CYCLE = 0       # NAV_RESOURCE → MINE → NAV_DEPOT → DEPOSIT
+    CRAFT_CYCLE = 1      # NAV_CRAFT → CRAFT → NAV_GEAR → ACQUIRE_GEAR
+    CAPTURE_CYCLE = 2    # NAV_JUNCTION → CAPTURE (requires gear)
+    EXPLORE = 3          # Wander until finding resource / station
+    DEFEND = 4           # NAV_JUNCTION → CAPTURE (defend territory)
+
+
 # ---------------------------------------------------------------------------
 # Observation enums
 # ---------------------------------------------------------------------------
@@ -151,6 +166,9 @@ NUM_STATES = NUM_PHASES * NUM_HANDS * NUM_TARGET_MODES * NUM_ROLES  # 216
 
 NUM_TASK_POLICIES = len(TaskPolicy)  # 13
 NUM_ACTIONS = NUM_TASK_POLICIES      # 13 (alias for generative model compat)
+
+NUM_OPTIONS = len(MacroOption)       # 5
+OPTION_NAMES = [o.name for o in MacroOption]
 
 NUM_OBS = [
     len(ObsResource),     # 3

@@ -3,6 +3,13 @@
 import numpy as np
 import pytest
 
+try:
+    import jax.numpy as jnp
+    from pymdp.agent import Agent as _JaxAgent
+    HAS_PYMDP = True
+except ImportError:
+    HAS_PYMDP = False
+
 from aif_meta_cogames.aif_agent import (
     NUM_ACTIONS,
     NUM_HANDS,
@@ -34,6 +41,11 @@ from aif_meta_cogames.aif_agent.discretizer import (
     LOC_GLOBAL,
     ObservationDiscretizer,
 )
+from aif_meta_cogames.aif_agent.discretizer import (
+    MacroOption,
+    NUM_OPTIONS,
+    OPTION_NAMES,
+)
 from aif_meta_cogames.aif_agent.generative_model import (
     A_DEPENDENCIES,
     B_DEPENDENCIES,
@@ -43,6 +55,7 @@ from aif_meta_cogames.aif_agent.generative_model import (
     build_default_B,
     build_C,
     build_D,
+    build_option_B,
     build_uniform_A,
     build_uniform_B,
 )
@@ -543,3 +556,108 @@ class TestCogsGuardPOMDP:
         assert "216" in text
         assert "factored" in text.lower()
         assert "13" in text
+
+
+# ---------------------------------------------------------------------------
+# Macro-options (hierarchical)
+# ---------------------------------------------------------------------------
+
+class TestMacroOptionEnum:
+    def test_option_values(self):
+        assert MacroOption.MINE_CYCLE == 0
+        assert MacroOption.CRAFT_CYCLE == 1
+        assert MacroOption.CAPTURE_CYCLE == 2
+        assert MacroOption.EXPLORE == 3
+        assert MacroOption.DEFEND == 4
+        assert len(MacroOption) == 5
+
+    def test_num_options(self):
+        assert NUM_OPTIONS == 5
+        assert len(OPTION_NAMES) == 5
+
+    def test_option_names(self):
+        assert OPTION_NAMES[0] == "MINE_CYCLE"
+        assert OPTION_NAMES[3] == "EXPLORE"
+
+
+class TestOptionB:
+    def test_shapes(self):
+        B = build_option_B()
+        assert len(B) == 4
+        assert B[0].shape == (6, 6, 3, 5)   # phase: (p', p, h, options)
+        assert B[1].shape == (3, 6, 3, 5)   # hand: (h', p, h, options)
+        assert B[2].shape == (3, 3, 5)       # target: (t', t, options)
+        assert B[3].shape == (4, 4, 5)       # role: (r', r, options)
+
+    def test_normalised(self):
+        B = build_option_B()
+        # B_phase columns
+        for p in range(NUM_PHASES):
+            for h in range(NUM_HANDS):
+                for o in range(NUM_OPTIONS):
+                    col_sum = B[0][:, p, h, o].sum()
+                    assert abs(col_sum - 1.0) < 1e-10, (
+                        f"B_phase column p={p}, h={h}, o={OPTION_NAMES[o]} "
+                        f"sums to {col_sum}"
+                    )
+        # B_hand columns
+        for p in range(NUM_PHASES):
+            for h in range(NUM_HANDS):
+                for o in range(NUM_OPTIONS):
+                    col_sum = B[1][:, p, h, o].sum()
+                    assert abs(col_sum - 1.0) < 1e-10, (
+                        f"B_hand column p={p}, h={h}, o={OPTION_NAMES[o]} "
+                        f"sums to {col_sum}"
+                    )
+        # B_target columns
+        for t in range(NUM_TARGET_MODES):
+            for o in range(NUM_OPTIONS):
+                col_sum = B[2][:, t, o].sum()
+                assert abs(col_sum - 1.0) < 1e-10
+        # B_role: identity
+        for r in range(NUM_ROLES):
+            for o in range(NUM_OPTIONS):
+                col_sum = B[3][:, r, o].sum()
+                assert abs(col_sum - 1.0) < 1e-10
+
+    def test_role_is_identity(self):
+        B = build_option_B()
+        for o in range(NUM_OPTIONS):
+            np.testing.assert_allclose(B[3][:, :, o], np.eye(NUM_ROLES), atol=1e-10)
+
+    def test_option_dependent(self):
+        """Different options should produce different phase transitions."""
+        B_phase = build_option_B()[0]
+        mine_col = B_phase[:, Phase.EXPLORE, Hand.EMPTY, MacroOption.MINE_CYCLE]
+        explore_col = B_phase[:, Phase.EXPLORE, Hand.EMPTY, MacroOption.EXPLORE]
+        assert not np.allclose(mine_col, explore_col)
+
+
+@pytest.mark.skipif(not HAS_PYMDP, reason="pymdp (JAX) not installed")
+class TestStrategicAgent:
+    def test_create_strategic_agent(self):
+        agent = CogsGuardPOMDP.create_strategic_agent(n_agents=8, policy_len=2)
+        assert agent.batch_size == 8
+        assert len(agent.A) == 6
+        assert len(agent.B) == 4
+        # B shapes: (batch, n_states_f', *dep_dims, n_controls_f=5)
+        assert agent.B[0].shape == (8, 6, 6, 3, 5)
+        assert agent.B[1].shape == (8, 3, 6, 3, 5)
+        assert agent.B[2].shape == (8, 3, 3, 5)
+        assert agent.B[3].shape == (8, 4, 4, 5)
+        # 25 policies (5^2)
+        assert len(agent.policies) == 25
+
+    def test_strategic_inference_loop(self):
+        import jax.numpy as jnp
+        agent = CogsGuardPOMDP.create_strategic_agent(n_agents=2, policy_len=2)
+        obs = [jnp.zeros((2, 1), dtype=jnp.int32) for _ in range(6)]
+        qs = agent.infer_states(obs, empirical_prior=agent.D)
+        assert len(qs) == 4
+        q_pi, G = agent.infer_policies(qs)
+        assert q_pi.shape == (2, 25)
+        action = agent.sample_action(q_pi)
+        assert action.shape == (2, 4)
+        # All factors share same action (constrained)
+        assert int(action[0, 0]) == int(action[0, 1])
+        assert 0 <= int(action[0, 0]) < 5

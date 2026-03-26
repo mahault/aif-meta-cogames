@@ -29,12 +29,14 @@ import numpy as np
 from .discretizer import (
     NUM_HANDS,
     NUM_OBS,
+    NUM_OPTIONS,
     NUM_PHASES,
     NUM_ROLES,
     NUM_STATES,
     NUM_TARGET_MODES,
     NUM_TASK_POLICIES,
     Hand,
+    MacroOption,
     ObsContest,
     ObsInventory,
     ObsResource,
@@ -397,6 +399,174 @@ def _fill_target(B_t, a):
 
 
 # ---------------------------------------------------------------------------
+# B matrices — option-level (strategic POMDP)
+# ---------------------------------------------------------------------------
+
+def build_option_B() -> list[np.ndarray]:
+    """Option-level B matrices for the strategic POMDP (5 macro-options).
+
+    Returns [B_phase, B_hand, B_target, B_role] where:
+      B_phase:  (6, 6, 3, 5)  P(phase' | phase, hand, option)
+      B_hand:   (3, 6, 3, 5)  P(hand'  | phase, hand, option)
+      B_target: (3, 3, 5)     P(target' | target, option)
+      B_role:   (4, 4, 5)     P(role'  | role, option) — identity
+
+    Each option column models the dominant single-step transition
+    when that option is actively executing.
+    """
+    n_p, n_h, n_t, n_r = NUM_PHASES, NUM_HANDS, NUM_TARGET_MODES, NUM_ROLES
+    n_o = NUM_OPTIONS
+
+    B_phase = np.zeros((n_p, n_p, n_h, n_o))
+    B_hand = np.zeros((n_h, n_p, n_h, n_o))
+    B_target = np.zeros((n_t, n_t, n_o))
+    B_role = np.zeros((n_r, n_r, n_o))
+
+    # Role never changes
+    for o in range(n_o):
+        B_role[:, :, o] = np.eye(n_r)
+
+    P = Phase
+    H = Hand
+    T = TargetMode
+    O = MacroOption
+
+    # --- MINE_CYCLE (option 0) ---
+    # Sequences: NAV_RESOURCE → MINE → NAV_DEPOT → DEPOSIT
+    for p in Phase:
+        for h in Hand:
+            a = O.MINE_CYCLE
+            if h == H.EMPTY:
+                if p == P.EXPLORE:
+                    B_phase[P.MINE, p, h, a] += 0.5
+                    B_phase[P.EXPLORE, p, h, a] += 0.5
+                elif p == P.MINE:
+                    B_phase[P.MINE, p, h, a] += 0.8
+                    B_phase[P.DEPOSIT, p, h, a] += 0.2
+                elif p == P.DEPOSIT:
+                    B_phase[P.EXPLORE, p, h, a] += 0.6
+                    B_phase[P.MINE, p, h, a] += 0.3
+                    B_phase[P.DEPOSIT, p, h, a] += 0.1
+                else:
+                    B_phase[P.MINE, p, h, a] += 0.4
+                    B_phase[p, p, h, a] += 0.6
+                B_hand[H.EMPTY, p, h, a] += 0.6
+                B_hand[H.HOLDING_RESOURCE, p, h, a] += 0.4
+            elif h == H.HOLDING_RESOURCE:
+                if p in (P.MINE, P.EXPLORE):
+                    B_phase[P.DEPOSIT, p, h, a] += 0.6
+                    B_phase[p, p, h, a] += 0.4
+                elif p == P.DEPOSIT:
+                    B_phase[P.DEPOSIT, p, h, a] += 0.5
+                    B_phase[P.EXPLORE, p, h, a] += 0.5
+                else:
+                    B_phase[P.DEPOSIT, p, h, a] += 0.5
+                    B_phase[p, p, h, a] += 0.5
+                B_hand[H.HOLDING_RESOURCE, p, h, a] += 0.6
+                B_hand[H.EMPTY, p, h, a] += 0.4
+            else:  # HOLDING_GEAR — shouldn't be in mine cycle
+                B_phase[p, p, h, a] += 0.9
+                B_phase[P.EXPLORE, p, h, a] += 0.1
+                B_hand[h, p, h, a] += 1.0
+
+    # --- CRAFT_CYCLE (option 1) ---
+    # Sequences: NAV_CRAFT → CRAFT → NAV_GEAR → ACQUIRE_GEAR
+    for p in Phase:
+        for h in Hand:
+            a = O.CRAFT_CYCLE
+            if h == H.EMPTY:
+                if p in (P.EXPLORE, P.DEPOSIT):
+                    B_phase[P.CRAFT, p, h, a] += 0.5
+                    B_phase[p, p, h, a] += 0.5
+                elif p == P.CRAFT:
+                    B_phase[P.CRAFT, p, h, a] += 0.7
+                    B_phase[P.GEAR, p, h, a] += 0.3
+                elif p == P.GEAR:
+                    B_phase[P.GEAR, p, h, a] += 0.8
+                    B_phase[P.CRAFT, p, h, a] += 0.2
+                else:
+                    B_phase[P.CRAFT, p, h, a] += 0.4
+                    B_phase[p, p, h, a] += 0.6
+                B_hand[H.EMPTY, p, h, a] += 0.5
+                B_hand[H.HOLDING_GEAR, p, h, a] += 0.5
+            elif h == H.HOLDING_GEAR:
+                # Goal achieved — craft cycle complete
+                B_phase[P.GEAR, p, h, a] += 0.7
+                B_phase[p, p, h, a] += 0.3
+                B_hand[H.HOLDING_GEAR, p, h, a] += 1.0
+            else:  # HOLDING_RESOURCE — deposit first
+                B_phase[P.DEPOSIT, p, h, a] += 0.5
+                B_phase[p, p, h, a] += 0.5
+                B_hand[h, p, h, a] += 0.7
+                B_hand[H.EMPTY, p, h, a] += 0.3
+
+    # --- CAPTURE_CYCLE (option 2) ---
+    # Sequences: NAV_JUNCTION → CAPTURE (requires gear)
+    for p in Phase:
+        for h in Hand:
+            a = O.CAPTURE_CYCLE
+            if h == H.HOLDING_GEAR:
+                if p == P.CAPTURE:
+                    B_phase[P.CAPTURE, p, h, a] += 0.6
+                    B_phase[P.EXPLORE, p, h, a] += 0.4
+                else:
+                    B_phase[P.CAPTURE, p, h, a] += 0.6
+                    B_phase[p, p, h, a] += 0.4
+                B_hand[H.HOLDING_GEAR, p, h, a] += 0.6
+                B_hand[H.EMPTY, p, h, a] += 0.4
+            else:
+                # No gear — can't capture effectively
+                B_phase[p, p, h, a] += 0.9
+                B_phase[P.EXPLORE, p, h, a] += 0.1
+                B_hand[h, p, h, a] += 1.0
+
+    # --- EXPLORE (option 3) ---
+    for p in Phase:
+        for h in Hand:
+            a = O.EXPLORE
+            B_phase[P.EXPLORE, p, h, a] += 0.6
+            B_phase[P.MINE, p, h, a] += 0.2
+            B_phase[p, p, h, a] += 0.2
+            B_hand[h, p, h, a] += 0.8
+            B_hand[H.EMPTY, p, h, a] += 0.2
+
+    # --- DEFEND (option 4) ---
+    for p in Phase:
+        for h in Hand:
+            a = O.DEFEND
+            B_phase[P.CAPTURE, p, h, a] += 0.6
+            B_phase[p, p, h, a] += 0.4
+            B_hand[h, p, h, a] += 1.0
+
+    # Target mode transitions per option
+    for o in range(n_o):
+        if o in (O.CAPTURE_CYCLE, O.DEFEND):
+            B_target[T.FREE, T.FREE, o] = 0.9
+            B_target[T.CONTESTED, T.FREE, o] = 0.1
+            B_target[T.FREE, T.CONTESTED, o] = 0.4
+            B_target[T.CONTESTED, T.CONTESTED, o] = 0.4
+            B_target[T.LOST, T.CONTESTED, o] = 0.2
+            B_target[T.CONTESTED, T.LOST, o] = 0.3
+            B_target[T.LOST, T.LOST, o] = 0.7
+        else:
+            for t in T:
+                B_target[t, t, o] = 1.0
+
+    # Normalize columns
+    _normalize_B_factor(B_phase, dims=(n_p, n_h), axes=2)
+    _normalize_B_factor(B_hand, dims=(n_p, n_h), axes=2)
+    for t in range(n_t):
+        for o in range(n_o):
+            s = B_target[:, t, o].sum()
+            if s > 0:
+                B_target[:, t, o] /= s
+            else:
+                B_target[t, t, o] = 1.0
+
+    return [B_phase, B_hand, B_target, B_role]
+
+
+# ---------------------------------------------------------------------------
 # C vectors (preferences)
 # ---------------------------------------------------------------------------
 
@@ -641,6 +811,90 @@ class CogsGuardPOMDP:
             D_batched.append(jnp.array(np.stack(per_agent)))
 
         # Replace C and D with per-batch versions
+        agent = eqx.tree_at(lambda a: a.C, agent, C_batched)
+        agent = eqx.tree_at(lambda a: a.D, agent, D_batched)
+
+        return agent
+
+    @staticmethod
+    def create_strategic_agent(n_agents: int = 8, **kwargs):
+        """Create a strategic POMDP agent with 5 macro-options.
+
+        Same state factors, A, C, D as the tactical agent.
+        Different B matrices (5 options instead of 13 task policies).
+        25 two-step policies (5²) instead of 169 (13²).
+
+        Even-indexed agents are miners, odd-indexed are aligners
+        (per-role C/D via eqx.tree_at).
+        """
+        import equinox as eqx
+        import itertools
+        import jax.numpy as jnp
+        from pymdp.agent import Agent
+
+        pomdp_miner = CogsGuardPOMDP.for_role("miner")
+        pomdp_aligner = CogsGuardPOMDP.for_role("aligner")
+        base = CogsGuardPOMDP()
+
+        A = [jnp.array(a) for a in base.A]
+        B_option = [jnp.array(b) for b in build_option_B()]
+        C = [jnp.array(c) for c in base.C]
+        D = [jnp.array(d) for d in base.D]
+
+        # Constrained policies: all 4 factors share the same option.
+        policy_len = kwargs.pop("policy_len", 2)
+        pol_list = [
+            [[a] * 4 for a in seq]
+            for seq in itertools.product(range(NUM_OPTIONS), repeat=policy_len)
+        ]
+        policies = jnp.array(pol_list)
+
+        # B-learning setup
+        pB_scale = kwargs.pop("pB_scale", 5.0)
+        learn_B = kwargs.pop("learn_B", False)
+        pB = None
+        if learn_B:
+            pB = [jnp.array(b * pB_scale + 0.1) for b in build_option_B()]
+
+        defaults = {
+            "A_dependencies": A_DEPENDENCIES,
+            "B_dependencies": B_DEPENDENCIES,
+            "num_controls": [NUM_OPTIONS, NUM_OPTIONS, NUM_OPTIONS, NUM_OPTIONS],
+            "policies": policies,
+            "sampling_mode": "full",
+            "policy_len": policy_len,
+            "inference_algo": "fpi",
+            "num_iter": 16,
+            "use_utility": True,
+            "use_states_info_gain": True,
+            "use_param_info_gain": learn_B,
+            "learn_B": learn_B,
+            "action_selection": "deterministic",
+            "gamma": 8.0,
+        }
+        if pB is not None:
+            defaults["pB"] = pB
+        defaults.update(kwargs)
+        agent = Agent(A=A, B=B_option, C=C, D=D,
+                      batch_size=n_agents, **defaults)
+
+        # Per-batch C/D (miner vs aligner)
+        C_batched = []
+        for m in range(len(NUM_OBS)):
+            per_agent = []
+            for i in range(n_agents):
+                c = pomdp_miner.C[m] if i % 2 == 0 else pomdp_aligner.C[m]
+                per_agent.append(c)
+            C_batched.append(jnp.array(np.stack(per_agent)))
+
+        D_batched = []
+        for f in range(len(NUM_STATE_FACTORS)):
+            per_agent = []
+            for i in range(n_agents):
+                d = pomdp_miner.D[f] if i % 2 == 0 else pomdp_aligner.D[f]
+                per_agent.append(d)
+            D_batched.append(jnp.array(np.stack(per_agent)))
+
         agent = eqx.tree_at(lambda a: a.C, agent, C_batched)
         agent = eqx.tree_at(lambda a: a.D, agent, D_batched)
 

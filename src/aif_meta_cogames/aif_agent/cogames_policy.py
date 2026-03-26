@@ -1,15 +1,20 @@
 """Live CogsGuard policy using discrete active inference (pymdp JAX).
 
 Architecture:
+- **Hierarchical 2-level**: Level 2 (strategic POMDP, 5 macro-options) selects
+  macro-options every 30-80 steps. Level 1 (option state machines) maps
+  observation -> task policy reactively within each option.
 - **BatchedAIFEngine** runs one pymdp Agent(batch_size=8) for all agents,
   JIT-compiled via eqx.filter_jit for ~5-10x speedup over sequential
 - **pymdp** (JAX) handles belief tracking (posterior over 216 economy-chain
-  states) and task-level policy selection via Expected Free Energy (EFE)
+  states) and macro-option selection via Expected Free Energy (EFE)
+- **OptionExecutor** converts macro-options + observations -> task policies
 - **Navigator** converts the selected task policy into primitive movement
 
-The POMDP action space is 13 task-level policies (not 5 primitive movements).
-This makes B matrices action-dependent, so pymdp's EFE computation produces
-meaningful, non-uniform policy selection.
+The POMDP action space is 5 macro-options (not 13 task policies or 5 movements).
+This gives 25 two-step policies vs 169 previously, reducing infer_policies from
+~280ms to ~42ms. Most steps only run belief update (~28ms), with full replanning
+only at option termination (~70ms total).
 
 Uses batched inference: one pymdp Agent(batch_size=8) with per-role C/D
 vectors (even=miner, odd=aligner). Agent 0's step triggers batched inference
@@ -34,8 +39,15 @@ import numpy as np
 
 from .discretizer import (
     Hand,
+    MacroOption,
     NUM_OBS,
+    NUM_OPTIONS,
     NUM_TASK_POLICIES,
+    OPTION_NAMES,
+    ObsContest,
+    ObsInventory,
+    ObsResource,
+    ObsStation,
     ObservationDiscretizer,
     Phase,
     TASK_POLICY_NAMES,
@@ -99,67 +111,213 @@ class AIFBeliefState:
 
 
 # ---------------------------------------------------------------------------
-# Batched AIF Engine (no mettagrid dependency)
+# Level 2: JIT-compiled strategic inference functions
 # ---------------------------------------------------------------------------
 
-def _batched_step(agent, batched_obs, empirical_prior, e_bias):
-    """JIT-compilable batched inference step.
+def _belief_update(agent, batched_obs, empirical_prior, option_actions):
+    """JIT-compilable belief update -- runs every step (~28ms).
 
-    Runs infer_states → infer_policies → sample_action →
-    update_empirical_prior for all agents in one vectorized call.
-
-    e_bias: (n_agents, n_policies) habit prior applied to q_pi.
-            All-ones = no bias.
+    Updates beliefs given new observations and the currently executing option.
+    Does NOT replan (no infer_policies).
     """
     qs = agent.infer_states(batched_obs, empirical_prior=empirical_prior)
+    pred, _ = agent.update_empirical_prior(option_actions, qs)
+    return pred, qs
+
+
+def _select_option(agent, qs):
+    """JIT-compilable option selection -- runs at option termination (~42ms).
+
+    Evaluates EFE over 25 two-step option policies and samples.
+    """
     q_pi, _efe = agent.infer_policies(qs)
-
-    # Apply E-vector habit bias to policy posterior
-    q_pi = q_pi * e_bias
-    q_pi = q_pi / jnp.sum(q_pi, axis=-1, keepdims=True)
-
     sampled = agent.sample_action(q_pi)
-    task_policies = sampled[:, 0]  # all factors share same action
+    return sampled[:, 0], q_pi
 
-    # Build pomdp_action: (n_agents, 4) — same action for all 4 factors
-    pomdp_action = jnp.tile(sampled[:, :1], (1, 4))
-    pred, _ = agent.update_empirical_prior(pomdp_action, qs)
 
-    return task_policies, pred, qs, pomdp_action
+# ---------------------------------------------------------------------------
+# Level 1: Option Executor (reactive state machines)
+# ---------------------------------------------------------------------------
 
+@dataclass
+class OptionState:
+    """Per-agent option execution state."""
+    current_option: int = MacroOption.EXPLORE
+    steps_in_option: int = 0
+    prev_inv: int = int(ObsInventory.EMPTY)
+    free_steps: int = 0  # consecutive steps at FREE junction (for DEFEND)
+
+
+class OptionExecutor:
+    """Level 1: Reactive state machines mapping obs -> task policy.
+
+    Each macro-option defines observation-conditional rules that select
+    the appropriate task policy without any planning or inference.
+    """
+
+    TIMEOUTS = {
+        MacroOption.MINE_CYCLE: 80,
+        MacroOption.CRAFT_CYCLE: 60,
+        MacroOption.CAPTURE_CYCLE: 80,
+        MacroOption.EXPLORE: 30,
+        MacroOption.DEFEND: 60,
+    }
+
+    def __init__(self, n_agents: int):
+        self.n_agents = n_agents
+        self.states = [OptionState() for _ in range(n_agents)]
+
+    def get_task_policy(self, agent_id: int, obs_ints: list[int]) -> int:
+        """Map current option + observation -> task policy."""
+        st = self.states[agent_id]
+        option = st.current_option
+
+        o_res = obs_ints[0]   # ObsResource
+        o_sta = obs_ints[1]   # ObsStation
+        o_inv = obs_ints[2]   # ObsInventory
+
+        if option == MacroOption.MINE_CYCLE:
+            return self._mine_cycle(o_res, o_sta, o_inv)
+        elif option == MacroOption.CRAFT_CYCLE:
+            return self._craft_cycle(o_sta, o_inv)
+        elif option == MacroOption.CAPTURE_CYCLE:
+            return self._capture_cycle(o_sta, o_inv)
+        elif option == MacroOption.EXPLORE:
+            return TaskPolicy.EXPLORE
+        elif option == MacroOption.DEFEND:
+            return self._defend(o_sta)
+        return TaskPolicy.EXPLORE
+
+    def check_termination(self, agent_id: int, obs_ints: list[int]) -> bool:
+        """Check if current option should terminate."""
+        st = self.states[agent_id]
+        option = st.current_option
+
+        # Timeout check
+        timeout = self.TIMEOUTS.get(option, 60)
+        if st.steps_in_option >= timeout:
+            return True
+
+        o_res = obs_ints[0]
+        o_sta = obs_ints[1]
+        o_inv = obs_ints[2]
+        o_contest = obs_ints[3]
+
+        if option == MacroOption.MINE_CYCLE:
+            # Deposit complete: had resource, now empty
+            if st.prev_inv == ObsInventory.HAS_RESOURCE and o_inv == ObsInventory.EMPTY:
+                return True
+        elif option == MacroOption.CRAFT_CYCLE:
+            # Gear acquired
+            if o_inv == ObsInventory.HAS_GEAR:
+                return True
+        elif option == MacroOption.CAPTURE_CYCLE:
+            # Gear used (had gear, now empty)
+            if st.prev_inv == ObsInventory.HAS_GEAR and o_inv != ObsInventory.HAS_GEAR:
+                return True
+            # Started without gear -- bail after grace period
+            if o_inv != ObsInventory.HAS_GEAR and st.steps_in_option > 5:
+                return True
+        elif option == MacroOption.EXPLORE:
+            # Found resource or station
+            if o_res >= ObsResource.AT or o_sta > ObsStation.NONE:
+                return True
+        elif option == MacroOption.DEFEND:
+            # Junction secured for 10+ steps
+            if o_sta == ObsStation.JUNCTION and o_contest == ObsContest.FREE:
+                st.free_steps += 1
+                if st.free_steps >= 10:
+                    return True
+            else:
+                st.free_steps = 0
+
+        return False
+
+    def set_option(self, agent_id: int, option: int):
+        """Activate a new option for this agent."""
+        st = self.states[agent_id]
+        st.current_option = option
+        st.steps_in_option = 0
+        st.free_steps = 0
+
+    def tick(self, agent_id: int, obs_ints: list[int]):
+        """Advance step counter and update tracking state."""
+        st = self.states[agent_id]
+        st.steps_in_option += 1
+        st.prev_inv = obs_ints[2]
+
+    # ------------------------------------------------------------------
+    # Option-specific reactive policies
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _mine_cycle(o_res, o_sta, o_inv):
+        """MINE_CYCLE: NAV_RESOURCE -> MINE -> NAV_DEPOT -> DEPOSIT."""
+        if o_inv == ObsInventory.EMPTY:
+            if o_res >= ObsResource.AT:
+                return TaskPolicy.MINE
+            return TaskPolicy.NAV_RESOURCE
+        elif o_inv == ObsInventory.HAS_RESOURCE:
+            if o_sta == ObsStation.HUB:
+                return TaskPolicy.DEPOSIT
+            return TaskPolicy.NAV_DEPOT
+        return TaskPolicy.NAV_RESOURCE
+
+    @staticmethod
+    def _craft_cycle(o_sta, o_inv):
+        """CRAFT_CYCLE: NAV_CRAFT -> CRAFT -> acquire gear."""
+        if o_inv == ObsInventory.HAS_GEAR:
+            return TaskPolicy.WAIT
+        if o_sta == ObsStation.CRAFT:
+            return TaskPolicy.CRAFT
+        return TaskPolicy.NAV_CRAFT
+
+    @staticmethod
+    def _capture_cycle(o_sta, o_inv):
+        """CAPTURE_CYCLE: requires gear, NAV_JUNCTION -> CAPTURE."""
+        if o_inv != ObsInventory.HAS_GEAR:
+            return TaskPolicy.WAIT
+        if o_sta == ObsStation.JUNCTION:
+            return TaskPolicy.CAPTURE
+        return TaskPolicy.NAV_JUNCTION
+
+    @staticmethod
+    def _defend(o_sta):
+        """DEFEND: go to junction and hold it."""
+        if o_sta == ObsStation.JUNCTION:
+            return TaskPolicy.CAPTURE
+        return TaskPolicy.NAV_JUNCTION
+
+
+# ---------------------------------------------------------------------------
+# Batched AIF Engine (hierarchical)
+# ---------------------------------------------------------------------------
 
 class BatchedAIFEngine:
-    """Batched active inference engine: 1 Agent(batch_size=N) for all agents.
+    """Hierarchical batched active inference engine.
 
-    Agent 0's step triggers batched inference over all N agents.
-    Agents 1-(N-1) return cached results (1-step lag, negligible for POMDP).
-    Navigator stays per-agent (cheap, needs current obs).
+    Level 2: Strategic POMDP with 5 macro-options (25 two-step policies).
+             Replans only at option termination (~42ms).
+    Level 1: OptionExecutor maps option + obs -> task policy (~0ms).
 
-    Learning mechanisms:
-    - **B-learning**: Online Dirichlet updates to transition model (pB)
-    - **C-from-reward**: Update C preferences from intrinsic reward signal
-    - **E-vector**: Habit prior that reinforces successful task policies
+    Most steps only run belief update (~28ms). Full replanning happens
+    every 30-80 steps when an option terminates.
     """
 
     def __init__(self, n_agents: int = 8, learn_B: bool = False,
-                 learn_interval: int = 50, policy_len: int = 2,
-                 learn_C: bool = False, learn_E: bool = False,
-                 c_learning_rate: float = 0.1, e_learning_rate: float = 0.05,
-                 c_update_interval: int = 200, e_start_step: int = 500):
+                 learn_interval: int = 50, policy_len: int = 2):
         self.n_agents = n_agents
         self.learn_B = learn_B
         self.learn_interval = learn_interval
-        self.learn_C = learn_C
-        self.learn_E = learn_E
-        self.c_learning_rate = c_learning_rate
-        self.e_learning_rate = e_learning_rate
-        self.c_update_interval = c_update_interval
-        self.e_start_step = e_start_step
         self._step_count = 0
 
-        self.agent = CogsGuardPOMDP.create_batched_agent(
+        # Level 2: Strategic agent with 5 macro-options
+        self.agent = CogsGuardPOMDP.create_strategic_agent(
             n_agents, learn_B=learn_B, policy_len=policy_len
         )
+
+        # Level 1: Option executor
+        self.option_executor = OptionExecutor(n_agents)
 
         # Obs buffer: per-agent, per-modality, shape (1,) = (T=1,)
         self._obs_buffer: list[list[Any]] = [
@@ -167,11 +325,20 @@ class BatchedAIFEngine:
             for _ in range(n_agents)
         ]
 
-        # Beliefs managed here (shared across batch)
+        # Discrete obs for option executor
+        self._discrete_obs: list[list[int]] = [[0] * 6 for _ in range(n_agents)]
+
+        # Beliefs managed here
         self.empirical_prior = self.agent.D
         self.qs = None
 
-        # Cached task policies from last batch
+        # Current option actions: (n_agents, 4) -- same option for all 4 factors
+        self._current_options = np.full(n_agents, MacroOption.EXPLORE, dtype=np.int32)
+        self._option_actions = jnp.full(
+            (n_agents, 4), MacroOption.EXPLORE, dtype=jnp.int32
+        )
+
+        # Cached task policies
         self._cached_policies = [int(TaskPolicy.EXPLORE)] * n_agents
 
         # B-learning buffers
@@ -179,26 +346,17 @@ class BatchedAIFEngine:
         self._prev_obs = None
         self._prev_actions = None
 
-        # C-from-reward and E-vector learning buffers
-        if learn_C or learn_E:
-            self._prev_discrete_obs = [[0] * 6 for _ in range(n_agents)]
-            # Per-role (0=miner, 1=aligner) reward accumulators
-            self._c_reward_sum = [np.zeros((2, n)) for n in NUM_OBS]
-            self._c_reward_count = [np.zeros((2, n)) for n in NUM_OBS]
-            # Per-role action reward tracking for E-vector
-            self._e_action_reward_sum = np.zeros((2, NUM_TASK_POLICIES))
-            self._e_action_reward_count = np.zeros((2, NUM_TASK_POLICIES))
-
-        # E-vector habit bias: (n_agents, n_policies), all-ones = neutral
-        n_policies = len(self.agent.policies)
-        self._e_bias = jnp.ones((n_agents, n_policies))
-
-        # JIT-compile the batched step function
-        self._jit_step = eqx.filter_jit(_batched_step)
+        # JIT-compile both functions
+        self._jit_belief_update = eqx.filter_jit(_belief_update)
+        self._jit_select_option = eqx.filter_jit(_select_option)
 
         # Warmup JIT compilation (avoids timeout on first eval step)
         dummy_obs = [jnp.zeros((n_agents, 1), dtype=jnp.int32) for _ in range(6)]
-        self._jit_step(self.agent, dummy_obs, self.empirical_prior, self._e_bias)
+        dummy_actions = jnp.full((n_agents, 4), 0, dtype=jnp.int32)
+        pred, qs = self._jit_belief_update(
+            self.agent, dummy_obs, self.empirical_prior, dummy_actions
+        )
+        self._jit_select_option(self.agent, qs)
 
     def submit_and_get_policy(self, agent_id: int, jax_obs: list) -> int:
         """Store obs for agent_id and return its task policy.
@@ -206,15 +364,8 @@ class BatchedAIFEngine:
         Agent 0 triggers batched inference for all agents.
         Others return cached policies (1-step lag).
         """
-        # Accumulate reward data for C/E learning
-        if self.learn_C or self.learn_E:
-            curr_obs_ints = [int(o[0]) for o in jax_obs]
-            prev_obs_ints = self._prev_discrete_obs[agent_id]
-            reward = self._compute_intrinsic_reward(curr_obs_ints, prev_obs_ints)
-            self._accumulate_reward(agent_id, curr_obs_ints, reward)
-            self._prev_discrete_obs[agent_id] = curr_obs_ints
-
         self._obs_buffer[agent_id] = jax_obs
+        self._discrete_obs[agent_id] = [int(o[0]) for o in jax_obs]
 
         if agent_id == 0:
             self._run_batch()
@@ -225,77 +376,14 @@ class BatchedAIFEngine:
         """Return per-agent beliefs (qs) from the batched posterior."""
         if self.qs is None:
             return None
-        # qs[f] shape: (batch, T, n_states_f) → index by agent_id
         return [q[agent_id] for q in self.qs]
 
     # ------------------------------------------------------------------
-    # Intrinsic reward (economy chain progress)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _compute_intrinsic_reward(curr_obs, prev_obs):
-        """Compute intrinsic reward from observation transitions.
-
-        Measures economy chain progress:
-        - Inventory gain (picked up resource/gear) → high reward
-        - Arriving at station → moderate reward
-        - Junction contest improvement → highest reward
-        - Idle (no obs change) → penalty
-        """
-        reward = 0.0
-
-        # Inventory change (obs[2]): EMPTY=0, RESOURCE=1, GEAR=2
-        inv_delta = curr_obs[2] - prev_obs[2]
-        if inv_delta > 0:
-            reward += 3.0 * inv_delta  # acquired resource or gear
-        elif inv_delta < 0 and curr_obs[1] > 0:
-            reward += 2.0  # deposited/used at station (productive)
-
-        # Arrived at station (obs[1]): NONE=0, HUB=1, CRAFT=2, JUNCTION=3
-        if curr_obs[1] > 0 and prev_obs[1] == 0:
-            reward += 1.0 + curr_obs[1] * 0.5
-
-        # Resource proximity (obs[0]): NONE=0, NEAR=1, AT=2
-        if curr_obs[0] > prev_obs[0]:
-            reward += 0.5
-
-        # Contest improvement (obs[3]): FREE=0, CONTESTED=1, LOST=2
-        if prev_obs[3] > 0 and curr_obs[3] < prev_obs[3]:
-            reward += 5.0  # improved junction control
-        elif curr_obs[3] > prev_obs[3]:
-            reward -= 1.0
-
-        # Idle penalty
-        if curr_obs == prev_obs:
-            reward -= 0.3
-
-        return reward
-
-    def _accumulate_reward(self, agent_id, obs_vals, reward):
-        """Accumulate obs-reward and action-reward data for C/E learning."""
-        role_idx = 0 if agent_id % 2 == 0 else 1  # 0=miner, 1=aligner
-
-        # C-from-reward: which obs values correlate with reward
-        if self.learn_C:
-            for m in range(6):
-                v = obs_vals[m]
-                if v < NUM_OBS[m]:
-                    self._c_reward_sum[m][role_idx, v] += reward
-                    self._c_reward_count[m][role_idx, v] += 1
-
-        # E-vector: which prior actions correlate with reward
-        if self.learn_E and self._step_count > 0:
-            prev_action = self._cached_policies[agent_id]
-            if prev_action < NUM_TASK_POLICIES:
-                self._e_action_reward_sum[role_idx, prev_action] += reward
-                self._e_action_reward_count[role_idx, prev_action] += 1
-
-    # ------------------------------------------------------------------
-    # Batch inference
+    # Batch inference (hierarchical)
     # ------------------------------------------------------------------
 
     def _run_batch(self):
-        """Run batched inference over all agents."""
+        """Run hierarchical batched inference."""
         # Stack obs: (n_agents, T=1) per modality
         batched_obs = []
         for m in range(6):
@@ -304,58 +392,73 @@ class BatchedAIFEngine:
             )
             batched_obs.append(stacked)
 
-        policies, new_prior, qs, pomdp_action = self._jit_step(
-            self.agent, batched_obs, self.empirical_prior, self._e_bias
+        # Level 2a: Belief update (every step, ~28ms)
+        new_prior, qs = self._jit_belief_update(
+            self.agent, batched_obs, self.empirical_prior, self._option_actions
         )
-
         self.empirical_prior = new_prior
         self.qs = qs
-        self._cached_policies = [int(policies[i]) for i in range(self.n_agents)]
+
+        # Level 1: Check option termination and get task policies
+        terminated = []
+        for i in range(self.n_agents):
+            obs_ints = self._discrete_obs[i]
+            if self.option_executor.check_termination(i, obs_ints):
+                terminated.append(i)
+            self.option_executor.tick(i, obs_ints)
+
+        # Level 2b: Replan for terminated agents (~42ms if any)
+        if terminated:
+            options, _q_pi = self._jit_select_option(self.agent, qs)
+            for i in terminated:
+                new_option = int(options[i])
+                self._current_options[i] = new_option
+                self.option_executor.set_option(i, new_option)
+            # Update option actions for next belief update
+            self._option_actions = jnp.tile(
+                jnp.array(self._current_options)[:, None], (1, 4)
+            )
+
+        # Level 1: Get task policies from option executor
+        for i in range(self.n_agents):
+            self._cached_policies[i] = self.option_executor.get_task_policy(
+                i, self._discrete_obs[i]
+            )
 
         # Online B-learning
         self._step_count += 1
         if (self.learn_B and self._prev_qs is not None
                 and self._step_count % self.learn_interval == 0):
-            self._update_B(batched_obs, qs, pomdp_action)
-
-        # C-from-reward and E-vector updates
-        if ((self.learn_C or self.learn_E)
-                and self._step_count > 0
-                and self._step_count % self.c_update_interval == 0):
-            if self.learn_C:
-                self._update_C_from_reward()
-            if self.learn_E and self._step_count >= self.e_start_step:
-                self._update_E_from_reward()
+            self._update_B(batched_obs, qs)
 
         # Periodic logging (every 500 steps)
         if self._step_count % 500 == 0:
-            actions = [int(policies[i]) for i in range(self.n_agents)]
-            action_names = [TASK_POLICY_NAMES[a] for a in actions]
+            option_names = [OPTION_NAMES[self._current_options[i]]
+                           for i in range(self.n_agents)]
+            task_names = [TASK_POLICY_NAMES[self._cached_policies[i]]
+                         for i in range(self.n_agents)]
             extras = []
             if self.learn_B and hasattr(self.agent, 'pB') and self.agent.pB is not None:
                 pB_sum = sum(float(pb.sum()) for pb in self.agent.pB)
                 extras.append(f"pB={pB_sum:.0f}")
-            if self.learn_E:
-                e_range = float(self._e_bias.max() - self._e_bias.min())
-                extras.append(f"E_range={e_range:.2f}")
+            opt_steps = [self.option_executor.states[i].steps_in_option
+                        for i in range(self.n_agents)]
+            extras.append(f"opt_steps={opt_steps}")
             extra_str = f", {', '.join(extras)}" if extras else ""
-            print(f"[AIF step={self._step_count}] actions={action_names}{extra_str}")
+            print(f"[AIF step={self._step_count}] options={option_names}")
+            print(f"  tasks={task_names}{extra_str}")
 
-        # Store for next learning step
+        # Store for next B-learning step
         self._prev_qs = qs
         self._prev_obs = batched_obs
-        self._prev_actions = pomdp_action
+        self._prev_actions = self._option_actions
 
     # ------------------------------------------------------------------
     # B-learning (Dirichlet updates)
     # ------------------------------------------------------------------
 
-    def _update_B(self, curr_obs, curr_qs, curr_actions):
-        """Update B matrices via online Dirichlet learning.
-
-        Constructs a T=2 temporal buffer from previous and current beliefs,
-        then calls pymdp's infer_parameters to update pB.
-        """
+    def _update_B(self, curr_obs, curr_qs):
+        """Update B matrices via online Dirichlet learning."""
         beliefs_T2 = [
             jnp.concatenate([self._prev_qs[f], curr_qs[f]], axis=1)
             for f in range(len(curr_qs))
@@ -375,94 +478,12 @@ class BatchedAIFEngine:
             lr_pB=1.0,
         )
 
-    # ------------------------------------------------------------------
-    # C-from-reward learning
-    # ------------------------------------------------------------------
-
-    def _update_C_from_reward(self):
-        """Update C preferences from accumulated reward-observation correlations.
-
-        For each modality m and obs value v, computes:
-            C_new[m][v] = mean(reward when obs[m] == v)
-        Then applies EMA: C = (1-lr) * C_old + lr * C_new
-        """
-        lr = self.c_learning_rate
-        new_C = []
-
-        for m in range(6):
-            per_agent = []
-            for i in range(self.n_agents):
-                role_idx = 0 if i % 2 == 0 else 1
-                old_c = np.array(self.agent.C[m][i])
-                c_new = np.copy(old_c)
-
-                for v in range(NUM_OBS[m]):
-                    count = self._c_reward_count[m][role_idx, v]
-                    if count > 5:  # minimum samples for reliable estimate
-                        mean_reward = self._c_reward_sum[m][role_idx, v] / count
-                        c_new[v] = (1 - lr) * old_c[v] + lr * mean_reward
-
-                per_agent.append(c_new)
-            new_C.append(jnp.array(np.stack(per_agent)))
-
-        self.agent = eqx.tree_at(lambda a: a.C, self.agent, new_C)
-
-        # Clear accumulators
-        self._c_reward_sum = [np.zeros((2, n)) for n in NUM_OBS]
-        self._c_reward_count = [np.zeros((2, n)) for n in NUM_OBS]
-
-    # ------------------------------------------------------------------
-    # E-vector habit learning
-    # ------------------------------------------------------------------
-
-    def _update_E_from_reward(self):
-        """Update E-vector (habit prior) from action-reward correlations.
-
-        Reinforces policies whose first action correlates with high reward.
-        E[π] ∝ exp(mean_reward[first_action_of_π])
-        Applied as multiplicative bias on q_pi in _batched_step.
-        """
-        n_policies = len(self.agent.policies)
-        new_e = np.ones((self.n_agents, n_policies))
-
-        for i in range(self.n_agents):
-            role_idx = 0 if i % 2 == 0 else 1
-
-            # Mean reward per action for this role
-            action_values = np.zeros(NUM_TASK_POLICIES)
-            for a in range(NUM_TASK_POLICIES):
-                count = self._e_action_reward_count[role_idx, a]
-                if count > 3:
-                    action_values[a] = (
-                        self._e_action_reward_sum[role_idx, a] / count
-                    )
-
-            # Map action values to policies (by first action)
-            for pi_idx in range(n_policies):
-                first_action = int(self.agent.policies.policy_arr[pi_idx, 0, 0])
-                new_e[i, pi_idx] = np.exp(
-                    np.clip(action_values[first_action], -5, 5)
-                )
-
-            # Normalize so mean = 1 (neutral baseline)
-            new_e[i] /= new_e[i].mean()
-
-        # EMA update
-        lr = self.e_learning_rate
-        old_e = np.array(self._e_bias)
-        updated_e = (1 - lr) * old_e + lr * new_e
-        self._e_bias = jnp.array(updated_e)
-
-        # Clear accumulators
-        self._e_action_reward_sum = np.zeros((2, NUM_TASK_POLICIES))
-        self._e_action_reward_count = np.zeros((2, NUM_TASK_POLICIES))
-
 
 # ---------------------------------------------------------------------------
 # Per-agent policy implementation (requires mettagrid)
 # ---------------------------------------------------------------------------
 
-# Import mettagrid lazily — only when classes are actually used at runtime.
+# Import mettagrid lazily -- only when classes are actually used at runtime.
 try:
     from mettagrid.policy.policy import (
         MultiAgentPolicy as _MultiAgentPolicy,
@@ -492,7 +513,7 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
 
     Each step:
     1. Convert AgentObservation -> numpy array -> 6 discrete POMDP observations
-    2. Submit obs to BatchedAIFEngine → get task policy (JIT-batched)
+    2. Submit obs to BatchedAIFEngine -> get task policy (hierarchical)
     3. Execute selected task policy via navigator (spatial movement)
     """
 
@@ -551,16 +572,16 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
         # 2. Discretize -> 6-tuple (o_res, o_sta, o_inv, o_contest, o_social, o_role)
         disc_obs = self._discretizer.discretize_obs(obs_array)
 
-        # 3. Convert to jax arrays — shape (T=1,) per modality
+        # 3. Convert to jax arrays -- shape (T=1,) per modality
         jax_obs = [jnp.array([int(o)]) for o in disc_obs]
 
-        # 4. Submit to batched engine → get task policy (JIT-compiled)
+        # 4. Submit to batched engine -> get task policy (hierarchical)
         task_policy = self._engine.submit_and_get_policy(self._agent_id, jax_obs)
 
         # 5. Execute selected task policy via navigator
         action, state = self._execute_task_policy(task_policy, obs, state)
 
-        # 6. Track for logging — get beliefs from engine
+        # 6. Track for logging -- get beliefs from engine
         beliefs = self._engine.get_beliefs(self._agent_id)
         if beliefs is not None:
             phase_beliefs = np.asarray(beliefs[0][-1])  # last timestep
@@ -605,35 +626,35 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
             return self._navigate_to_tags(self._extractor_tags, obs, state)
 
         elif task_policy == TaskPolicy.MINE:
-            # At extractor — interact (noop to mine)
+            # At extractor -- interact (noop to mine)
             return self._action("noop"), state
 
         elif task_policy == TaskPolicy.NAV_DEPOT:
             return self._navigate_to_tags(self._hub_tags, obs, state)
 
         elif task_policy == TaskPolicy.DEPOSIT:
-            # At hub — interact (noop to deposit)
+            # At hub -- interact (noop to deposit)
             return self._action("noop"), state
 
         elif task_policy == TaskPolicy.NAV_CRAFT:
             return self._navigate_to_tags(self._craft_tags, obs, state)
 
         elif task_policy == TaskPolicy.CRAFT:
-            # At craft station — interact (noop to craft)
+            # At craft station -- interact (noop to craft)
             return self._action("noop"), state
 
         elif task_policy == TaskPolicy.NAV_GEAR:
             return self._navigate_to_tags(self._craft_tags, obs, state)
 
         elif task_policy == TaskPolicy.ACQUIRE_GEAR:
-            # At gear station — interact (noop to pick up)
+            # At gear station -- interact (noop to pick up)
             return self._action("noop"), state
 
         elif task_policy == TaskPolicy.NAV_JUNCTION:
             return self._navigate_to_tags(self._junction_tags, obs, state)
 
         elif task_policy == TaskPolicy.CAPTURE:
-            # At junction — interact (noop to capture)
+            # At junction -- interact (noop to capture)
             return self._action("noop"), state
 
         elif task_policy == TaskPolicy.EXPLORE:
@@ -757,12 +778,12 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
 # ---------------------------------------------------------------------------
 
 class AIFPolicy(_MultiAgentPolicy):
-    """Discrete active inference policy for CogsGuard.
+    """Hierarchical active inference policy for CogsGuard.
 
-    Uses a 216-state POMDP (phase x hand x target_mode x role) with 13
-    task-level policies as the action space.  pymdp JAX handles Bayesian
-    belief tracking and EFE-driven task policy selection, combined with a
-    navigator for spatial movement.
+    Level 2: 216-state POMDP (phase x hand x target_mode x role) with 5
+    macro-options.  Replans at option termination (~every 30-80 steps).
+    Level 1: Reactive option state machines map obs -> task policy.
+    Level 0: Navigator converts task policy -> primitive movement.
 
     All 8 agents share one BatchedAIFEngine (JIT-compiled, batched inference).
     Even agents are miners, odd agents are aligners (per-role C/D vectors).
@@ -791,13 +812,10 @@ class AIFPolicy(_MultiAgentPolicy):
 
         self._discretizer = ObservationDiscretizer(feat_names, tag_categories)
 
-        # One shared engine for all agents (JIT-compiled, batched)
-        # v6: disable C-from-reward (hand-crafted C is well-tuned),
-        # keep E-vector with delayed start and lower lr
+        # Hierarchical engine: strategic POMDP + option state machines
         self._engine = BatchedAIFEngine(
-            n_agents=n_agents, learn_B=True, learn_C=False, learn_E=True,
+            n_agents=n_agents, learn_B=True,
             policy_len=2, learn_interval=50,
-            e_learning_rate=0.02, c_update_interval=200,
         )
         self._agents: dict[int, _StatefulAgentPolicy] = {}
 

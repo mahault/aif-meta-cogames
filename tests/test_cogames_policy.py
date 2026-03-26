@@ -35,13 +35,23 @@ except ImportError:
 
 from aif_meta_cogames.aif_agent.discretizer import (
     Hand,
+    MacroOption,
+    ObsContest,
+    ObsInventory,
+    ObsResource,
+    ObsStation,
     Phase,
     Role,
+    TaskPolicy,
     TargetMode,
 )
 from aif_meta_cogames.aif_agent.generative_model import (
     CogsGuardPOMDP,
     NUM_STATE_FACTORS,
+)
+from aif_meta_cogames.aif_agent.cogames_policy import (
+    OptionExecutor,
+    OptionState,
 )
 
 
@@ -318,3 +328,202 @@ class TestIntegration:
         agent_policy = policy.agent_policy(0)
         assert agent_policy is not None
         assert policy.is_recurrent()
+
+
+# ---------------------------------------------------------------------------
+# OptionExecutor tests
+# ---------------------------------------------------------------------------
+
+class TestOptionExecutor:
+    """Test reactive option state machines."""
+
+    def test_initial_state(self):
+        executor = OptionExecutor(n_agents=4)
+        for i in range(4):
+            assert executor.states[i].current_option == MacroOption.EXPLORE
+            assert executor.states[i].steps_in_option == 0
+
+    def test_explore_returns_explore(self):
+        executor = OptionExecutor(n_agents=1)
+        obs = [ObsResource.NONE, ObsStation.NONE, ObsInventory.EMPTY,
+               ObsContest.FREE, 0, 0]
+        assert executor.get_task_policy(0, obs) == TaskPolicy.EXPLORE
+
+    def test_mine_cycle_nav_resource(self):
+        executor = OptionExecutor(n_agents=1)
+        executor.set_option(0, MacroOption.MINE_CYCLE)
+        obs = [ObsResource.NONE, ObsStation.NONE, ObsInventory.EMPTY,
+               ObsContest.FREE, 0, 0]
+        assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_RESOURCE
+
+    def test_mine_cycle_mine_at_resource(self):
+        executor = OptionExecutor(n_agents=1)
+        executor.set_option(0, MacroOption.MINE_CYCLE)
+        obs = [ObsResource.AT, ObsStation.NONE, ObsInventory.EMPTY,
+               ObsContest.FREE, 0, 0]
+        assert executor.get_task_policy(0, obs) == TaskPolicy.MINE
+
+    def test_mine_cycle_nav_depot_with_resource(self):
+        executor = OptionExecutor(n_agents=1)
+        executor.set_option(0, MacroOption.MINE_CYCLE)
+        obs = [ObsResource.NONE, ObsStation.NONE, ObsInventory.HAS_RESOURCE,
+               ObsContest.FREE, 0, 0]
+        assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_DEPOT
+
+    def test_mine_cycle_deposit_at_hub(self):
+        executor = OptionExecutor(n_agents=1)
+        executor.set_option(0, MacroOption.MINE_CYCLE)
+        obs = [ObsResource.NONE, ObsStation.HUB, ObsInventory.HAS_RESOURCE,
+               ObsContest.FREE, 0, 0]
+        assert executor.get_task_policy(0, obs) == TaskPolicy.DEPOSIT
+
+    def test_craft_cycle_nav_craft(self):
+        executor = OptionExecutor(n_agents=1)
+        executor.set_option(0, MacroOption.CRAFT_CYCLE)
+        obs = [ObsResource.NONE, ObsStation.NONE, ObsInventory.EMPTY,
+               ObsContest.FREE, 0, 0]
+        assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_CRAFT
+
+    def test_craft_cycle_craft_at_station(self):
+        executor = OptionExecutor(n_agents=1)
+        executor.set_option(0, MacroOption.CRAFT_CYCLE)
+        obs = [ObsResource.NONE, ObsStation.CRAFT, ObsInventory.EMPTY,
+               ObsContest.FREE, 0, 0]
+        assert executor.get_task_policy(0, obs) == TaskPolicy.CRAFT
+
+    def test_capture_cycle_nav_junction(self):
+        executor = OptionExecutor(n_agents=1)
+        executor.set_option(0, MacroOption.CAPTURE_CYCLE)
+        obs = [ObsResource.NONE, ObsStation.NONE, ObsInventory.HAS_GEAR,
+               ObsContest.FREE, 0, 0]
+        assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_JUNCTION
+
+    def test_capture_cycle_capture_at_junction(self):
+        executor = OptionExecutor(n_agents=1)
+        executor.set_option(0, MacroOption.CAPTURE_CYCLE)
+        obs = [ObsResource.NONE, ObsStation.JUNCTION, ObsInventory.HAS_GEAR,
+               ObsContest.FREE, 0, 0]
+        assert executor.get_task_policy(0, obs) == TaskPolicy.CAPTURE
+
+    def test_capture_cycle_no_gear_waits(self):
+        executor = OptionExecutor(n_agents=1)
+        executor.set_option(0, MacroOption.CAPTURE_CYCLE)
+        obs = [ObsResource.NONE, ObsStation.NONE, ObsInventory.EMPTY,
+               ObsContest.FREE, 0, 0]
+        assert executor.get_task_policy(0, obs) == TaskPolicy.WAIT
+
+    def test_defend_nav_junction(self):
+        executor = OptionExecutor(n_agents=1)
+        executor.set_option(0, MacroOption.DEFEND)
+        obs = [ObsResource.NONE, ObsStation.NONE, ObsInventory.EMPTY,
+               ObsContest.FREE, 0, 0]
+        assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_JUNCTION
+
+    def test_defend_capture_at_junction(self):
+        executor = OptionExecutor(n_agents=1)
+        executor.set_option(0, MacroOption.DEFEND)
+        obs = [ObsResource.NONE, ObsStation.JUNCTION, ObsInventory.EMPTY,
+               ObsContest.FREE, 0, 0]
+        assert executor.get_task_policy(0, obs) == TaskPolicy.CAPTURE
+
+
+class TestOptionTermination:
+    """Test option termination conditions."""
+
+    def test_timeout(self):
+        executor = OptionExecutor(n_agents=1)
+        executor.set_option(0, MacroOption.EXPLORE)
+        obs = [ObsResource.NONE, ObsStation.NONE, ObsInventory.EMPTY,
+               ObsContest.FREE, 0, 0]
+        # Tick 30 times (EXPLORE timeout)
+        for _ in range(30):
+            executor.tick(0, obs)
+        assert executor.check_termination(0, obs) is True
+
+    def test_explore_terminates_on_resource(self):
+        executor = OptionExecutor(n_agents=1)
+        executor.set_option(0, MacroOption.EXPLORE)
+        obs_resource = [ObsResource.AT, ObsStation.NONE, ObsInventory.EMPTY,
+                        ObsContest.FREE, 0, 0]
+        assert executor.check_termination(0, obs_resource) is True
+
+    def test_explore_terminates_on_station(self):
+        executor = OptionExecutor(n_agents=1)
+        executor.set_option(0, MacroOption.EXPLORE)
+        obs_station = [ObsResource.NONE, ObsStation.HUB, ObsInventory.EMPTY,
+                       ObsContest.FREE, 0, 0]
+        assert executor.check_termination(0, obs_station) is True
+
+    def test_mine_cycle_terminates_on_deposit(self):
+        executor = OptionExecutor(n_agents=1)
+        executor.set_option(0, MacroOption.MINE_CYCLE)
+        # Set prev_inv to RESOURCE (simulates having resource)
+        executor.states[0].prev_inv = ObsInventory.HAS_RESOURCE
+        obs = [ObsResource.NONE, ObsStation.HUB, ObsInventory.EMPTY,
+               ObsContest.FREE, 0, 0]
+        assert executor.check_termination(0, obs) is True
+
+    def test_craft_cycle_terminates_on_gear(self):
+        executor = OptionExecutor(n_agents=1)
+        executor.set_option(0, MacroOption.CRAFT_CYCLE)
+        obs = [ObsResource.NONE, ObsStation.CRAFT, ObsInventory.HAS_GEAR,
+               ObsContest.FREE, 0, 0]
+        assert executor.check_termination(0, obs) is True
+
+    def test_capture_terminates_when_gear_used(self):
+        executor = OptionExecutor(n_agents=1)
+        executor.set_option(0, MacroOption.CAPTURE_CYCLE)
+        executor.states[0].prev_inv = ObsInventory.HAS_GEAR
+        obs = [ObsResource.NONE, ObsStation.JUNCTION, ObsInventory.EMPTY,
+               ObsContest.FREE, 0, 0]
+        assert executor.check_termination(0, obs) is True
+
+    def test_set_option_resets_state(self):
+        executor = OptionExecutor(n_agents=1)
+        executor.set_option(0, MacroOption.MINE_CYCLE)
+        obs = [0, 0, 0, 0, 0, 0]
+        for _ in range(10):
+            executor.tick(0, obs)
+        assert executor.states[0].steps_in_option == 10
+        executor.set_option(0, MacroOption.CRAFT_CYCLE)
+        assert executor.states[0].steps_in_option == 0
+        assert executor.states[0].current_option == MacroOption.CRAFT_CYCLE
+
+
+@pytest.mark.skipif(not HAS_PYMDP, reason="pymdp (JAX) not installed")
+class TestHierarchicalEngine:
+    """Test the hierarchical BatchedAIFEngine."""
+
+    def test_engine_creation(self):
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        engine = BatchedAIFEngine(n_agents=8)
+        assert engine.n_agents == 8
+        assert engine.agent.batch_size == 8
+        assert len(engine.agent.policies) == 25  # 5^2
+
+    def test_engine_step(self):
+        import jax.numpy as jnp
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        engine = BatchedAIFEngine(n_agents=4)
+
+        # Submit observations for all agents
+        for agent_id in range(4):
+            jax_obs = [jnp.array([0]) for _ in range(6)]
+            policy = engine.submit_and_get_policy(agent_id, jax_obs)
+            assert 0 <= policy < 13  # valid task policy
+
+    def test_option_persistence(self):
+        """Options should persist across steps (not replan every step)."""
+        import jax.numpy as jnp
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        engine = BatchedAIFEngine(n_agents=2)
+
+        # Run a few steps with same obs
+        obs = [jnp.array([0]) for _ in range(6)]
+        for _ in range(5):
+            for agent_id in range(2):
+                engine.submit_and_get_policy(agent_id, obs)
+
+        # Options should have steps > 0 (persisting)
+        for i in range(2):
+            assert engine.option_executor.states[i].steps_in_option > 0
