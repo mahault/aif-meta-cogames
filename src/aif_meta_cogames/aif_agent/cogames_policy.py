@@ -189,7 +189,7 @@ class BatchedAIFEngine:
             self._e_action_reward_count = np.zeros((2, NUM_TASK_POLICIES))
 
         # E-vector habit bias: (n_agents, n_policies), all-ones = neutral
-        n_policies = self.agent.policies.shape[0]
+        n_policies = len(self.agent.policies)
         self._e_bias = jnp.ones((n_agents, n_policies))
 
         # JIT-compile the batched step function
@@ -421,7 +421,7 @@ class BatchedAIFEngine:
         E[π] ∝ exp(mean_reward[first_action_of_π])
         Applied as multiplicative bias on q_pi in _batched_step.
         """
-        n_policies = self.agent.policies.shape[0]
+        n_policies = len(self.agent.policies)
         new_e = np.ones((self.n_agents, n_policies))
 
         for i in range(self.n_agents):
@@ -438,7 +438,7 @@ class BatchedAIFEngine:
 
             # Map action values to policies (by first action)
             for pi_idx in range(n_policies):
-                first_action = int(self.agent.policies[pi_idx, 0, 0])
+                first_action = int(self.agent.policies.policy_arr[pi_idx, 0, 0])
                 new_e[i, pi_idx] = np.exp(
                     np.clip(action_values[first_action], -5, 5)
                 )
