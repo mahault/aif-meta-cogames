@@ -36,22 +36,33 @@ except ImportError:
 from aif_meta_cogames.aif_agent.discretizer import (
     Hand,
     MacroOption,
+    NavAction,
+    NavProgress,
+    NUM_NAV_ACTIONS,
     ObsContest,
     ObsInventory,
     ObsResource,
     ObsStation,
     Phase,
     Role,
+    TargetRange,
     TaskPolicy,
     TargetMode,
 )
 from aif_meta_cogames.aif_agent.generative_model import (
     CogsGuardPOMDP,
     NUM_STATE_FACTORS,
+    create_nav_agent,
+    _build_nav_A,
+    _build_nav_B,
+    _build_nav_C,
+    _build_nav_D,
 )
 from aif_meta_cogames.aif_agent.cogames_policy import (
     OptionExecutor,
     OptionState,
+    SpatialMemory,
+    _BEARING_DIRS,
 )
 
 
@@ -381,41 +392,41 @@ class TestOptionExecutor:
 
     def test_craft_cycle_empty_goes_to_hub(self):
         """No hearts: go to hub first (dinky aligner chain)."""
-        executor = OptionExecutor(n_agents=1)
-        executor.set_option(0, MacroOption.CRAFT_CYCLE)
+        executor = OptionExecutor(n_agents=2)
+        executor.set_option(1, MacroOption.CRAFT_CYCLE)  # agent 1 = aligner
         obs = [ObsResource.NONE, ObsStation.NONE, ObsInventory.EMPTY,
                ObsContest.FREE, 0, 0]
-        assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_DEPOT
+        assert executor.get_task_policy(1, obs) == TaskPolicy.NAV_DEPOT
 
     def test_craft_cycle_with_resource_goes_to_craft(self):
         """Has hearts (resource): go to craft station."""
-        executor = OptionExecutor(n_agents=1)
-        executor.set_option(0, MacroOption.CRAFT_CYCLE)
+        executor = OptionExecutor(n_agents=2)
+        executor.set_option(1, MacroOption.CRAFT_CYCLE)  # agent 1 = aligner
         obs = [ObsResource.NONE, ObsStation.NONE, ObsInventory.HAS_RESOURCE,
                ObsContest.FREE, 0, 0]
-        assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_CRAFT
+        assert executor.get_task_policy(1, obs) == TaskPolicy.NAV_CRAFT
 
     def test_capture_cycle_nav_junction(self):
-        executor = OptionExecutor(n_agents=1)
-        executor.set_option(0, MacroOption.CAPTURE_CYCLE)
+        executor = OptionExecutor(n_agents=2)
+        executor.set_option(1, MacroOption.CAPTURE_CYCLE)  # agent 1 = aligner
         obs = [ObsResource.NONE, ObsStation.NONE, ObsInventory.HAS_GEAR,
                ObsContest.FREE, 0, 0]
-        assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_JUNCTION
+        assert executor.get_task_policy(1, obs) == TaskPolicy.NAV_JUNCTION
 
     def test_capture_cycle_nav_junction_at_junction(self):
         """Even at JUNCTION, use NAV_JUNCTION (auto-captures at dist=0)."""
-        executor = OptionExecutor(n_agents=1)
-        executor.set_option(0, MacroOption.CAPTURE_CYCLE)
+        executor = OptionExecutor(n_agents=2)
+        executor.set_option(1, MacroOption.CAPTURE_CYCLE)  # agent 1 = aligner
         obs = [ObsResource.NONE, ObsStation.JUNCTION, ObsInventory.HAS_GEAR,
                ObsContest.FREE, 0, 0]
-        assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_JUNCTION
+        assert executor.get_task_policy(1, obs) == TaskPolicy.NAV_JUNCTION
 
     def test_capture_cycle_no_gear_waits(self):
-        executor = OptionExecutor(n_agents=1)
-        executor.set_option(0, MacroOption.CAPTURE_CYCLE)
+        executor = OptionExecutor(n_agents=2)
+        executor.set_option(1, MacroOption.CAPTURE_CYCLE)  # agent 1 = aligner
         obs = [ObsResource.NONE, ObsStation.NONE, ObsInventory.EMPTY,
                ObsContest.FREE, 0, 0]
-        assert executor.get_task_policy(0, obs) == TaskPolicy.WAIT
+        assert executor.get_task_policy(1, obs) == TaskPolicy.WAIT
 
     def test_defend_nav_junction(self):
         executor = OptionExecutor(n_agents=1)
@@ -431,6 +442,25 @@ class TestOptionExecutor:
         obs = [ObsResource.NONE, ObsStation.JUNCTION, ObsInventory.EMPTY,
                ObsContest.FREE, 0, 0]
         assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_JUNCTION
+
+
+    def test_role_filter_miner_cannot_craft(self):
+        """Miner (even) requesting CRAFT_CYCLE gets MINE_CYCLE instead."""
+        executor = OptionExecutor(n_agents=2)
+        executor.set_option(0, MacroOption.CRAFT_CYCLE)  # agent 0 = miner
+        assert executor.states[0].current_option == MacroOption.MINE_CYCLE
+
+    def test_role_filter_miner_cannot_capture(self):
+        """Miner (even) requesting CAPTURE_CYCLE gets MINE_CYCLE instead."""
+        executor = OptionExecutor(n_agents=2)
+        executor.set_option(0, MacroOption.CAPTURE_CYCLE)  # agent 0 = miner
+        assert executor.states[0].current_option == MacroOption.MINE_CYCLE
+
+    def test_role_filter_aligner_cannot_mine(self):
+        """Aligner (odd) requesting MINE_CYCLE gets EXPLORE instead."""
+        executor = OptionExecutor(n_agents=2)
+        executor.set_option(1, MacroOption.MINE_CYCLE)  # agent 1 = aligner
+        assert executor.states[1].current_option == MacroOption.EXPLORE
 
 
 class TestOptionTermination:
@@ -487,30 +517,30 @@ class TestOptionTermination:
         assert executor.check_termination(0, obs) is True
 
     def test_craft_cycle_terminates_on_gear(self):
-        executor = OptionExecutor(n_agents=1)
-        executor.set_option(0, MacroOption.CRAFT_CYCLE)
+        executor = OptionExecutor(n_agents=2)
+        executor.set_option(1, MacroOption.CRAFT_CYCLE)  # agent 1 = aligner
         obs = [ObsResource.NONE, ObsStation.CRAFT, ObsInventory.HAS_GEAR,
                ObsContest.FREE, 0, 0]
-        assert executor.check_termination(0, obs) is True
+        assert executor.check_termination(1, obs) is True
 
     def test_capture_terminates_when_gear_used(self):
-        executor = OptionExecutor(n_agents=1)
-        executor.set_option(0, MacroOption.CAPTURE_CYCLE)
-        executor.states[0].prev_inv = ObsInventory.HAS_GEAR
+        executor = OptionExecutor(n_agents=2)
+        executor.set_option(1, MacroOption.CAPTURE_CYCLE)  # agent 1 = aligner
+        executor.states[1].prev_inv = ObsInventory.HAS_GEAR
         obs = [ObsResource.NONE, ObsStation.JUNCTION, ObsInventory.EMPTY,
                ObsContest.FREE, 0, 0]
-        assert executor.check_termination(0, obs) is True
+        assert executor.check_termination(1, obs) is True
 
     def test_set_option_resets_state(self):
-        executor = OptionExecutor(n_agents=1)
-        executor.set_option(0, MacroOption.MINE_CYCLE)
+        executor = OptionExecutor(n_agents=2)
+        executor.set_option(1, MacroOption.CRAFT_CYCLE)  # agent 1 = aligner
         obs = [0, 0, 0, 0, 0, 0]
         for _ in range(10):
-            executor.tick(0, obs)
-        assert executor.states[0].steps_in_option == 10
-        executor.set_option(0, MacroOption.CRAFT_CYCLE)
-        assert executor.states[0].steps_in_option == 0
-        assert executor.states[0].current_option == MacroOption.CRAFT_CYCLE
+            executor.tick(1, obs)
+        assert executor.states[1].steps_in_option == 10
+        executor.set_option(1, MacroOption.CAPTURE_CYCLE)
+        assert executor.states[1].steps_in_option == 0
+        assert executor.states[1].current_option == MacroOption.CAPTURE_CYCLE
 
 
 @pytest.mark.skipif(not HAS_PYMDP, reason="pymdp (JAX) not installed")
@@ -644,3 +674,342 @@ class TestSpatialMemory:
         mem.position_history.append((10, 10))
         mem.position_history.append((10, 10))
         assert not mem.is_stuck()  # Only 2 entries, need 20
+
+
+# ---------------------------------------------------------------------------
+# Navigation POMDP tests
+# ---------------------------------------------------------------------------
+
+class TestNavEnums:
+    """Test navigation POMDP enums and constants."""
+
+    def test_nav_progress_values(self):
+        assert NavProgress.APPROACHING == 0
+        assert NavProgress.LATERAL == 1
+        assert NavProgress.RETREATING == 2
+        assert NavProgress.BLOCKED == 3
+        assert len(NavProgress) == 4
+
+    def test_target_range_values(self):
+        assert TargetRange.ADJACENT == 0
+        assert TargetRange.NEAR == 1
+        assert TargetRange.FAR == 2
+        assert TargetRange.NO_TARGET == 3
+        assert len(TargetRange) == 4
+
+    def test_nav_action_values(self):
+        assert NavAction.TOWARD == 0
+        assert NavAction.LEFT == 1
+        assert NavAction.RIGHT == 2
+        assert NavAction.AWAY == 3
+        assert NavAction.RANDOM == 4
+        assert NUM_NAV_ACTIONS == 5
+
+    def test_bearing_dirs(self):
+        assert len(_BEARING_DIRS) == 4
+        assert _BEARING_DIRS[0] == "move_north"
+        assert _BEARING_DIRS[1] == "move_east"
+        assert _BEARING_DIRS[2] == "move_south"
+        assert _BEARING_DIRS[3] == "move_west"
+
+
+class TestNavGenerativeModel:
+    """Test navigation POMDP A/B/C/D matrices."""
+
+    def test_nav_A_shapes(self):
+        A = _build_nav_A()
+        assert len(A) == 2
+        assert A[0].shape == (4, 4)  # obs_range x target_range
+        assert A[1].shape == (4, 4)  # obs_movement x nav_progress
+
+    def test_nav_A_normalized(self):
+        A = _build_nav_A()
+        for m in range(2):
+            col_sums = A[m].sum(axis=0)
+            np.testing.assert_allclose(col_sums, 1.0, atol=1e-6)
+
+    def test_nav_B_shapes(self):
+        B = _build_nav_B()
+        assert len(B) == 2
+        assert B[0].shape == (4, 4, 4, 5)  # prog' x prog x range x action
+        assert B[1].shape == (4, 4, 4, 5)  # range' x prog x range x action
+
+    def test_nav_B_normalized(self):
+        B = _build_nav_B()
+        for f in range(2):
+            for p in range(4):
+                for r in range(4):
+                    for a in range(5):
+                        col_sum = B[f][:, p, r, a].sum()
+                        assert abs(col_sum - 1.0) < 1e-6, (
+                            f"B[{f}][:, {p}, {r}, {a}] sums to {col_sum}"
+                        )
+
+    def test_nav_B_blocked_asymmetry(self):
+        """TOWARD from BLOCKED should stay BLOCKED more than LEFT/RIGHT."""
+        B = _build_nav_B()
+        B_prog = B[0]
+        BLKD = NavProgress.BLOCKED
+        # Check across all range values
+        for rng in range(4):
+            # TOWARD from BLOCKED → BLOCKED should be higher
+            toward_blocked = B_prog[BLKD, BLKD, rng, NavAction.TOWARD]
+            left_blocked = B_prog[BLKD, BLKD, rng, NavAction.LEFT]
+            assert toward_blocked > left_blocked, (
+                f"At range={rng}: TOWARD→BLOCKED ({toward_blocked:.3f}) "
+                f"should > LEFT→BLOCKED ({left_blocked:.3f})"
+            )
+
+    def test_nav_C_shapes(self):
+        C = _build_nav_C()
+        assert len(C) == 2
+        assert C[0].shape == (4,)  # range preferences
+        assert C[1].shape == (4,)  # movement preferences
+
+    def test_nav_C_preferences(self):
+        """ADJACENT preferred over FAR, APPROACHING preferred over BLOCKED."""
+        C = _build_nav_C()
+        assert C[0][TargetRange.ADJACENT] > C[0][TargetRange.FAR]
+        assert C[0][TargetRange.ADJACENT] > C[0][TargetRange.NO_TARGET]
+        assert C[1][NavProgress.APPROACHING] > C[1][NavProgress.BLOCKED]
+        assert C[1][NavProgress.APPROACHING] > C[1][NavProgress.RETREATING]
+
+    def test_nav_D_shapes(self):
+        D = _build_nav_D()
+        assert len(D) == 2
+        assert D[0].shape == (4,)
+        assert D[1].shape == (4,)
+
+    def test_nav_D_normalized(self):
+        D = _build_nav_D()
+        for f in range(2):
+            assert abs(D[f].sum() - 1.0) < 1e-6
+
+
+@pytest.mark.skipif(not HAS_PYMDP, reason="pymdp (JAX) not installed")
+class TestNavPOMDPAgent:
+    """Test navigation POMDP agent creation and inference."""
+
+    def test_create_nav_agent(self):
+        agent = create_nav_agent(n_agents=2, policy_len=2)
+        assert agent.batch_size == 2
+        assert len(agent.A) == 2  # 2 observation modalities
+        assert len(agent.B) == 2  # 2 state factors
+        assert len(agent.policies) == 25  # 5^2 two-step policies
+
+    def test_nav_inference(self):
+        agent = create_nav_agent(n_agents=2, policy_len=2)
+        obs = [jnp.zeros((2, 1), dtype=jnp.int32) for _ in range(2)]
+        qs = agent.infer_states(obs, empirical_prior=agent.D)
+        assert len(qs) == 2  # 2 state factors
+        assert qs[0].shape[0] == 2  # batch=2
+
+    def test_nav_full_cycle(self):
+        """Test full nav POMDP inference cycle."""
+        agent = create_nav_agent(n_agents=4, policy_len=2)
+        obs = [jnp.zeros((4, 1), dtype=jnp.int32) for _ in range(2)]
+        qs = agent.infer_states(obs, empirical_prior=agent.D)
+        q_pi, G = agent.infer_policies(qs)
+        action = agent.sample_action(q_pi)
+        # action shape: (batch=4, num_factors=2)
+        assert action.shape == (4, 2)
+        # Both factors same action (constrained)
+        assert int(action[0, 0]) == int(action[0, 1])
+        assert 0 <= int(action[0, 0]) < 5
+
+    def test_nav_blocked_prefers_lateral(self):
+        """When observing BLOCKED, nav POMDP should prefer LEFT/RIGHT over TOWARD."""
+        agent = create_nav_agent(n_agents=1, policy_len=2)
+        # Observe: range=NEAR, movement=BLOCKED
+        obs = [
+            jnp.array([[int(TargetRange.NEAR)]]),
+            jnp.array([[int(NavProgress.BLOCKED)]]),
+        ]
+        qs = agent.infer_states(obs, empirical_prior=agent.D)
+        q_pi, G = agent.infer_policies(qs)
+        action = agent.sample_action(q_pi)
+        nav_act = int(action[0, 0])
+        # Should NOT choose TOWARD when blocked (wall ahead)
+        # Note: this is probabilistic, but deterministic selection should avoid TOWARD
+        assert nav_act != NavAction.TOWARD or nav_act in (
+            NavAction.LEFT, NavAction.RIGHT
+        )
+
+
+@pytest.mark.skipif(not HAS_PYMDP, reason="pymdp (JAX) not installed")
+class TestNavEngine:
+    """Test nav POMDP integration in BatchedAIFEngine."""
+
+    def test_engine_has_nav_agent(self):
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        engine = BatchedAIFEngine(n_agents=4)
+        assert engine.nav_agent is not None
+        assert engine.nav_agent.batch_size == 4
+
+    def test_submit_nav_returns_valid_action(self):
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        engine = BatchedAIFEngine(n_agents=4)
+
+        # Submit nav obs for all agents
+        for agent_id in range(4):
+            nav_obs = [jnp.array([0]), jnp.array([0])]
+            nav_action = engine.submit_nav_and_get_action(agent_id, nav_obs)
+            assert 0 <= nav_action < NUM_NAV_ACTIONS
+
+    def test_nav_belief_reset(self):
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        engine = BatchedAIFEngine(n_agents=2)
+
+        # Run a step to update beliefs
+        for agent_id in range(2):
+            nav_obs = [
+                jnp.array([int(TargetRange.FAR)]),
+                jnp.array([int(NavProgress.APPROACHING)]),
+            ]
+            engine.submit_nav_and_get_action(agent_id, nav_obs)
+
+        # Reset agent 0's beliefs
+        engine._reset_nav_beliefs([0])
+
+        # Agent 0's prior should be back to D
+        for f in range(len(engine.nav_prior)):
+            reset_prior = np.asarray(engine.nav_prior[f][0])
+            d_prior = np.asarray(engine.nav_agent.D[f][0])
+            np.testing.assert_allclose(reset_prior, d_prior, atol=1e-6)
+
+
+class TestFrontierExploration:
+    """Test frontier-based exploration target computation."""
+
+    def test_frontier_basic(self):
+        """Frontier cells are unexplored cells adjacent to explored ones."""
+        mem = SpatialMemory()
+        mem.position = (5, 5)
+        # Explore a 3x3 area centered on (5, 5)
+        for dr in range(-1, 2):
+            for dc in range(-1, 2):
+                mem.explored.add((5 + dr, 5 + dc))
+
+        # Import the method (it's on AIFCogPolicyImpl, but we can test logic)
+        frontiers = set()
+        for (r, c) in mem.explored:
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nb = (r + dr, c + dc)
+                if nb not in mem.explored and nb not in mem.walls:
+                    frontiers.add(nb)
+
+        assert len(frontiers) > 0
+        # All frontiers should be adjacent to explored territory
+        for fr, fc in frontiers:
+            has_explored_neighbor = False
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                if (fr + dr, fc + dc) in mem.explored:
+                    has_explored_neighbor = True
+                    break
+            assert has_explored_neighbor
+
+    def test_frontier_excludes_walls(self):
+        """Frontier cells should not include known walls."""
+        mem = SpatialMemory()
+        mem.position = (5, 5)
+        mem.explored.add((5, 5))
+        mem.walls.add((5, 6))  # Wall to the east
+
+        frontiers = set()
+        for (r, c) in mem.explored:
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nb = (r + dr, c + dc)
+                if nb not in mem.explored and nb not in mem.walls:
+                    frontiers.add(nb)
+
+        assert (5, 6) not in frontiers
+
+    def test_frontier_nearest(self):
+        """Should pick the frontier nearest to current position."""
+        mem = SpatialMemory()
+        mem.position = (5, 5)
+        mem.explored.add((5, 5))
+        mem.explored.add((5, 6))
+        mem.explored.add((5, 7))
+
+        frontiers = set()
+        for (r, c) in mem.explored:
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nb = (r + dr, c + dc)
+                if nb not in mem.explored and nb not in mem.walls:
+                    frontiers.add(nb)
+
+        nearest = min(
+            frontiers,
+            key=lambda f: abs(f[0] - mem.position[0]) + abs(f[1] - mem.position[1])
+        )
+        # Nearest frontier should be dist 1 from (5, 5)
+        dist = abs(nearest[0] - 5) + abs(nearest[1] - 5)
+        assert dist == 1
+
+
+class TestBearingConversion:
+    """Test relative-to-absolute direction conversion logic."""
+
+    def test_toward_north(self):
+        """TOWARD when target is north → move_north."""
+        bearing_idx = _BEARING_DIRS.index("move_north")
+        direction = _BEARING_DIRS[bearing_idx]
+        assert direction == "move_north"
+
+    def test_left_of_north(self):
+        """LEFT when bearing is north → move_west (CCW)."""
+        bearing_idx = _BEARING_DIRS.index("move_north")
+        direction = _BEARING_DIRS[(bearing_idx + 3) % 4]
+        assert direction == "move_west"
+
+    def test_right_of_north(self):
+        """RIGHT when bearing is north → move_east (CW)."""
+        bearing_idx = _BEARING_DIRS.index("move_north")
+        direction = _BEARING_DIRS[(bearing_idx + 1) % 4]
+        assert direction == "move_east"
+
+    def test_away_from_north(self):
+        """AWAY when bearing is north → move_south."""
+        bearing_idx = _BEARING_DIRS.index("move_north")
+        direction = _BEARING_DIRS[(bearing_idx + 2) % 4]
+        assert direction == "move_south"
+
+    def test_toward_east(self):
+        """TOWARD when target is east → move_east."""
+        bearing_idx = _BEARING_DIRS.index("move_east")
+        direction = _BEARING_DIRS[bearing_idx]
+        assert direction == "move_east"
+
+    def test_left_of_east(self):
+        """LEFT when bearing is east → move_north (CCW)."""
+        bearing_idx = _BEARING_DIRS.index("move_east")
+        direction = _BEARING_DIRS[(bearing_idx + 3) % 4]
+        assert direction == "move_north"
+
+    def test_all_bearings_cycle(self):
+        """Verify all 4 bearings produce correct TOWARD/LEFT/RIGHT/AWAY."""
+        expected = {
+            "move_north": {
+                "toward": "move_north", "left": "move_west",
+                "right": "move_east", "away": "move_south",
+            },
+            "move_east": {
+                "toward": "move_east", "left": "move_north",
+                "right": "move_south", "away": "move_west",
+            },
+            "move_south": {
+                "toward": "move_south", "left": "move_east",
+                "right": "move_west", "away": "move_north",
+            },
+            "move_west": {
+                "toward": "move_west", "left": "move_south",
+                "right": "move_north", "away": "move_east",
+            },
+        }
+        for bearing, dirs in expected.items():
+            idx = _BEARING_DIRS.index(bearing)
+            assert _BEARING_DIRS[idx] == dirs["toward"], f"{bearing} toward"
+            assert _BEARING_DIRS[(idx + 3) % 4] == dirs["left"], f"{bearing} left"
+            assert _BEARING_DIRS[(idx + 1) % 4] == dirs["right"], f"{bearing} right"
+            assert _BEARING_DIRS[(idx + 2) % 4] == dirs["away"], f"{bearing} away"

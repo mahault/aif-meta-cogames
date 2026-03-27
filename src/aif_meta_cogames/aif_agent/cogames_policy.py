@@ -1,26 +1,19 @@
-"""Live CogsGuard policy using discrete active inference (pymdp JAX).
+"""Live CogsGuard policy using deep active inference (two nested POMDPs).
 
-Architecture:
-- **Hierarchical 2-level**: Level 2 (strategic POMDP, 5 macro-options) selects
-  macro-options every 30-80 steps. Level 1 (option state machines) maps
-  observation -> task policy reactively within each option.
-- **BatchedAIFEngine** runs one pymdp Agent(batch_size=8) for all agents,
-  JIT-compiled via eqx.filter_jit for ~5-10x speedup over sequential
-- **pymdp** (JAX) handles belief tracking (posterior over 216 economy-chain
-  states) and macro-option selection via Expected Free Energy (EFE)
-- **OptionExecutor** converts macro-options + observations -> task policies
-- **Navigator** converts the selected task policy into primitive movement
+Architecture (deep AIF with nested generative models):
+- **Level 2**: Strategic POMDP (216 states, 5 macro-options, replans every
+  ~30-80 steps). Decides WHAT to do via Expected Free Energy (EFE).
+- **Level 1**: OptionExecutor (reactive state machines) maps option + obs ->
+  task policy (~0ms).
+- **Level 0**: Navigation POMDP (16 states, 5 relative actions, every step).
+  Decides HOW to move toward the target. Uses epistemic value (info gain) for
+  principled exploration and 2-step planning for obstacle avoidance.
 
-The POMDP action space is 5 macro-options (not 13 task policies or 5 movements).
-This gives 25 two-step policies vs 169 previously, reducing infer_policies from
-~280ms to ~42ms. Most steps only run belief update (~28ms), with full replanning
-only at option termination (~70ms total).
+Both POMDPs use JIT-compiled batched inference via pymdp 1.0 (JAX/Equinox).
+Agent 0's step triggers batched inference for all 8 agents; agents 1-7 use
+cached results (1-step lag).
 
-Uses batched inference: one pymdp Agent(batch_size=8) with per-role C/D
-vectors (even=miner, odd=aligner). Agent 0's step triggers batched inference
-for all 8 agents; agents 1-7 use cached results (1-step lag).
-
-Implements the cogames MultiAgentPolicy interface so it can be used directly:
+Implements the cogames MultiAgentPolicy interface:
     cogames eval -p class=aif_meta_cogames.aif_agent.cogames_policy.AIFPolicy
 
 Note: mettagrid has no Windows wheel. This module uses lazy imports so that
@@ -40,6 +33,9 @@ import numpy as np
 from .discretizer import (
     Hand,
     MacroOption,
+    NavAction,
+    NavProgress,
+    NUM_NAV_ACTIONS,
     NUM_OBS,
     NUM_OPTIONS,
     NUM_TASK_POLICIES,
@@ -51,10 +47,11 @@ from .discretizer import (
     ObservationDiscretizer,
     Phase,
     TASK_POLICY_NAMES,
+    TargetRange,
     TaskPolicy,
     state_factors,
 )
-from .generative_model import CogsGuardPOMDP
+from .generative_model import CogsGuardPOMDP, create_nav_agent
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -73,6 +70,8 @@ OPPOSITES = {
     "move_north": "move_south", "move_south": "move_north",
     "move_east": "move_west", "move_west": "move_east",
 }
+# Clockwise bearing order for relative→absolute nav action conversion
+_BEARING_DIRS = ("move_north", "move_east", "move_south", "move_west")
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +216,9 @@ class AIFBeliefState:
     last_hand: int = 0
     last_task_policy: int = TaskPolicy.EXPLORE
     spatial_memory: Optional[SpatialMemory] = None
+    # Navigation POMDP state
+    last_heading: str = "move_east"
+    prev_target_dist: int = -1
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +244,40 @@ def _select_option(agent, qs):
     q_pi, _efe = agent.infer_policies(qs)
     sampled = agent.sample_action(q_pi)
     return sampled[:, 0], q_pi
+
+
+# ---------------------------------------------------------------------------
+# Level 0: JIT-compiled navigation POMDP functions
+# ---------------------------------------------------------------------------
+
+def _nav_infer(agent, batched_obs, empirical_prior, nav_actions):
+    """JIT-compilable nav POMDP: belief update + policy selection.
+
+    Runs every step. ~3-5ms for 16-state POMDP with 25 policies.
+    Returns qs for downstream B-learning.
+    """
+    qs = agent.infer_states(batched_obs, empirical_prior=empirical_prior)
+    pred, _ = agent.update_empirical_prior(nav_actions, qs)
+    q_pi, _efe = agent.infer_policies(qs)
+    sampled = agent.sample_action(q_pi)
+    return pred, sampled[:, 0], q_pi, qs
+
+
+def _nav_learn_B(agent, beliefs_T2, obs_T2, actions_T1):
+    """JIT-compilable nav POMDP B-learning via Dirichlet updates.
+
+    After observing a transition (s_{t-1}, a_{t-1}, s_t), updates the
+    Dirichlet posterior pB.  The expected B matrices are recomputed so
+    that future policy evaluation uses the learned dynamics.
+    """
+    return agent.infer_parameters(
+        beliefs_A=beliefs_T2,
+        outcomes=obs_T2,
+        actions=actions_T1,
+        beliefs_B=beliefs_T2,
+        lr_pA=0.0,
+        lr_pB=1.0,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +386,20 @@ class OptionExecutor:
         return False
 
     def set_option(self, agent_id: int, option: int):
-        """Activate a new option for this agent."""
+        """Activate a new option for this agent.
+
+        Enforces role-based option initiation sets (Options framework):
+        miners cannot initiate CRAFT/CAPTURE, aligners cannot initiate MINE.
+        If a disallowed option is selected, fall back to role-appropriate default.
+        """
+        # Role filter: restrict option initiation by role
+        if self._is_aligner[agent_id]:
+            if option == MacroOption.MINE_CYCLE:
+                option = MacroOption.EXPLORE
+        else:  # miner
+            if option in (MacroOption.CRAFT_CYCLE, MacroOption.CAPTURE_CYCLE):
+                option = MacroOption.MINE_CYCLE
+
         st = self.states[agent_id]
         st.current_option = option
         st.steps_in_option = 0
@@ -457,9 +506,35 @@ class BatchedAIFEngine:
         self._prev_obs = None
         self._prev_actions = None
 
-        # JIT-compile both functions
+        # Level 0: Navigation POMDP (with B-learning by default)
+        self.nav_agent = create_nav_agent(n_agents, policy_len=2,
+                                          learn_B=True)
+        self._nav_obs_buffer: list[list[Any]] = [
+            [jnp.array([0]) for _ in range(2)]
+            for _ in range(n_agents)
+        ]
+        self.nav_prior = self.nav_agent.D
+        self._nav_actions = jnp.full(
+            (n_agents, 2), NavAction.TOWARD, dtype=jnp.int32
+        )
+        self._cached_nav_actions = [int(NavAction.TOWARD)] * n_agents
+
+        # Nav B-learning buffers
+        self._prev_nav_qs = None
+        self._prev_nav_obs = None
+        self._prev_nav_actions = None
+        # Store initial pB/B for reset on option change
+        self._nav_initial_pB = (
+            [pb.copy() for pb in self.nav_agent.pB]
+            if self.nav_agent.pB is not None else None
+        )
+        self._nav_initial_B = [b.copy() for b in self.nav_agent.B]
+
+        # JIT-compile all functions
         self._jit_belief_update = eqx.filter_jit(_belief_update)
         self._jit_select_option = eqx.filter_jit(_select_option)
+        self._jit_nav_infer = eqx.filter_jit(_nav_infer)
+        self._jit_nav_learn_B = eqx.filter_jit(_nav_learn_B)
 
         # Warmup JIT compilation (avoids timeout on first eval step)
         dummy_obs = [jnp.zeros((n_agents, 1), dtype=jnp.int32) for _ in range(6)]
@@ -468,6 +543,13 @@ class BatchedAIFEngine:
             self.agent, dummy_obs, self.empirical_prior, dummy_actions
         )
         self._jit_select_option(self.agent, qs)
+
+        # Warmup nav POMDP JIT (including B-learning)
+        dummy_nav_obs = [jnp.zeros((n_agents, 1), dtype=jnp.int32) for _ in range(2)]
+        dummy_nav_act = jnp.full((n_agents, 2), 0, dtype=jnp.int32)
+        _pred, _act, _qpi, _qs = self._jit_nav_infer(
+            self.nav_agent, dummy_nav_obs, self.nav_prior, dummy_nav_act
+        )
 
     def submit_and_get_policy(self, agent_id: int, jax_obs: list) -> int:
         """Store obs for agent_id and return its task policy.
@@ -482,6 +564,19 @@ class BatchedAIFEngine:
             self._run_batch()
 
         return self._cached_policies[agent_id]
+
+    def submit_nav_and_get_action(self, agent_id: int, nav_obs: list) -> int:
+        """Store nav obs for agent_id and return its nav action.
+
+        Agent 0 triggers batched nav inference for all agents.
+        Others return cached nav actions (1-step lag).
+        """
+        self._nav_obs_buffer[agent_id] = nav_obs
+
+        if agent_id == 0:
+            self._run_nav_batch()
+
+        return self._cached_nav_actions[agent_id]
 
     def get_beliefs(self, agent_id: int):
         """Return per-agent beliefs (qs) from the batched posterior."""
@@ -529,6 +624,8 @@ class BatchedAIFEngine:
             self._option_actions = jnp.tile(
                 jnp.array(self._current_options)[:, None], (1, 4)
             )
+            # Reset nav POMDP beliefs for agents with new options
+            self._reset_nav_beliefs(terminated)
 
         # Level 1: Get task policies from option executor
         for i in range(self.n_agents):
@@ -565,6 +662,90 @@ class BatchedAIFEngine:
         self._prev_actions = self._option_actions
 
     # ------------------------------------------------------------------
+    # Level 0: Nav POMDP batch inference
+    # ------------------------------------------------------------------
+
+    def _run_nav_batch(self):
+        """Run batched nav POMDP inference + online B-learning."""
+        # Stack obs: (n_agents, T=1) per modality
+        batched_nav_obs = []
+        for m in range(2):
+            stacked = jnp.stack(
+                [self._nav_obs_buffer[i][m] for i in range(self.n_agents)]
+            )
+            batched_nav_obs.append(stacked)
+
+        # Nav inference: belief update + policy selection (~3-5ms)
+        new_prior, nav_actions, _q_pi, nav_qs = self._jit_nav_infer(
+            self.nav_agent, batched_nav_obs, self.nav_prior, self._nav_actions
+        )
+        self.nav_prior = new_prior
+
+        # Cache actions for each agent
+        nav_act_np = np.asarray(nav_actions, dtype=np.int32)
+        for i in range(self.n_agents):
+            self._cached_nav_actions[i] = int(nav_act_np[i])
+
+        # Online B-learning: update nav transition model from experience
+        if self._prev_nav_qs is not None and self.nav_agent.pB is not None:
+            beliefs_T2 = [
+                jnp.concatenate([self._prev_nav_qs[f], nav_qs[f]], axis=1)
+                for f in range(len(nav_qs))
+            ]
+            obs_T2 = [
+                jnp.concatenate(
+                    [self._prev_nav_obs[m], batched_nav_obs[m]], axis=1
+                )
+                for m in range(len(batched_nav_obs))
+            ]
+            actions_T1 = self._prev_nav_actions[:, None, :]
+            self.nav_agent = self._jit_nav_learn_B(
+                self.nav_agent, beliefs_T2, obs_T2, actions_T1
+            )
+
+        # Store for next B-learning step
+        self._prev_nav_qs = nav_qs
+        self._prev_nav_obs = batched_nav_obs
+        self._prev_nav_actions = self._nav_actions
+
+        # Store actions for next belief update (both factors get same action)
+        self._nav_actions = jnp.tile(
+            nav_actions[:, None].astype(jnp.int32), (1, 2)
+        )
+
+    def _reset_nav_beliefs(self, agent_ids: list[int]):
+        """Reset nav POMDP beliefs and learned B for agents that changed options.
+
+        When the strategic POMDP picks a new option the nav target changes,
+        so relative actions (LEFT/RIGHT/TOWARD) map to different compass
+        directions.  The learned B matrices are no longer valid and must
+        be reset to the prior so the agent re-learns which actions work
+        in the new spatial context.
+        """
+        for i in agent_ids:
+            for f in range(len(self.nav_prior)):
+                self.nav_prior[f] = self.nav_prior[f].at[i].set(
+                    self.nav_agent.D[f][i]
+                )
+
+        # Reset pB and B to initial priors (Dirichlet concentration resets)
+        if self._nav_initial_pB is not None:
+            for f in range(len(self._nav_initial_pB)):
+                for i in agent_ids:
+                    new_pB_f = self.nav_agent.pB[f].at[i].set(
+                        self._nav_initial_pB[f][i]
+                    )
+                    new_B_f = self.nav_agent.B[f].at[i].set(
+                        self._nav_initial_B[f][i]
+                    )
+                    self.nav_agent = eqx.tree_at(
+                        lambda a, _f=f: a.pB[_f], self.nav_agent, new_pB_f
+                    )
+                    self.nav_agent = eqx.tree_at(
+                        lambda a, _f=f: a.B[_f], self.nav_agent, new_B_f
+                    )
+
+    # ------------------------------------------------------------------
     # B-learning (Dirichlet updates)
     # ------------------------------------------------------------------
 
@@ -582,7 +763,7 @@ class BatchedAIFEngine:
 
         self.agent = self.agent.infer_parameters(
             beliefs_A=beliefs_T2,
-            observations=obs_T2,
+            outcomes=obs_T2,
             actions=actions_T1,
             beliefs_B=beliefs_T2,
             lr_pA=0.0,
@@ -739,7 +920,7 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
         return arr
 
     # ------------------------------------------------------------------
-    # Task-policy execution (the navigator)
+    # Task-policy execution (nav POMDP)
     # ------------------------------------------------------------------
 
     def _execute_task_policy(
@@ -748,73 +929,81 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
         obs: _AgentObservation,
         state: AIFBeliefState,
     ) -> tuple[_Action, AIFBeliefState]:
-        """Execute a task-level policy by dispatching to the navigator.
+        """Execute a task-level policy using the navigation POMDP.
 
-        pymdp selects WHAT to do (task policy). This method handles HOW
-        to do it (spatial movement toward the right target).
+        Level 2 (strategic POMDP) selects WHAT to do (task policy).
+        Level 0 (nav POMDP) decides HOW to move toward the target.
         """
-        if task_policy == TaskPolicy.NAV_RESOURCE:
-            return self._navigate_to_tags(
-                self._extractor_tags, obs, state, category="extractor")
-
-        elif task_policy == TaskPolicy.NAV_DEPOT:
-            return self._navigate_to_tags(
-                self._hub_tags, obs, state, category="hub")
-
-        elif task_policy == TaskPolicy.NAV_CRAFT:
-            return self._navigate_to_tags(
-                self._craft_tags, obs, state, category="craft")
-
-        elif task_policy == TaskPolicy.NAV_GEAR:
-            return self._navigate_to_tags(
-                self._craft_tags, obs, state, category="craft")
-
-        elif task_policy == TaskPolicy.NAV_JUNCTION:
-            return self._navigate_to_tags(
-                self._junction_tags, obs, state, category="junction")
-
-        elif task_policy == TaskPolicy.EXPLORE:
-            return self._wander(state)
-
-        elif task_policy == TaskPolicy.YIELD:
-            return self._wander(state)
-
-        elif task_policy in (
+        # Noop task policies — no movement needed
+        if task_policy in (
             TaskPolicy.MINE, TaskPolicy.DEPOSIT, TaskPolicy.CRAFT,
             TaskPolicy.ACQUIRE_GEAR, TaskPolicy.CAPTURE, TaskPolicy.WAIT,
         ):
             return self._action("noop"), state
 
-        else:
-            return self._wander(state)
+        # Resolve target position (absolute coordinates)
+        target = self._resolve_nav_target(task_policy, obs, state)
 
-    def _navigate_to_tags(
+        # Compute nav POMDP observations
+        obs_range, obs_movement = self._compute_nav_obs(target, state)
+
+        # Submit to nav POMDP engine -> get relative action
+        nav_obs = [jnp.array([obs_range]), jnp.array([obs_movement])]
+        nav_action = self._engine.submit_nav_and_get_action(
+            self._agent_id, nav_obs
+        )
+
+        # Convert relative -> absolute direction
+        direction = self._relative_to_absolute(nav_action, target, state)
+
+        return self._action(direction), state
+
+    def _resolve_nav_target(
         self,
-        tag_ids: set[int],
+        task_policy: int,
         obs: _AgentObservation,
         state: AIFBeliefState,
-        category: Optional[str] = None,
-    ) -> tuple[_Action, AIFBeliefState]:
-        """Navigate toward nearest entity with matching tags.
+    ) -> Optional[tuple[int, int]]:
+        """Resolve task policy to absolute target position.
 
-        Falls back to spatial memory when target is outside the 13x13 view.
+        Returns (abs_row, abs_col) or None if no target found.
         """
-        # 1. Visible target (egocentric)
-        target_loc = self._closest_tag_location(obs, tag_ids)
-        if target_loc is not None:
-            return self._move_toward(target_loc, state)
-
-        # 2. Remembered target (spatial memory)
         mem = state.spatial_memory
-        if mem is not None and mem.position is not None and category:
+
+        # Map task policy to tag set and station category
+        if task_policy == TaskPolicy.NAV_RESOURCE:
+            tag_ids, category = self._extractor_tags, "extractor"
+        elif task_policy == TaskPolicy.NAV_DEPOT:
+            tag_ids, category = self._hub_tags, "hub"
+        elif task_policy in (TaskPolicy.NAV_CRAFT, TaskPolicy.NAV_GEAR):
+            tag_ids, category = self._craft_tags, "craft"
+        elif task_policy == TaskPolicy.NAV_JUNCTION:
+            tag_ids, category = self._junction_tags, "junction"
+        elif task_policy in (TaskPolicy.EXPLORE, TaskPolicy.YIELD):
+            if mem is not None:
+                return self._get_frontier_target(mem)
+            return None
+        else:
+            return None
+
+        # 1. Try visible target (convert egocentric to absolute)
+        target_loc = self._closest_tag_location(obs, tag_ids)
+        if target_loc is not None and mem is not None and mem.position is not None:
+            abs_r = mem.position[0] + target_loc[0] - self._center[0]
+            abs_c = mem.position[1] + target_loc[1] - self._center[1]
+            return (abs_r, abs_c)
+
+        # 2. Try spatial memory
+        if mem is not None and mem.position is not None:
             station_pos = mem.find_nearest_station(category)
             if station_pos is not None:
-                ego_r = station_pos[0] - mem.position[0] + self._center[0]
-                ego_c = station_pos[1] - mem.position[1] + self._center[1]
-                return self._move_toward((ego_r, ego_c), state)
+                return station_pos
 
-        # 3. Nothing known — wander
-        return self._wander(state)
+        # 3. Fall back to frontier exploration
+        if mem is not None:
+            return self._get_frontier_target(mem)
+
+        return None
 
     # ------------------------------------------------------------------
     # Inventory parsing (adapted from starter_agent.py)
@@ -846,13 +1035,13 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
         return items
 
     # ------------------------------------------------------------------
-    # Navigation (spatial movement)
+    # Navigation (nav POMDP support methods)
     # ------------------------------------------------------------------
 
     def _closest_tag_location(
         self, obs: _AgentObservation, tag_ids: set[int]
     ) -> Optional[tuple[int, int]]:
-        """Find closest entity with matching tag."""
+        """Find closest entity with matching tag (egocentric coords)."""
         if not tag_ids:
             return None
         best_loc: Optional[tuple[int, int]] = None
@@ -871,96 +1060,132 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
                 best_loc = loc
         return best_loc
 
-    def _move_toward(
+    def _compute_nav_obs(
         self,
         target: Optional[tuple[int, int]],
         state: AIFBeliefState,
-    ) -> tuple[_Action, AIFBeliefState]:
-        """Move toward target, avoiding walls and detecting stuck state.
+    ) -> tuple[int, int]:
+        """Compute nav POMDP observations from current state.
 
-        Interaction in CogsGuard uses 'bumping': move INTO an entity to
-        interact (extract, craft, capture).  So at dist=1 we keep moving
-        toward the target instead of nooping.
+        Returns (obs_range, obs_movement) as integer indices.
         """
         mem = state.spatial_memory
 
-        # Stuck detection and recovery
-        if mem is not None and mem.is_stuck():
-            return self._break_stuck(state)
-
-        if target is None:
-            return self._wander(state)
-
-        dr = target[0] - self._center[0]
-        dc = target[1] - self._center[1]
-
-        if dr == 0 and dc == 0:
-            # On top of the target — bump in last wander direction to interact
-            direction = WANDER_DIRECTIONS[state.wander_dir]
-            return self._action(direction), state
-
-        # Compute direction priority: primary, secondary, perpendiculars
-        if abs(dr) >= abs(dc):
-            primary = "move_south" if dr > 0 else "move_north"
-            secondary = ("move_east" if dc > 0 else "move_west") if dc != 0 else primary
+        # Target range
+        if target is None or mem is None or mem.position is None:
+            target_range = int(TargetRange.NO_TARGET)
+            curr_dist = -1
         else:
-            primary = "move_east" if dc > 0 else "move_west"
-            secondary = ("move_south" if dr > 0 else "move_north") if dr != 0 else primary
+            curr_dist = (abs(target[0] - mem.position[0])
+                         + abs(target[1] - mem.position[1]))
+            if curr_dist <= 1:
+                target_range = int(TargetRange.ADJACENT)
+            elif curr_dist <= 4:
+                target_range = int(TargetRange.NEAR)
+            else:
+                target_range = int(TargetRange.FAR)
 
-        # At dist=1: bump directly into target (no wall avoidance — it IS the target)
-        if abs(dr) + abs(dc) == 1:
-            return self._action(primary), state
+        # Nav progress (movement quality relative to target)
+        prev_dist = state.prev_target_dist
+        if prev_dist < 0 or curr_dist < 0:
+            nav_progress = int(NavProgress.LATERAL)
+        elif (mem is not None and len(mem.position_history) >= 2
+              and mem.position_history[-1] == mem.position_history[-2]):
+            nav_progress = int(NavProgress.BLOCKED)
+        elif curr_dist < prev_dist:
+            nav_progress = int(NavProgress.APPROACHING)
+        elif curr_dist > prev_dist:
+            nav_progress = int(NavProgress.RETREATING)
+        else:
+            nav_progress = int(NavProgress.LATERAL)
 
-        candidates = [primary]
-        if secondary != primary:
-            candidates.append(secondary)
-        for d in DIRECTION_DELTAS:
-            if d not in candidates and d != OPPOSITES.get(primary):
-                candidates.append(d)
-        opp = OPPOSITES.get(primary)
-        if opp and opp not in candidates:
-            candidates.append(opp)
+        # Update for next step
+        state.prev_target_dist = curr_dist
 
-        # Try each direction, skip known walls
-        for direction in candidates:
-            if mem is not None and mem.is_wall_adjacent(direction):
-                continue
-            return self._action(direction), state
+        return (target_range, nav_progress)
 
-        return self._action("noop"), state  # surrounded by walls
+    def _relative_to_absolute(
+        self,
+        nav_action: int,
+        target: Optional[tuple[int, int]],
+        state: AIFBeliefState,
+    ) -> str:
+        """Convert relative nav action to absolute direction.
 
-    def _break_stuck(self, state: AIFBeliefState) -> tuple[_Action, AIFBeliefState]:
-        """Break stuck state with random non-wall direction."""
-        import random
-        mem = state.spatial_memory
-        dirs = list(DIRECTION_DELTAS.keys())
-        random.shuffle(dirs)
-        for d in dirs:
-            if mem is None or not mem.is_wall_adjacent(d):
-                if mem is not None:
-                    mem.position_history.clear()
-                state.wander_dir = (state.wander_dir + 1) % len(WANDER_DIRECTIONS)
-                state.wander_steps = WANDER_STEPS
-                return self._action(d), state
-        return self._action("noop"), state
+        Uses target bearing to determine what TOWARD/LEFT/RIGHT/AWAY mean.
+        """
+        import random as _random
 
-    def _wander(self, state: AIFBeliefState) -> tuple[_Action, AIFBeliefState]:
-        """Wander in a rectangular pattern, avoiding walls."""
-        if state.wander_steps <= 0:
-            state.wander_dir = (state.wander_dir + 1) % len(WANDER_DIRECTIONS)
-            state.wander_steps = WANDER_STEPS
-
-        direction = WANDER_DIRECTIONS[state.wander_dir]
         mem = state.spatial_memory
 
+        # Compute bearing to target
+        if target is not None and mem is not None and mem.position is not None:
+            dr = target[0] - mem.position[0]
+            dc = target[1] - mem.position[1]
+
+            if dr == 0 and dc == 0:
+                bearing_dir = state.last_heading
+            elif abs(dr) >= abs(dc):
+                bearing_dir = "move_south" if dr > 0 else "move_north"
+            else:
+                bearing_dir = "move_east" if dc > 0 else "move_west"
+        else:
+            bearing_dir = state.last_heading
+
+        bearing_idx = _BEARING_DIRS.index(bearing_dir)
+
+        if nav_action == NavAction.TOWARD:
+            direction = _BEARING_DIRS[bearing_idx]
+        elif nav_action == NavAction.LEFT:
+            direction = _BEARING_DIRS[(bearing_idx + 3) % 4]  # CCW
+        elif nav_action == NavAction.RIGHT:
+            direction = _BEARING_DIRS[(bearing_idx + 1) % 4]  # CW
+        elif nav_action == NavAction.AWAY:
+            direction = _BEARING_DIRS[(bearing_idx + 2) % 4]
+        else:  # RANDOM
+            direction = _random.choice(_BEARING_DIRS)
+
+        # Wall safety: skip if wall-adjacent (but not at dist<=1, that's bumping)
         if mem is not None and mem.is_wall_adjacent(direction):
-            # Wall ahead — rotate to next direction
-            state.wander_dir = (state.wander_dir + 1) % len(WANDER_DIRECTIONS)
-            state.wander_steps = WANDER_STEPS
-            direction = WANDER_DIRECTIONS[state.wander_dir]
+            if target is not None and mem.position is not None:
+                dist = (abs(target[0] - mem.position[0])
+                        + abs(target[1] - mem.position[1]))
+                if dist <= 1:
+                    state.last_heading = direction
+                    return direction
+            # Try alternatives: right, left, away
+            for offset in [1, 3, 2]:
+                alt = _BEARING_DIRS[(bearing_idx + offset) % 4]
+                if not mem.is_wall_adjacent(alt):
+                    state.last_heading = alt
+                    return alt
+            return "noop"
 
-        state.wander_steps -= 1
-        return self._action(direction), state
+        state.last_heading = direction
+        return direction
+
+    def _get_frontier_target(
+        self, mem: SpatialMemory
+    ) -> Optional[tuple[int, int]]:
+        """Find nearest unexplored cell adjacent to explored territory."""
+        if mem.position is None:
+            return None
+
+        frontiers: set[tuple[int, int]] = set()
+        for (r, c) in mem.explored:
+            for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nb = (r + dr, c + dc)
+                if nb not in mem.explored and nb not in mem.walls:
+                    frontiers.add(nb)
+
+        if not frontiers:
+            return None
+
+        return min(
+            frontiers,
+            key=lambda f: (abs(f[0] - mem.position[0])
+                           + abs(f[1] - mem.position[1]))
+        )
 
     def _action(self, name: str) -> _Action:
         """Create Action, falling back to noop if name is unavailable."""
@@ -974,12 +1199,11 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
 # ---------------------------------------------------------------------------
 
 class AIFPolicy(_MultiAgentPolicy):
-    """Hierarchical active inference policy for CogsGuard.
+    """Deep active inference policy for CogsGuard (two nested POMDPs).
 
-    Level 2: 216-state POMDP (phase x hand x target_mode x role) with 5
-    macro-options.  Replans at option termination (~every 30-80 steps).
-    Level 1: Reactive option state machines map obs -> task policy.
-    Level 0: Navigator converts task policy -> primitive movement.
+    Level 2: Strategic POMDP (216 states, 5 macro-options, ~42ms replan).
+    Level 1: Option state machines map obs -> task policy (~0ms).
+    Level 0: Navigation POMDP (16 states, 5 relative actions, ~3-5ms/step).
 
     All 8 agents share one BatchedAIFEngine (JIT-compiled, batched inference).
     Even agents are miners, odd agents are aligners (per-role C/D vectors).

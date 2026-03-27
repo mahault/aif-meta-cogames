@@ -155,6 +155,42 @@ class ObsRoleSignal(IntEnum):
 
 
 # ---------------------------------------------------------------------------
+# Navigation POMDP enums (Level 0)
+# ---------------------------------------------------------------------------
+
+class NavProgress(IntEnum):
+    """Movement quality relative to target — nav POMDP state factor 0."""
+    APPROACHING = 0  # Manhattan distance decreased
+    LATERAL = 1      # Distance unchanged (perpendicular)
+    RETREATING = 2   # Distance increased
+    BLOCKED = 3      # Position unchanged (wall or noop)
+
+
+class TargetRange(IntEnum):
+    """Distance to navigation target — nav POMDP state factor 1."""
+    ADJACENT = 0   # dist 0-1, bump to interact
+    NEAR = 1       # dist 2-4
+    FAR = 2        # dist 5+
+    NO_TARGET = 3  # no target known
+
+
+class NavAction(IntEnum):
+    """Relative navigation actions — nav POMDP action space."""
+    TOWARD = 0   # Move toward target (primary direction)
+    LEFT = 1     # 90° counterclockwise from toward
+    RIGHT = 2    # 90° clockwise from toward
+    AWAY = 3     # Opposite of toward
+    RANDOM = 4   # Random direction (exploration/recovery)
+
+
+NUM_NAV_PROGRESS = len(NavProgress)   # 4
+NUM_TARGET_RANGE = len(TargetRange)   # 4
+NUM_NAV_ACTIONS = len(NavAction)      # 5
+NAV_NUM_OBS = [NUM_TARGET_RANGE, NUM_NAV_PROGRESS]  # [4, 4]
+NAV_STATE_FACTORS = [NUM_NAV_PROGRESS, NUM_TARGET_RANGE]  # [4, 4]
+
+
+# ---------------------------------------------------------------------------
 # Dimensions
 # ---------------------------------------------------------------------------
 

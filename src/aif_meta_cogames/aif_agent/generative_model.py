@@ -913,14 +913,17 @@ class CogsGuardPOMDP:
         E_miner = np.ones(n_policies)
         E_aligner = np.ones(n_policies)
 
-        E_miner[0:5] = 3.0    # MINE first
-        E_miner[15:20] = 2.0  # EXPLORE first (find resources)
-        E_miner[5:10] = 0.3   # CRAFT first (not miner's job)
-        E_miner[10:15] = 0.3  # CAPTURE first (not miner's job)
+        E_miner[0:5] = 4.0     # MINE first — core role
+        E_miner[15:20] = 2.0   # EXPLORE first (find resources)
+        E_miner[20:25] = 1.5   # DEFEND — acceptable fallback
+        E_miner[5:10] = 0.001  # CRAFT first — blocked (not miner's job)
+        E_miner[10:15] = 0.001 # CAPTURE first — blocked (not miner's job)
 
-        E_aligner[5:10] = 3.0   # CRAFT first
-        E_aligner[10:15] = 3.0  # CAPTURE first
-        E_aligner[0:5] = 0.3    # MINE first (not aligner's job)
+        E_aligner[5:10] = 4.0    # CRAFT first — core role
+        E_aligner[10:15] = 4.0   # CAPTURE first — core role
+        E_aligner[20:25] = 2.0   # DEFEND — hold junctions
+        E_aligner[15:20] = 1.5   # EXPLORE — find stations
+        E_aligner[0:5] = 0.001   # MINE first — blocked (not aligner's job)
 
         E_miner /= E_miner.sum()
         E_aligner /= E_aligner.sum()
@@ -958,3 +961,276 @@ class CogsGuardPOMDP:
             f"  B_deps:    {B_DEPENDENCIES}",
         ]
         return "\n".join(lines)
+
+
+# ============================================================================
+# Navigation POMDP (Level 0 — fast timescale)
+# ============================================================================
+
+# Navigation dependencies (each factor depends on both factors)
+NAV_A_DEPENDENCIES = [[1], [0]]        # obs_range ← target_range; obs_movement ← nav_progress
+NAV_B_DEPENDENCIES = [[0, 1], [0, 1]]  # cross-coupled
+
+
+def _build_nav_A() -> list[np.ndarray]:
+    """Build observation likelihood matrices for the navigation POMDP.
+
+    A[0]: P(obs_range | target_range) — shape (4, 4)
+    A[1]: P(obs_movement | nav_progress) — shape (4, 4)
+    """
+    from .discretizer import NUM_NAV_PROGRESS, NUM_TARGET_RANGE
+
+    # A[0]: obs_range depends on target_range — mostly identity with noise
+    A_range = np.array([
+        # target:  ADJ   NEAR   FAR   NOTGT
+        [0.85, 0.10, 0.00, 0.00],   # obs: ADJACENT
+        [0.10, 0.80, 0.10, 0.05],   # obs: NEAR
+        [0.05, 0.10, 0.80, 0.10],   # obs: FAR
+        [0.00, 0.00, 0.10, 0.85],   # obs: NO_TARGET
+    ], dtype=np.float64)
+    # Normalize columns
+    A_range /= A_range.sum(axis=0, keepdims=True)
+
+    # A[1]: obs_movement depends on nav_progress — mostly identity
+    A_movement = np.array([
+        # progress: APPR  LATR  RETR  BLKD
+        [0.85, 0.10, 0.05, 0.05],   # obs: APPROACHING
+        [0.10, 0.75, 0.15, 0.05],   # obs: LATERAL
+        [0.00, 0.10, 0.75, 0.10],   # obs: RETREATING
+        [0.05, 0.05, 0.05, 0.80],   # obs: BLOCKED
+    ], dtype=np.float64)
+    A_movement /= A_movement.sum(axis=0, keepdims=True)
+
+    return [A_range, A_movement]
+
+
+def _build_nav_B() -> list[np.ndarray]:
+    """Build transition matrices for the navigation POMDP.
+
+    B[0]: P(progress' | progress, range, action) — shape (4, 4, 4, 5)
+    B[1]: P(range' | progress, range, action) — shape (4, 4, 4, 5)
+
+    Key asymmetry: TOWARD from BLOCKED → likely stays BLOCKED,
+    LEFT/RIGHT from BLOCKED → likely APPROACHING (obstacle avoidance).
+    """
+    from .discretizer import (
+        NavAction, NavProgress, TargetRange,
+        NUM_NAV_ACTIONS, NUM_NAV_PROGRESS, NUM_TARGET_RANGE,
+    )
+    APPR, LATR, RETR, BLKD = 0, 1, 2, 3
+    ADJ, NEAR, FAR, NOTGT = 0, 1, 2, 3
+    n_prog = NUM_NAV_PROGRESS   # 4
+    n_range = NUM_TARGET_RANGE  # 4
+    n_act = NUM_NAV_ACTIONS     # 5
+
+    # B[0]: progress transitions — shape (prog', prog, range, action)
+    B_prog = np.full((n_prog, n_prog, n_range, n_act), 0.1, dtype=np.float64)
+
+    for rng in range(n_range):
+        # --- TOWARD (action 0) ---
+        # From non-blocked: usually approach
+        for p in range(n_prog):
+            B_prog[APPR, p, rng, NavAction.TOWARD] = 0.55
+            B_prog[LATR, p, rng, NavAction.TOWARD] = 0.15
+            B_prog[RETR, p, rng, NavAction.TOWARD] = 0.05
+            B_prog[BLKD, p, rng, NavAction.TOWARD] = 0.25
+        # From BLOCKED, TOWARD likely stays BLOCKED (wall ahead)
+        B_prog[BLKD, BLKD, rng, NavAction.TOWARD] = 0.60
+        B_prog[APPR, BLKD, rng, NavAction.TOWARD] = 0.15
+        B_prog[LATR, BLKD, rng, NavAction.TOWARD] = 0.15
+        B_prog[RETR, BLKD, rng, NavAction.TOWARD] = 0.10
+
+        # --- LEFT (action 1) --- obstacle avoidance
+        for p in range(n_prog):
+            B_prog[APPR, p, rng, NavAction.LEFT] = 0.30
+            B_prog[LATR, p, rng, NavAction.LEFT] = 0.45
+            B_prog[RETR, p, rng, NavAction.LEFT] = 0.10
+            B_prog[BLKD, p, rng, NavAction.LEFT] = 0.15
+        # From BLOCKED, LEFT likely unblocks
+        B_prog[APPR, BLKD, rng, NavAction.LEFT] = 0.35
+        B_prog[LATR, BLKD, rng, NavAction.LEFT] = 0.35
+        B_prog[RETR, BLKD, rng, NavAction.LEFT] = 0.10
+        B_prog[BLKD, BLKD, rng, NavAction.LEFT] = 0.20
+
+        # --- RIGHT (action 2) --- symmetric to LEFT
+        B_prog[:, :, rng, NavAction.RIGHT] = B_prog[:, :, rng, NavAction.LEFT]
+
+        # --- AWAY (action 3) ---
+        for p in range(n_prog):
+            B_prog[APPR, p, rng, NavAction.AWAY] = 0.10
+            B_prog[LATR, p, rng, NavAction.AWAY] = 0.15
+            B_prog[RETR, p, rng, NavAction.AWAY] = 0.55
+            B_prog[BLKD, p, rng, NavAction.AWAY] = 0.20
+        # From BLOCKED, AWAY likely unblocks (going opposite)
+        B_prog[RETR, BLKD, rng, NavAction.AWAY] = 0.40
+        B_prog[LATR, BLKD, rng, NavAction.AWAY] = 0.25
+        B_prog[BLKD, BLKD, rng, NavAction.AWAY] = 0.20
+        B_prog[APPR, BLKD, rng, NavAction.AWAY] = 0.15
+
+        # --- RANDOM (action 4) --- uniform
+        B_prog[:, :, rng, NavAction.RANDOM] = 0.25
+
+    # Normalize: sum over first axis (progress') must = 1
+    B_prog /= B_prog.sum(axis=0, keepdims=True)
+
+    # B[1]: range transitions — shape (range', prog, range, action)
+    B_range = np.full((n_range, n_prog, n_range, n_act), 0.05, dtype=np.float64)
+
+    for act in range(n_act):
+        for p in range(n_prog):
+            # --- ADJ stays ADJ mostly (target right there) ---
+            B_range[ADJ, p, ADJ, act] = 0.70
+            B_range[NEAR, p, ADJ, act] = 0.25
+            B_range[FAR, p, ADJ, act] = 0.05
+            B_range[NOTGT, p, ADJ, act] = 0.00
+
+            # --- NEAR transitions depend on progress ---
+            if p == APPR:
+                B_range[ADJ, p, NEAR, act] = 0.40
+                B_range[NEAR, p, NEAR, act] = 0.45
+                B_range[FAR, p, NEAR, act] = 0.10
+                B_range[NOTGT, p, NEAR, act] = 0.05
+            elif p == RETR:
+                B_range[ADJ, p, NEAR, act] = 0.05
+                B_range[NEAR, p, NEAR, act] = 0.35
+                B_range[FAR, p, NEAR, act] = 0.50
+                B_range[NOTGT, p, NEAR, act] = 0.10
+            else:  # LATERAL or BLOCKED
+                B_range[ADJ, p, NEAR, act] = 0.10
+                B_range[NEAR, p, NEAR, act] = 0.60
+                B_range[FAR, p, NEAR, act] = 0.20
+                B_range[NOTGT, p, NEAR, act] = 0.10
+
+            # --- FAR transitions ---
+            if p == APPR:
+                B_range[ADJ, p, FAR, act] = 0.05
+                B_range[NEAR, p, FAR, act] = 0.35
+                B_range[FAR, p, FAR, act] = 0.50
+                B_range[NOTGT, p, FAR, act] = 0.10
+            elif p == RETR:
+                B_range[ADJ, p, FAR, act] = 0.00
+                B_range[NEAR, p, FAR, act] = 0.05
+                B_range[FAR, p, FAR, act] = 0.55
+                B_range[NOTGT, p, FAR, act] = 0.40
+            else:  # LATERAL or BLOCKED
+                B_range[ADJ, p, FAR, act] = 0.02
+                B_range[NEAR, p, FAR, act] = 0.13
+                B_range[FAR, p, FAR, act] = 0.60
+                B_range[NOTGT, p, FAR, act] = 0.25
+
+            # --- NO_TARGET mostly stays (until something found) ---
+            B_range[ADJ, p, NOTGT, act] = 0.02
+            B_range[NEAR, p, NOTGT, act] = 0.08
+            B_range[FAR, p, NOTGT, act] = 0.15
+            B_range[NOTGT, p, NOTGT, act] = 0.75
+
+    # TOWARD action biases range decrease
+    for p in range(n_prog):
+        B_range[ADJ, p, NEAR, NavAction.TOWARD] += 0.10
+        B_range[NEAR, p, FAR, NavAction.TOWARD] += 0.10
+    # AWAY biases range increase
+    for p in range(n_prog):
+        B_range[FAR, p, NEAR, NavAction.AWAY] += 0.10
+        B_range[NOTGT, p, FAR, NavAction.AWAY] += 0.05
+
+    # Normalize
+    B_range /= B_range.sum(axis=0, keepdims=True)
+
+    return [B_prog, B_range]
+
+
+def _build_nav_C() -> list[np.ndarray]:
+    """Build preference vectors for the navigation POMDP.
+
+    C[0]: preferences over obs_range — prefer ADJACENT
+    C[1]: preferences over obs_movement — prefer APPROACHING
+    """
+    C_range = np.array([3.0, 1.0, -0.5, -1.0])     # ADJACENT > NEAR > FAR > NO_TARGET
+    C_movement = np.array([2.0, 0.0, -1.0, -2.0])   # APPROACHING > LATERAL > RETREATING > BLOCKED
+    return [C_range, C_movement]
+
+
+def _build_nav_D() -> list[np.ndarray]:
+    """Build initial state priors for the navigation POMDP.
+
+    D[0]: prior over nav_progress — slightly optimistic
+    D[1]: prior over target_range — initially FAR or UNKNOWN
+    """
+    D_progress = np.array([0.35, 0.30, 0.10, 0.25])
+    D_progress /= D_progress.sum()
+    D_range = np.array([0.05, 0.15, 0.40, 0.40])
+    D_range /= D_range.sum()
+    return [D_progress, D_range]
+
+
+def create_nav_agent(n_agents: int = 8, policy_len: int = 2,
+                     learn_B: bool = True, pB_scale: float = 5.0):
+    """Create the navigation POMDP agent (Level 0).
+
+    Small 16-state POMDP with 5 relative actions, operating at every step.
+    Uses epistemic value (use_states_info_gain) for exploration.
+
+    When ``learn_B=True`` (default), the agent learns transition dynamics
+    online via Dirichlet updates on pB.  This is the principled AIF fix
+    for stuck-in-a-loop behaviour: after ~5 blocked steps with the same
+    action, the posterior B shifts enough to make that action unattractive
+    and the agent switches to an alternative.  ``use_param_info_gain``
+    adds an epistemic bonus for untried actions, driving natural
+    exploration of alternatives.
+
+    Parameters
+    ----------
+    n_agents : int
+        Batch size (number of agents).
+    policy_len : int
+        Planning horizon (2 = two-step planning for obstacle avoidance).
+    learn_B : bool
+        Enable online B-matrix learning via Dirichlet updates.
+    pB_scale : float
+        Concentration scale for the Dirichlet prior on B.
+        Lower = faster learning (fewer blocked steps to switch).
+    """
+    import itertools
+    import jax.numpy as jnp
+    from pymdp.agent import Agent
+    from .discretizer import NUM_NAV_ACTIONS
+
+    A = [jnp.array(a) for a in _build_nav_A()]
+    B_raw = _build_nav_B()
+    B = [jnp.array(b) for b in B_raw]
+    C = [jnp.array(c) for c in _build_nav_C()]
+    D = [jnp.array(d) for d in _build_nav_D()]
+
+    # Constrained policies: both factors share the same action
+    pol_list = [
+        [[a] * 2 for a in seq]
+        for seq in itertools.product(range(NUM_NAV_ACTIONS), repeat=policy_len)
+    ]
+    policies = jnp.array(pol_list)
+
+    # Dirichlet priors for B learning
+    pB = None
+    if learn_B:
+        pB = [jnp.array(b * pB_scale + 0.1) for b in B_raw]
+
+    agent = Agent(
+        A=A, B=B, C=C, D=D,
+        A_dependencies=NAV_A_DEPENDENCIES,
+        B_dependencies=NAV_B_DEPENDENCIES,
+        num_controls=[NUM_NAV_ACTIONS, NUM_NAV_ACTIONS],
+        policies=policies,
+        pB=pB,
+        learn_B=learn_B,
+        use_param_info_gain=learn_B,
+        batch_size=n_agents,
+        sampling_mode="full",
+        policy_len=policy_len,
+        inference_algo="fpi",
+        num_iter=8,
+        use_utility=True,
+        use_states_info_gain=True,
+        action_selection="deterministic",
+        gamma=8.0,
+    )
+
+    return agent
