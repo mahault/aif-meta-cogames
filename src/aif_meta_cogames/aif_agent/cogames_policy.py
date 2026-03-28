@@ -219,6 +219,8 @@ class AIFBeliefState:
     # Navigation POMDP state
     last_heading: str = "move_east"
     prev_target_dist: int = -1
+    # Gear tracking
+    has_role_gear: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -618,8 +620,9 @@ class BatchedAIFEngine:
             options, _q_pi = self._jit_select_option(self.agent, qs)
             for i in terminated:
                 new_option = int(options[i])
-                self._current_options[i] = new_option
                 self.option_executor.set_option(i, new_option)
+                # Record the post-filter option (role filter may redirect)
+                self._current_options[i] = self.option_executor.states[i].current_option
             # Update option actions for next belief update
             self._option_actions = jnp.tile(
                 jnp.array(self._current_options)[:, None], (1, 4)
@@ -836,6 +839,9 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
         )
         self._junction_tags = self._resolve_tag_ids(["junction"])
         self._heart_source_tags = self._resolve_tag_ids(["hub", "chest"])
+        # Per-role gear station tags
+        self._miner_gear_tags = self._resolve_tag_ids(["c:miner"])
+        self._aligner_gear_tags = self._resolve_tag_ids(["c:aligner"])
 
         # Spatial memory support: wall tags + station tag map
         self._wall_tags = self._resolve_tag_ids(["wall"])
@@ -889,6 +895,17 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
 
         # 4. Submit to batched engine -> get task policy (hierarchical)
         task_policy = self._engine.submit_and_get_policy(self._agent_id, jax_obs)
+
+        # 4b. Gear check: override task policy if agent lacks role gear
+        if not state.has_role_gear:
+            items = self._inventory_amounts(obs)
+            is_aligner = self._agent_id % 2 == 1
+            role_gear = "aligner" if is_aligner else "miner"
+            if items.get(role_gear, 0) > 0:
+                state.has_role_gear = True
+            else:
+                # Navigate to role-specific gear station
+                task_policy = TaskPolicy.NAV_GEAR  # special: gear-up mode
 
         # 5. Execute selected task policy via navigator
         action, state = self._execute_task_policy(task_policy, obs, state)
@@ -975,8 +992,13 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
             tag_ids, category = self._extractor_tags, "extractor"
         elif task_policy == TaskPolicy.NAV_DEPOT:
             tag_ids, category = self._hub_tags, "hub"
-        elif task_policy in (TaskPolicy.NAV_CRAFT, TaskPolicy.NAV_GEAR):
+        elif task_policy == TaskPolicy.NAV_CRAFT:
             tag_ids, category = self._craft_tags, "craft"
+        elif task_policy == TaskPolicy.NAV_GEAR:
+            # Role-specific gear station
+            is_aligner = self._agent_id % 2 == 1
+            tag_ids = self._aligner_gear_tags if is_aligner else self._miner_gear_tags
+            category = "craft"  # gear stations are categorized as "craft" in spatial memory
         elif task_policy == TaskPolicy.NAV_JUNCTION:
             tag_ids, category = self._junction_tags, "junction"
         elif task_policy in (TaskPolicy.EXPLORE, TaskPolicy.YIELD):
