@@ -96,7 +96,7 @@ def inner_loop(theta, support_data, steps):
 
 ## AIF Agent
 
-### Phase 3b (Current): Deep AIF v9.6 — 288-State with Two Nested POMDPs
+### Phase 3b (Current): Deep AIF v9.7 — 288-State with Two Nested POMDPs
 
 #### State Space (288 states = phase × hand × target_mode × role)
 
@@ -117,6 +117,25 @@ policies (not primitive movements), making B matrices action-dependent:
 - **phase × hand**: Economy-chain progress — HOLDING_BOTH enables natural gear+resource co-holding
 - **target_mode**: Junction contest status — affects EFE for CAPTURE vs YIELD
 - **role**: Agent specialisation — affects which task policies are preferred via C
+
+#### Role System (v9.7)
+
+Three roles with distinct AIF priors:
+
+| Role | Agents | C-vector | D-prior | E-vector | Initiation Set |
+|------|--------|----------|---------|----------|----------------|
+| **Miner** | 0,2,4,6 (even) | Strong resource/deposit prefs | Role.GATHERER | MINE > EXPLORE > rest | MINE, EXPLORE, DEFEND |
+| **Aligner** | 1,3,5 (odd<7) | Strong gear/junction prefs | Role.CRAFTER | CRAFT/CAPTURE > EXPLORE | CRAFT, CAPTURE, EXPLORE, DEFEND |
+| **Scout** | 7 (last) | Near-uniform (epistemic) | Role.SUPPORT | EXPLORE >> DEFEND >> rest | EXPLORE, DEFEND only |
+
+**Scout as epistemic agent**: When C ≈ uniform, pragmatic EFE → 0 and the agent
+is driven purely by **information gain** (epistemic term). The E-vector acts as a
+**precision gate** on the policy posterior, zeroing mass on non-epistemic options.
+Scout shares discovered stations and explored cells via SharedSpatialMemory.
+
+**Aligner MINE redirect** (v9.7 fix): When the strategic POMDP selects MINE for an
+aligner, the OptionExecutor redirects to CRAFT_CYCLE (no gear) or CAPTURE_CYCLE
+(has gear) — not EXPLORE, which caused the v9.6 stuck loop (max_stuck=985).
 
 #### Action Space (13 task-level policies)
 
@@ -175,14 +194,14 @@ Level 2: Strategic POMDP (288 states, 5 macro-options)
   └── update_empirical_prior() → state prediction
         ↓
 Level 1: OptionExecutor (reactive state machines)
-  ├── mine_cycle, craft_cycle, capture_cycle, explore, wait
-  ├── Role filter: miners≠CRAFT/CAPTURE, aligners≠MINE
+  ├── mine_cycle, craft_cycle, capture_cycle, explore, defend
+  ├── Role filter: miners≠CRAFT/CAPTURE, aligners MINE→CRAFT, scouts≠MINE/CRAFT/CAPTURE
   └── EFE-optimal element selection (Level 0.5)
         ↓
 Level 0: Navigation POMDP (16 states, 5 actions)
   ├── Online B-learning via Dirichlet updates
-  ├── Frontier exploration for unknown areas
-  └── SharedSpatialMemory (belief sharing)
+  ├── Frontier exploration → shared memory fallback when exhausted
+  └── SharedSpatialMemory (belief sharing: stations + explored cells)
         ↓
 Primitive movement action
 ```

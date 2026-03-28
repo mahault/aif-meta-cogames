@@ -117,29 +117,34 @@ The v1 prototype mapped the POMDP action space to 5 primitive movement actions (
 
 ---
 
-## Phase 3b: Discrete AIF Agent — Deep AIF v9.6 (288-State, Two Nested POMDPs) — IN PROGRESS
+## Phase 3b: Discrete AIF Agent — Deep AIF v9.7 (288-State, Two Nested POMDPs) — IN PROGRESS
 
 **Lead**: Mahault | **Started**: 2026-03-19
 
 ### Core Architecture: Two Nested POMDPs + Shared Beliefs
 
 **Level 2** (Strategic POMDP): 288-state factored POMDP with 5 macro-options (25 two-step policies). Replans at option termination (~42ms).
-**Level 1** (OptionExecutor): Reactive state machines with role filter (miners≠CRAFT/CAPTURE, aligners≠MINE).
+**Level 1** (OptionExecutor): Reactive state machines with role filter (miners≠CRAFT/CAPTURE, aligners MINE→CRAFT, scouts≠MINE/CRAFT/CAPTURE).
 **Level 0.5** (EFE Goal Generation): G(e)=D_KL(Q(res|mine_e)||C_uniform) — scarcest element = lowest EFE.
 **Level 0** (Navigation POMDP): 16-state, 5 relative actions, 25 two-step policies, online B-learning (~3-5ms/step).
 
 | Task | Description | Status |
 |------|-------------|--------|
-| Task-level action space | 13 policies → 5 macro-options (mine_cycle, craft_cycle, capture_cycle, explore, wait) | Done |
+| Task-level action space | 13 policies → 5 macro-options (mine_cycle, craft_cycle, capture_cycle, explore, defend) | Done |
 | 288-state space | phase(6) × hand(4) × target_mode(3) × role(4) = 288 | Done |
 | 6 observation modalities | resource, station, inventory(4), contest, social, role_signal | Done |
 | Action-dependent B matrices | Hand-crafted B with distinct transitions per macro-option | Done |
 | Navigation POMDP | 16-state nav with B-learning, frontier exploration | Done |
-| SharedSpatialMemory | Belief sharing (Catal et al. 2024) — agents share station/wall observations | Done |
+| SharedSpatialMemory | Belief sharing (Catal et al. 2024) — stations + explored cells | Done |
 | Element-typed world model | `extractor:carbon`, `extractor:silicon` etc. + EFE element selection | Done |
 | HOLDING_BOTH (v9.6) | 4-state hand: EMPTY, HOLDING_RESOURCE, HOLDING_GEAR, HOLDING_BOTH | Done |
-| Tests | 170 tests pass, mock eval: 8 captures/500 steps | Done |
-| AWS eval | Deploy v9.6 and run 3-episode eval on arena | TODO |
+| Scout epistemic agent (v9.7) | Near-uniform C → epistemic EFE, E-vector precision gate, explored cell sharing | Done |
+| Aligner MINE redirect (v9.7) | MINE→CRAFT_CYCLE (not EXPLORE) — fixes stuck loop | Done |
+| EXPLORE fallback (v9.7) | SharedSpatialMemory fallback when local frontier exhausted | Done |
+| Mock realism (v9.7) | No pre-seeded stations, no free gear, discovery on adjacency | Done |
+| Tests | 186 tests pass, mock eval: 7 captures/500 steps (no pre-seeded knowledge) | Done |
+| AWS eval v9.7 (no_clips) | stuck=22.62, timeouts=3, all 4 resources mined, 0 junctions | Done |
+| Junction captures | Aligners craft gear but never reach junctions — next focus | TODO |
 
 ### State Space (288 states)
 
@@ -197,6 +202,25 @@ Observation → Discretizer → 6 modalities
                                 ↓
                      Navigator (spatial movement)
 ```
+
+### AWS Eval Results
+
+| Metric | v9.5c | v9.6 | v9.7 (no_clips) |
+|--------|-------|------|-----------------|
+| max_stuck | 1160 | 985 | **22.62** |
+| timeouts | ~100 | 182 | **3** |
+| carbon.gained | 17 | 0.25 | **11.50** |
+| silicon.gained | 22.62 | 16.38 | **23.88** |
+| germanium.gained | 0 | 0 | **9.00** |
+| oxygen.gained | 0 | 0 | **6.38** |
+| aligner.gained | 0 | 0 | **1.75** |
+| miner.gained | 0 | 0 | **1.88** |
+| junction.aligned | 0 | 0 | 0 |
+| death | - | 3.0 | **1.25** |
+| shared_stations | 0 | 0 | **83-96** |
+| move.failed | - | 4280 | **2511** |
+
+**v9.7 analysis**: All subsystems working — mining, depositing, heart withdrawal, gear crafting, spatial exploration, belief sharing. Remaining bottleneck: aligners craft gear but get stuck navigating to junctions (CRAFT_CYCLE timeout up to 192 steps). Junction capture is the last missing piece of the economy chain.
 
 ### MAML Integration (for Luca)
 
