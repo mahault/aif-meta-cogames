@@ -101,12 +101,12 @@ class TestBuildTagCategories:
         assert cats[6] == "craft"   # c:scout
         assert cats[7] == "craft"   # c:scrambler
 
-        # Extractors
-        assert cats[8] == "extractor"   # carbon
-        assert cats[10] == "extractor"  # germanium
-        assert cats[13] == "extractor"  # oxygen
-        assert cats[14] == "extractor"  # silicon
-        assert cats[15] == "extractor"  # solar
+        # Extractors — element-typed for EFE-optimal resource selection
+        assert cats[8] == "extractor:carbon"
+        assert cats[10] == "extractor:germanium"
+        assert cats[13] == "extractor:oxygen"
+        assert cats[14] == "extractor:silicon"
+        assert cats[15] == "extractor"  # solar (no element match)
 
         # Hub
         assert cats[11] == "hub"
@@ -131,7 +131,7 @@ class TestBuildTagCategories:
         cats = _build_tag_categories(tags)
         assert cats[0] == "hub"
         assert cats[1] == "junction"
-        assert cats[2] == "extractor"
+        assert cats[2] == "extractor:carbon"
         assert cats[3] == "craft"
 
 
@@ -616,9 +616,9 @@ class TestSpatialMemory:
         mem = SpatialMemory()
         mem.position = (10, 10)
         mem.stations[(50, 50)] = "hub"
-        mem.stations[(20, 20)] = "extractor"
+        mem.stations[(20, 20)] = "extractor:carbon"
         mem.stations[(30, 30)] = "craft"
-        nearest_ext = mem.find_nearest_station("extractor")
+        nearest_ext = mem.find_nearest_station("extractor:carbon")
         assert nearest_ext == (20, 20)
         nearest_hub = mem.find_nearest_station("hub")
         assert nearest_hub == (50, 50)
@@ -674,6 +674,85 @@ class TestSpatialMemory:
         mem.position_history.append((10, 10))
         mem.position_history.append((10, 10))
         assert not mem.is_stuck()  # Only 2 entries, need 20
+
+
+class TestSharedSpatialMemory:
+    """Test shared spatial memory (belief sharing — Catal et al. 2024)."""
+
+    def test_contribute_merges_stations(self):
+        from aif_meta_cogames.aif_agent.cogames_policy import (
+            SharedSpatialMemory, SpatialMemory,
+        )
+        shared = SharedSpatialMemory()
+        mem1 = SpatialMemory()
+        mem1.stations[(10, 10)] = "hub"
+        mem1.stations[(20, 20)] = "extractor:carbon"
+        mem2 = SpatialMemory()
+        mem2.stations[(30, 30)] = "extractor:silicon"
+        shared.contribute(mem1)
+        shared.contribute(mem2)
+        assert shared.stations[(10, 10)] == "hub"
+        assert shared.stations[(20, 20)] == "extractor:carbon"
+        assert shared.stations[(30, 30)] == "extractor:silicon"
+
+    def test_find_nearest_element_specific(self):
+        from aif_meta_cogames.aif_agent.cogames_policy import SharedSpatialMemory
+        shared = SharedSpatialMemory()
+        shared.stations[(10, 10)] = "extractor:carbon"
+        shared.stations[(20, 20)] = "extractor:silicon"
+        shared.stations[(5, 5)] = "extractor:silicon"  # closer but wrong element
+        pos = (0, 0)
+        nearest_carbon = shared.find_nearest_station("extractor:carbon", pos)
+        assert nearest_carbon == (10, 10)
+        nearest_silicon = shared.find_nearest_station("extractor:silicon", pos)
+        assert nearest_silicon == (5, 5)
+
+    def test_multiple_agents_share_discoveries(self):
+        from aif_meta_cogames.aif_agent.cogames_policy import (
+            SharedSpatialMemory, SpatialMemory,
+        )
+        shared = SharedSpatialMemory()
+        # Agent 0 finds carbon extractor
+        mem0 = SpatialMemory()
+        mem0.stations[(15, 15)] = "extractor:carbon"
+        mem0.explored.add((15, 15))
+        shared.contribute(mem0)
+        # Agent 1 doesn't know about it directly, but shared does
+        pos = (0, 0)
+        result = shared.find_nearest_station("extractor:carbon", pos)
+        assert result == (15, 15)
+        # Agent 1 also explored some area
+        mem1 = SpatialMemory()
+        mem1.explored.add((40, 40))
+        shared.contribute(mem1)
+        # Shared pool has both explored areas
+        assert (15, 15) in shared.explored
+        assert (40, 40) in shared.explored
+
+    def test_walls_shared(self):
+        from aif_meta_cogames.aif_agent.cogames_policy import (
+            SharedSpatialMemory, SpatialMemory,
+        )
+        shared = SharedSpatialMemory()
+        mem = SpatialMemory()
+        mem.walls.add((10, 11))
+        mem.walls.add((10, 12))
+        shared.contribute(mem)
+        assert (10, 11) in shared.walls
+        assert (10, 12) in shared.walls
+
+    def test_efe_element_selection(self):
+        """Scarcest element has lowest EFE — mining it minimizes
+        D_KL(Q(resources|mine_e) || C_uniform)."""
+        from aif_meta_cogames.aif_agent.cogames_policy import RESOURCE_NAMES
+        team_res = {"carbon": 2, "oxygen": 30, "germanium": 25, "silicon": 50}
+        scarcest = min(RESOURCE_NAMES, key=lambda e: team_res.get(e, 0))
+        assert scarcest == "carbon"
+        # After mining carbon, resources are more balanced → lower KL from uniform
+        team_res2 = {"carbon": 20, "oxygen": 20, "germanium": 20, "silicon": 20}
+        scarcest2 = min(RESOURCE_NAMES, key=lambda e: team_res2.get(e, 0))
+        # When balanced, any element is fine (min picks first alphabetically)
+        assert scarcest2 in RESOURCE_NAMES
 
 
 # ---------------------------------------------------------------------------

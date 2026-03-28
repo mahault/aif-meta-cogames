@@ -173,6 +173,44 @@ class SpatialMemory:
         return False
 
 
+class SharedSpatialMemory:
+    """Shared observation pool for multi-agent belief sharing.
+
+    Following Catal, Van de Maele, ..., Albarracin et al. (2024) "Belief
+    sharing: a blessing or a curse": agent factual observations (station
+    locations, walls) are shared as a social observation modality.  Each
+    agent's spatial discoveries propagate to all other agents.
+
+    Shares ground-truth observations (not posterior beliefs) to avoid echo
+    chambers.  Agents maintain independent beliefs about what to DO.
+    """
+
+    def __init__(self):
+        self.stations: dict[tuple[int, int], str] = {}
+        self.walls: set[tuple[int, int]] = set()
+        self.explored: set[tuple[int, int]] = set()
+
+    def contribute(self, agent_memory: SpatialMemory):
+        """Merge one agent's factual observations into the shared pool."""
+        self.stations.update(agent_memory.stations)
+        self.walls.update(agent_memory.walls)
+        self.explored.update(agent_memory.explored)
+
+    def find_nearest_station(
+        self, category: str, position: tuple[int, int]
+    ) -> Optional[tuple[int, int]]:
+        """Find nearest station of given category from shared knowledge."""
+        best, best_dist = None, float("inf")
+        for pos, cat in self.stations.items():
+            if cat != category:
+                continue
+            dist = abs(pos[0] - position[0]) + abs(pos[1] - position[1])
+            if dist < best_dist:
+                best_dist = dist
+                best = pos
+        return best
+
+
 # ---------------------------------------------------------------------------
 # Mettagrid-independent utilities
 # ---------------------------------------------------------------------------
@@ -181,13 +219,22 @@ def _build_tag_categories(tags: list[str]) -> dict[int, str]:
     """Build tag_value -> category mapping dynamically from tag names.
 
     More robust than hardcoded indices -- works across cogames versions.
-    Does NOT require mettagrid.
+    Does NOT require mettagrid.  Extractors are element-typed
+    (e.g. ``"extractor:carbon"``) for EFE-optimal resource selection.
     """
     categories: dict[int, str] = {}
     for i, tag_name in enumerate(tags):
         name = tag_name.removeprefix("type:")
         if "extractor" in name:
-            categories[i] = "extractor"
+            # Element-typed: richer generative model
+            matched = False
+            for elem in RESOURCE_NAMES:
+                if elem in name:
+                    categories[i] = f"extractor:{elem}"
+                    matched = True
+                    break
+            if not matched:
+                categories[i] = "extractor"  # solar or unknown
         elif name in ("hub",):
             categories[i] = "hub"
         elif name in ("junction",):
@@ -274,7 +321,7 @@ def _nav_learn_B(agent, beliefs_T2, obs_T2, actions_T1):
     """
     return agent.infer_parameters(
         beliefs_A=beliefs_T2,
-        observations=obs_T2,
+        outcomes=obs_T2,
         actions=actions_T1,
         beliefs_B=beliefs_T2,
         lr_pA=0.0,
@@ -480,6 +527,10 @@ class BatchedAIFEngine:
 
         # Level 1: Option executor
         self.option_executor = OptionExecutor(n_agents)
+
+        # Shared spatial memory — social observation modality
+        # (Catal, Van de Maele, ..., Albarracin et al., 2024)
+        self.shared_memory = SharedSpatialMemory()
 
         # Obs buffer: per-agent, per-modality, shape (1,) = (T=1,)
         self._obs_buffer: list[list[Any]] = [
@@ -766,7 +817,7 @@ class BatchedAIFEngine:
 
         self.agent = self.agent.infer_parameters(
             beliefs_A=beliefs_T2,
-            observations=obs_T2,
+            outcomes=obs_T2,
             actions=actions_T1,
             beliefs_B=beliefs_T2,
             lr_pA=0.0,
@@ -833,6 +884,11 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
         self._extractor_tags = self._resolve_tag_ids(
             [f"{e}_extractor" for e in RESOURCE_NAMES]
         )
+        # Per-element extractor tags for EFE-optimal resource selection
+        self._element_extractor_tags: dict[str, set[int]] = {
+            elem: self._resolve_tag_ids([f"{elem}_extractor"])
+            for elem in RESOURCE_NAMES
+        }
         self._hub_tags = self._resolve_tag_ids(["hub"])
         self._craft_tags = self._resolve_tag_ids(
             [f"c:{g}" for g in GEAR_NAMES]
@@ -846,8 +902,10 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
         # Spatial memory support: wall tags + station tag map
         self._wall_tags = self._resolve_tag_ids(["wall"])
         self._station_tag_map: dict[int, str] = {}
-        for tid in self._extractor_tags:
-            self._station_tag_map[tid] = "extractor"
+        # Element-typed extractor categories for richer world model
+        for elem in RESOURCE_NAMES:
+            for tid in self._element_extractor_tags[elem]:
+                self._station_tag_map[tid] = f"extractor:{elem}"
         for tid in self._hub_tags:
             self._station_tag_map[tid] = "hub"
         for tid in self._craft_tags:
@@ -883,6 +941,8 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
         state.spatial_memory.update(
             obs, self._center, self._wall_tags, self._station_tag_map
         )
+        # Contribute discoveries to shared memory (belief sharing)
+        self._engine.shared_memory.contribute(state.spatial_memory)
 
         # 1. Convert AgentObservation -> numpy array
         obs_array = self._obs_to_array(obs)
@@ -983,13 +1043,27 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
     ) -> Optional[tuple[int, int]]:
         """Resolve task policy to absolute target position.
 
+        For NAV_RESOURCE, uses EFE-optimal element selection: the element
+        whose extraction minimally reduces D_KL from the preferred uniform
+        team resource distribution = the scarcest element.
+
         Returns (abs_row, abs_col) or None if no target found.
         """
         mem = state.spatial_memory
 
         # Map task policy to tag set and station category
         if task_policy == TaskPolicy.NAV_RESOURCE:
-            tag_ids, category = self._extractor_tags, "extractor"
+            # EFE-optimal element selection (Level 0.5 goal generation):
+            # G(e) = D_KL(Q(resources|mine_e) || C_uniform)
+            # Scarcest element minimizes G → lowest EFE.
+            team_res = self._team_resources(obs)
+            if team_res:
+                scarcest = min(RESOURCE_NAMES,
+                               key=lambda e: team_res.get(e, 0))
+                tag_ids = self._element_extractor_tags[scarcest]
+                category = f"extractor:{scarcest}"
+            else:
+                tag_ids, category = self._extractor_tags, "extractor"
         elif task_policy == TaskPolicy.NAV_DEPOT:
             tag_ids, category = self._hub_tags, "hub"
         elif task_policy == TaskPolicy.NAV_CRAFT:
@@ -1015,11 +1089,38 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
             abs_c = mem.position[1] + target_loc[1] - self._center[1]
             return (abs_r, abs_c)
 
-        # 2. Try spatial memory
+        # 2. Try own spatial memory
         if mem is not None and mem.position is not None:
             station_pos = mem.find_nearest_station(category)
             if station_pos is not None:
                 return station_pos
+
+        # 2b. Try shared spatial memory (belief sharing — Catal et al. 2024)
+        if mem is not None and mem.position is not None:
+            shared = self._engine.shared_memory
+            station_pos = shared.find_nearest_station(category, mem.position)
+            if station_pos is not None:
+                return station_pos
+
+        # 2c. Fallback for NAV_RESOURCE: try any element's extractor
+        if task_policy == TaskPolicy.NAV_RESOURCE and mem is not None and mem.position is not None:
+            for elem in RESOURCE_NAMES:
+                fb_tags = self._element_extractor_tags[elem]
+                fb_loc = self._closest_tag_location(obs, fb_tags)
+                if fb_loc is not None:
+                    abs_r = mem.position[0] + fb_loc[0] - self._center[0]
+                    abs_c = mem.position[1] + fb_loc[1] - self._center[1]
+                    return (abs_r, abs_c)
+            for elem in RESOURCE_NAMES:
+                cat = f"extractor:{elem}"
+                pos = mem.find_nearest_station(cat)
+                if pos is not None:
+                    return pos
+                pos = self._engine.shared_memory.find_nearest_station(
+                    cat, mem.position
+                )
+                if pos is not None:
+                    return pos
 
         # 3. Fall back to frontier exploration
         if mem is not None:
@@ -1055,6 +1156,31 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
             base = max(int(token.feature.normalization), 1)
             items[item_name] = items.get(item_name, 0) + value * (base ** power)
         return items
+
+    def _team_resources(self, obs: _AgentObservation) -> dict[str, int]:
+        """Read team resource levels from global ``team:*`` obs tokens.
+
+        These are hub-level totals for each element, shared across agents.
+        Used for EFE-optimal element selection (mine scarcest).
+        """
+        resources: dict[str, int] = {}
+        for token in obs.tokens:
+            name = token.feature.name
+            if not name.startswith("team:"):
+                continue
+            elem = name[5:]
+            item_name, sep, power_str = elem.rpartition(":p")
+            if sep and item_name and power_str.isdigit():
+                power = int(power_str)
+                elem = item_name
+            else:
+                power = 0
+            value = int(token.value)
+            if value <= 0:
+                continue
+            base = max(int(token.feature.normalization), 1)
+            resources[elem] = resources.get(elem, 0) + value * (base ** power)
+        return resources
 
     # ------------------------------------------------------------------
     # Navigation (nav POMDP support methods)

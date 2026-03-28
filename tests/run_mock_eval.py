@@ -38,8 +38,8 @@ from aif_meta_cogames.aif_agent.cogames_policy import (
 # ---------------------------------------------------------------------------
 
 STATIONS = {
-    (0, 0): "extractor",
-    (6, 7): "extractor",
+    (0, 0): "extractor:carbon",
+    (6, 7): "extractor:silicon",
     (2, 2): "hub",
     (4, 4): "craft",
     (2, 6): "junction",
@@ -140,7 +140,7 @@ def discretize_obs(agent: MockAgent) -> list:
     pos = agent.pos
 
     # Resource: nearest extractor distance
-    ext_positions = [(r, c) for (r, c), s in STATIONS.items() if s == "extractor"]
+    ext_positions = [(r, c) for (r, c), s in STATIONS.items() if s.startswith("extractor")]
     min_ext_dist = min(abs(pos[0] - r) + abs(pos[1] - c) for r, c in ext_positions)
     if min_ext_dist <= 1:
         obs_res = ObsResource.AT
@@ -152,7 +152,7 @@ def discretize_obs(agent: MockAgent) -> list:
     # Station: check adjacent stations (dist <= 1)
     obs_sta = ObsStation.NONE
     for (sr, sc), stype in STATIONS.items():
-        if stype == "extractor":
+        if stype.startswith("extractor"):
             continue
         dist = abs(pos[0] - sr) + abs(pos[1] - sc)
         if dist <= 1 and stype in STATION_OBS:
@@ -179,8 +179,8 @@ def discretize_obs(agent: MockAgent) -> list:
 def resolve_nav_target(agent: MockAgent, task_policy: int):
     """Resolve task policy to absolute target position."""
     if task_policy == TaskPolicy.NAV_RESOURCE:
-        # Nearest extractor
-        ext = [(r, c) for (r, c), s in STATIONS.items() if s == "extractor"]
+        # Nearest extractor (any element — mock doesn't have team resources)
+        ext = [(r, c) for (r, c), s in STATIONS.items() if s.startswith("extractor")]
         return min(ext, key=lambda e: abs(e[0] - agent.pos[0]) + abs(e[1] - agent.pos[1]))
     elif task_policy == TaskPolicy.NAV_DEPOT:
         return (2, 2)  # hub
