@@ -3,13 +3,13 @@
 Maps raw uint8 token observations from MettaGrid to the discrete state and
 observation spaces used by the CogsGuard POMDP generative model.
 
-State space (216 states):
-    phase(6) x hand(3) x target_mode(3) x role(4)
+State space (288 states):
+    phase(6) x hand(4) x target_mode(3) x role(4)
 
 Observation modalities (6):
     o_resource(3):     extractor proximity
     o_station(4):      hub / craft-station / junction proximity
-    o_inventory(3):    what the agent is holding
+    o_inventory(4):    what the agent is holding
     o_contest(3):      junction contest status
     o_social(4):       nearby agent presence
     o_role_signal(2):  teammate role similarity
@@ -49,6 +49,7 @@ class Hand(IntEnum):
     EMPTY = 0
     HOLDING_RESOURCE = 1
     HOLDING_GEAR = 2
+    HOLDING_BOTH = 3
 
 
 class TargetMode(IntEnum):
@@ -131,6 +132,7 @@ class ObsInventory(IntEnum):
     EMPTY = 0
     HAS_RESOURCE = 1
     HAS_GEAR = 2
+    HAS_BOTH = 3
 
 
 class ObsContest(IntEnum):
@@ -452,23 +454,30 @@ class ObservationDiscretizer:
     def infer_hand(self, obs: np.ndarray) -> int:
         """Infer Hand state from inventory tokens.
 
-        Checks gear first (higher priority if agent has both gear and
-        resource features simultaneously).
+        Scans all inventory tokens to detect whether the agent holds
+        gear, resources, or both simultaneously.
 
         Inventory tokens may use LOC_GLOBAL (254) or the center-cell
         encoding (6<<4|6 = 102) depending on the mettagrid version.
         """
         loc_center = (6 << 4) | 6   # 102
         has_resource = False
+        has_gear = False
         for i in range(obs.shape[0]):
             loc, feat_id, value = int(obs[i, 0]), int(obs[i, 1]), int(obs[i, 2])
             if (loc != LOC_GLOBAL and loc != loc_center) or value == 0:
                 continue
             if feat_id in self._gear_feat_ids:
-                return Hand.HOLDING_GEAR
+                has_gear = True
             if feat_id in self._resource_feat_ids:
                 has_resource = True
-        return Hand.HOLDING_RESOURCE if has_resource else Hand.EMPTY
+        if has_gear and has_resource:
+            return Hand.HOLDING_BOTH
+        if has_gear:
+            return Hand.HOLDING_GEAR
+        if has_resource:
+            return Hand.HOLDING_RESOURCE
+        return Hand.EMPTY
 
     def infer_phase(self, obs: np.ndarray, hand: int) -> int:
         """Infer Phase from nearby entity tags and hand state.
@@ -486,12 +495,12 @@ class ObservationDiscretizer:
                 return Phase.CRAFT if hand == Hand.HOLDING_RESOURCE else Phase.GEAR
             if cat == "hub":
                 return Phase.DEPOSIT
-            if cat == "extractor":
+            if cat is not None and cat.startswith("extractor"):
                 return Phase.MINE
 
         # Not adjacent to a station — infer from hand
-        if hand == Hand.HOLDING_RESOURCE:
-            return Phase.DEPOSIT
+        if hand in (Hand.HOLDING_RESOURCE, Hand.HOLDING_BOTH):
+            return Phase.DEPOSIT  # deposit resources first (even if also holding gear)
         if hand == Hand.HOLDING_GEAR:
             return Phase.CAPTURE
         return Phase.EXPLORE
@@ -693,7 +702,7 @@ class ObservationDiscretizer:
                 continue
             dist = self._manhattan_from_center(loc)
 
-            if cat == "extractor" and dist < best_res_dist:
+            if cat is not None and cat.startswith("extractor") and dist < best_res_dist:
                 best_res_dist = dist
             if cat in sta_map and dist < best_sta_dist:
                 best_sta_dist = dist

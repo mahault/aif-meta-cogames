@@ -143,7 +143,7 @@ class TestGoalSelectionLogic:
         phase_qs = np.zeros(6)
         phase_qs[Phase.CAPTURE] = 0.9
         phase_qs[Phase.EXPLORE] = 0.1
-        hand_qs = np.zeros(3)
+        hand_qs = np.zeros(4)
         hand_qs[Hand.HOLDING_GEAR] = 1.0
 
         assert int(np.argmax(phase_qs)) == Phase.CAPTURE
@@ -154,7 +154,7 @@ class TestGoalSelectionLogic:
         phase_qs = np.zeros(6)
         phase_qs[Phase.DEPOSIT] = 0.9
         phase_qs[Phase.EXPLORE] = 0.1
-        hand_qs = np.zeros(3)
+        hand_qs = np.zeros(4)
         hand_qs[Hand.HOLDING_RESOURCE] = 1.0
 
         assert int(np.argmax(phase_qs)) == Phase.DEPOSIT
@@ -165,7 +165,7 @@ class TestGoalSelectionLogic:
         phase_qs = np.zeros(6)
         phase_qs[Phase.EXPLORE] = 0.95
         phase_qs[Phase.MINE] = 0.05
-        hand_qs = np.zeros(3)
+        hand_qs = np.zeros(4)
         hand_qs[Hand.EMPTY] = 1.0
 
         assert int(np.argmax(phase_qs)) == Phase.EXPLORE
@@ -176,7 +176,7 @@ class TestGoalSelectionLogic:
         phase_qs = np.zeros(6)
         phase_qs[Phase.CRAFT] = 0.8
         phase_qs[Phase.EXPLORE] = 0.2
-        hand_qs = np.zeros(3)
+        hand_qs = np.zeros(4)
         hand_qs[Hand.EMPTY] = 1.0
 
         assert int(np.argmax(phase_qs)) == Phase.CRAFT
@@ -196,15 +196,15 @@ class TestPOMDPAgentCreation:
         # A shapes: (batch, n_obs, *dep_factor_dims)
         assert agent.A[0].shape == (1, 3, 6)   # (batch, o_resource, phase)
         assert agent.A[1].shape == (1, 4, 6)   # (batch, o_station, phase)
-        assert agent.A[2].shape == (1, 3, 3)   # (batch, o_inventory, hand)
+        assert agent.A[2].shape == (1, 4, 4)   # (batch, o_inventory, hand)
         assert agent.A[3].shape == (1, 3, 3)   # (batch, o_contest, target_mode)
         assert agent.A[4].shape == (1, 4, 4, 3)  # (batch, o_social, role, target_mode)
         assert agent.A[5].shape == (1, 2, 4)   # (batch, o_role_signal, role)
 
         # B shapes: (batch, n_states_f', *dep_dims, n_controls_f)
         assert len(agent.B) == 4  # 4 state factors
-        assert agent.B[0].shape == (1, 6, 6, 3, 13)  # phase: (batch, p', p, h, actions)
-        assert agent.B[1].shape == (1, 3, 6, 3, 13)  # hand: (batch, h', p, h, actions)
+        assert agent.B[0].shape == (1, 6, 6, 4, 13)  # phase: (batch, p', p, h, actions)
+        assert agent.B[1].shape == (1, 4, 6, 4, 13)  # hand: (batch, h', p, h, actions)
         assert agent.B[2].shape == (1, 3, 3, 13)      # target: (batch, t', t, actions)
         assert agent.B[3].shape == (1, 4, 4, 13)      # role: (batch, r', r, actions)
 
@@ -223,7 +223,7 @@ class TestPOMDPAgentCreation:
         # Each qs[f] shape: (batch=1, T=1, n_states_f)
         assert qs[0].shape[0] == 1  # batch
         assert qs[0].shape[-1] == 6  # phase states
-        assert qs[1].shape[-1] == 3  # hand states
+        assert qs[1].shape[-1] == 4  # hand states
 
         # Compute EFE
         q_pi, G = agent.infer_policies(qs)
@@ -282,7 +282,7 @@ class TestPOMDPAgentCreation:
         assert len(pred) == 4
         # Each factor's prior: (batch=1, n_states_f)
         assert pred[0].shape == (1, 6)   # phase
-        assert pred[1].shape == (1, 3)   # hand
+        assert pred[1].shape == (1, 4)   # hand
         assert pred[2].shape == (1, 3)   # target_mode
         assert pred[3].shape == (1, 4)   # role
         # Should be valid probability distributions
@@ -457,10 +457,35 @@ class TestOptionExecutor:
         assert executor.states[0].current_option == MacroOption.MINE_CYCLE
 
     def test_role_filter_aligner_cannot_mine(self):
-        """Aligner (odd) requesting MINE_CYCLE gets EXPLORE instead."""
+        """Aligner (odd) requesting MINE_CYCLE gets CRAFT_CYCLE (not EXPLORE)."""
         executor = OptionExecutor(n_agents=2)
         executor.set_option(1, MacroOption.MINE_CYCLE)  # agent 1 = aligner
-        assert executor.states[1].current_option == MacroOption.EXPLORE
+        # v9.7: redirects to CRAFT_CYCLE (next-best from initiation set)
+        assert executor.states[1].current_option == MacroOption.CRAFT_CYCLE
+
+    def test_mine_cycle_has_both_goes_to_depot(self):
+        """HAS_BOTH (gear + resources): mine_cycle should NAV_DEPOT to deposit."""
+        executor = OptionExecutor(n_agents=1)
+        executor.set_option(0, MacroOption.MINE_CYCLE)
+        obs = [ObsResource.NONE, ObsStation.NONE, ObsInventory.HAS_BOTH,
+               ObsContest.FREE, 0, 0]
+        assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_DEPOT
+
+    def test_craft_cycle_has_both_waits(self):
+        """HAS_BOTH: craft_cycle has gear already, should WAIT."""
+        executor = OptionExecutor(n_agents=2)
+        executor.set_option(1, MacroOption.CRAFT_CYCLE)  # agent 1 = aligner
+        obs = [ObsResource.NONE, ObsStation.NONE, ObsInventory.HAS_BOTH,
+               ObsContest.FREE, 0, 0]
+        assert executor.get_task_policy(1, obs) == TaskPolicy.WAIT
+
+    def test_capture_cycle_has_both_nav_junction(self):
+        """HAS_BOTH: capture_cycle has gear, should NAV_JUNCTION."""
+        executor = OptionExecutor(n_agents=2)
+        executor.set_option(1, MacroOption.CAPTURE_CYCLE)  # agent 1 = aligner
+        obs = [ObsResource.NONE, ObsStation.NONE, ObsInventory.HAS_BOTH,
+               ObsContest.FREE, 0, 0]
+        assert executor.get_task_policy(1, obs) == TaskPolicy.NAV_JUNCTION
 
 
 class TestOptionTermination:
@@ -530,6 +555,15 @@ class TestOptionTermination:
         obs = [ObsResource.NONE, ObsStation.JUNCTION, ObsInventory.EMPTY,
                ObsContest.FREE, 0, 0]
         assert executor.check_termination(1, obs) is True
+
+    def test_mine_cycle_terminates_on_deposit_from_both(self):
+        """Deposit with HOLDING_BOTH: prev=HAS_BOTH, now=HAS_GEAR → terminates."""
+        executor = OptionExecutor(n_agents=1)
+        executor.set_option(0, MacroOption.MINE_CYCLE)
+        executor.states[0].prev_inv = ObsInventory.HAS_BOTH
+        obs = [ObsResource.NONE, ObsStation.HUB, ObsInventory.HAS_GEAR,
+               ObsContest.FREE, 0, 0]
+        assert executor.check_termination(0, obs) is True
 
     def test_set_option_resets_state(self):
         executor = OptionExecutor(n_agents=2)
@@ -684,24 +718,41 @@ class TestSharedSpatialMemory:
             SharedSpatialMemory, SpatialMemory,
         )
         shared = SharedSpatialMemory()
+        # Agent 0: hub at (10, 10), extractor at (20, 20)
         mem1 = SpatialMemory()
+        mem1.hub_offset = (10, 10)
         mem1.stations[(10, 10)] = "hub"
         mem1.stations[(20, 20)] = "extractor:carbon"
+        # Agent 1: different spawn, hub at (5, 8), extractor at (35, 33)
         mem2 = SpatialMemory()
-        mem2.stations[(30, 30)] = "extractor:silicon"
+        mem2.hub_offset = (5, 8)
+        mem2.stations[(35, 33)] = "extractor:silicon"
         shared.contribute(mem1)
         shared.contribute(mem2)
-        assert shared.stations[(10, 10)] == "hub"
-        assert shared.stations[(20, 20)] == "extractor:carbon"
-        assert shared.stations[(30, 30)] == "extractor:silicon"
+        # Shared uses hub-relative coords: hub=(0,0), ext1=(10,10), ext2=(30,25)
+        assert shared.stations[(0, 0)] == "hub"
+        assert shared.stations[(10, 10)] == "extractor:carbon"
+        assert shared.stations[(30, 25)] == "extractor:silicon"
+
+    def test_contribute_skips_without_hub(self):
+        from aif_meta_cogames.aif_agent.cogames_policy import (
+            SharedSpatialMemory, SpatialMemory,
+        )
+        shared = SharedSpatialMemory()
+        mem = SpatialMemory()
+        mem.stations[(10, 10)] = "extractor:carbon"
+        # No hub_offset → contribute should skip
+        shared.contribute(mem)
+        assert len(shared.stations) == 0
 
     def test_find_nearest_element_specific(self):
         from aif_meta_cogames.aif_agent.cogames_policy import SharedSpatialMemory
         shared = SharedSpatialMemory()
+        # Hub-relative positions directly
         shared.stations[(10, 10)] = "extractor:carbon"
         shared.stations[(20, 20)] = "extractor:silicon"
         shared.stations[(5, 5)] = "extractor:silicon"  # closer but wrong element
-        pos = (0, 0)
+        pos = (0, 0)  # hub-relative query
         nearest_carbon = shared.find_nearest_station("extractor:carbon", pos)
         assert nearest_carbon == (10, 10)
         nearest_silicon = shared.find_nearest_station("extractor:silicon", pos)
@@ -712,34 +763,40 @@ class TestSharedSpatialMemory:
             SharedSpatialMemory, SpatialMemory,
         )
         shared = SharedSpatialMemory()
-        # Agent 0 finds carbon extractor
+        # Agent 0: hub at (3, 3), finds carbon extractor at (18, 18)
         mem0 = SpatialMemory()
-        mem0.stations[(15, 15)] = "extractor:carbon"
-        mem0.explored.add((15, 15))
+        mem0.hub_offset = (3, 3)
+        mem0.stations[(18, 18)] = "extractor:carbon"
         shared.contribute(mem0)
-        # Agent 1 doesn't know about it directly, but shared does
-        pos = (0, 0)
-        result = shared.find_nearest_station("extractor:carbon", pos)
+        # Agent 1 has hub at (7, 2) — different spawn
+        # Query in hub-relative: carbon should be at (15, 15)
+        result = shared.find_nearest_station("extractor:carbon", (0, 0))
         assert result == (15, 15)
-        # Agent 1 also explored some area
-        mem1 = SpatialMemory()
-        mem1.explored.add((40, 40))
-        shared.contribute(mem1)
-        # Shared pool has both explored areas
-        assert (15, 15) in shared.explored
-        assert (40, 40) in shared.explored
 
-    def test_walls_shared(self):
+    def test_coordinate_roundtrip(self):
+        """to_shared → from_shared should round-trip correctly."""
         from aif_meta_cogames.aif_agent.cogames_policy import (
             SharedSpatialMemory, SpatialMemory,
         )
         shared = SharedSpatialMemory()
-        mem = SpatialMemory()
-        mem.walls.add((10, 11))
-        mem.walls.add((10, 12))
-        shared.contribute(mem)
-        assert (10, 11) in shared.walls
-        assert (10, 12) in shared.walls
+        # Agent 0: hub at (5, 10), station at (15, 20)
+        mem0 = SpatialMemory()
+        mem0.hub_offset = (5, 10)
+        mem0.position = (8, 12)
+        mem0.stations[(15, 20)] = "junction"
+        shared.contribute(mem0)
+        # Agent 1: hub at (2, 7) — 3 rows south, 3 cols east relative to agent 0
+        mem1 = SpatialMemory()
+        mem1.hub_offset = (2, 7)
+        mem1.position = (6, 9)
+        # Agent 1 queries shared memory in hub-relative coords
+        shared_pos = mem1.to_shared(mem1.position)  # (4, 2)
+        result = shared.find_nearest_station("junction", shared_pos)  # (10, 10)
+        # Convert back to agent 1's frame
+        local = mem1.from_shared(result)  # (12, 17)
+        # This should be the same map location as agent 0's (15, 20)
+        # Verify: agent0's (15,20) = hub + (10,10), agent1's (12,17) = hub1 + (10,10) = (2+10, 7+10) = (12, 17)
+        assert local == (12, 17)
 
     def test_efe_element_selection(self):
         """Scarcest element has lowest EFE — mining it minimizes
@@ -1092,3 +1149,134 @@ class TestBearingConversion:
             assert _BEARING_DIRS[(idx + 3) % 4] == dirs["left"], f"{bearing} left"
             assert _BEARING_DIRS[(idx + 1) % 4] == dirs["right"], f"{bearing} right"
             assert _BEARING_DIRS[(idx + 2) % 4] == dirs["away"], f"{bearing} away"
+
+
+# ---------------------------------------------------------------------------
+# v9.7: Scout role, aligner redirect, shared explored cells
+# ---------------------------------------------------------------------------
+
+from aif_meta_cogames.aif_agent.generative_model import _agent_role
+from aif_meta_cogames.aif_agent.cogames_policy import SharedSpatialMemory
+
+
+class TestAgentRole:
+    """Test _agent_role() assignment."""
+
+    def test_8_agent_split(self):
+        """8 agents: 4 miners, 3 aligners, 1 scout."""
+        roles = [_agent_role(i, 8) for i in range(8)]
+        assert roles.count("miner") == 4
+        assert roles.count("aligner") == 3
+        assert roles.count("scout") == 1
+        assert roles[7] == "scout"
+
+    def test_small_team_no_scout(self):
+        """Teams with <4 agents should not have a scout."""
+        for n in (1, 2, 3):
+            roles = [_agent_role(i, n) for i in range(n)]
+            assert "scout" not in roles
+
+    def test_even_miners_odd_aligners(self):
+        """Even IDs are miners, odd (non-scout) are aligners."""
+        for i in range(7):
+            role = _agent_role(i, 8)
+            if i % 2 == 0:
+                assert role == "miner", f"Agent {i} should be miner"
+            else:
+                assert role == "aligner", f"Agent {i} should be aligner"
+
+
+class TestScoutOptionFilter:
+    """Test scout option initiation set (epistemic precision gate)."""
+
+    def test_scout_explore_allowed(self):
+        executor = OptionExecutor(n_agents=8)
+        executor.set_option(7, MacroOption.EXPLORE)
+        assert executor.states[7].current_option == MacroOption.EXPLORE
+
+    def test_scout_defend_allowed(self):
+        executor = OptionExecutor(n_agents=8)
+        executor.set_option(7, MacroOption.DEFEND)
+        assert executor.states[7].current_option == MacroOption.DEFEND
+
+    def test_scout_mine_blocked(self):
+        """Scout requesting MINE → redirected to EXPLORE."""
+        executor = OptionExecutor(n_agents=8)
+        executor.set_option(7, MacroOption.MINE_CYCLE)
+        assert executor.states[7].current_option == MacroOption.EXPLORE
+
+    def test_scout_craft_blocked(self):
+        """Scout requesting CRAFT → redirected to EXPLORE."""
+        executor = OptionExecutor(n_agents=8)
+        executor.set_option(7, MacroOption.CRAFT_CYCLE)
+        assert executor.states[7].current_option == MacroOption.EXPLORE
+
+    def test_scout_capture_blocked(self):
+        """Scout requesting CAPTURE → redirected to EXPLORE."""
+        executor = OptionExecutor(n_agents=8)
+        executor.set_option(7, MacroOption.CAPTURE_CYCLE)
+        assert executor.states[7].current_option == MacroOption.EXPLORE
+
+    def test_scout_explore_no_early_termination(self):
+        """Scout EXPLORE does not self-terminate when station is found."""
+        executor = OptionExecutor(n_agents=8)
+        executor.set_option(7, MacroOption.EXPLORE)
+        # At a resource + station — should NOT terminate for scout
+        obs = [ObsResource.AT, ObsStation.HUB, ObsInventory.EMPTY,
+               ObsContest.FREE, 0, 0]
+        assert executor.check_termination(7, obs) is False
+
+
+class TestAlignerMineRedirect:
+    """Test aligner MINE → CRAFT/CAPTURE redirect (v9.7 fix)."""
+
+    def test_aligner_mine_no_gear_goes_craft(self):
+        """Aligner with no gear: MINE → CRAFT_CYCLE."""
+        executor = OptionExecutor(n_agents=8)
+        # prev_inv defaults to 0 (EMPTY) — no gear
+        executor.set_option(1, MacroOption.MINE_CYCLE)
+        assert executor.states[1].current_option == MacroOption.CRAFT_CYCLE
+
+    def test_aligner_mine_with_gear_goes_capture(self):
+        """Aligner with gear: MINE → CAPTURE_CYCLE."""
+        executor = OptionExecutor(n_agents=8)
+        # Simulate having gear by setting prev_inv
+        executor.states[1].prev_inv = ObsInventory.HAS_GEAR
+        executor.set_option(1, MacroOption.MINE_CYCLE)
+        assert executor.states[1].current_option == MacroOption.CAPTURE_CYCLE
+
+
+class TestSharedExploredCells:
+    """Test SharedSpatialMemory explored cell sharing."""
+
+    def test_explored_cells_shared(self):
+        """Agent's explored cells appear in shared memory (hub-relative)."""
+        shared = SharedSpatialMemory()
+        mem = SpatialMemory()
+        mem.position = (5, 5)
+        mem.hub_offset = (3, 3)  # hub at (3,3) in agent frame
+        mem.explored = {(5, 5), (5, 6), (4, 5)}
+
+        shared.contribute(mem)
+
+        # Verify hub-relative coords: (5,5) - (3,3) = (2,2)
+        assert (2, 2) in shared.explored
+        assert (2, 3) in shared.explored
+        assert (1, 2) in shared.explored
+        assert len(shared.explored) == 3
+
+    def test_find_least_explored_direction(self):
+        """Scout navigates toward least-explored area."""
+        shared = SharedSpatialMemory()
+        # Explore heavily to the east and south, leave north and west empty
+        for r in range(-3, 15):
+            for c in range(-3, 15):
+                shared.explored.add((r, c))
+
+        target = shared.find_least_explored_direction((0, 0), radius=15)
+        # Should pick north or west since east/south are explored
+        assert target is not None
+        # Target should NOT be in the heavily explored quadrant
+        assert target[0] < 0 or target[1] < 0, (
+            f"Expected target away from explored area, got {target}"
+        )

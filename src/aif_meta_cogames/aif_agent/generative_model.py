@@ -6,12 +6,12 @@ compatible with ``pymdp.agent.Agent`` from inferactively-pymdp v1.0.
 
 State factors:
     factor 0: phase (6)       — economy-chain phase
-    factor 1: hand (3)        — what agent is holding
+    factor 1: hand (4)        — what agent is holding
     factor 2: target_mode (3) — junction contest status
     factor 3: role (4)        — agent specialisation
 
 Observation modalities (6):
-    o_resource(3), o_station(4), o_inventory(3),
+    o_resource(3), o_station(4), o_inventory(4),
     o_contest(3), o_social(4), o_role_signal(2)
 
 Actions:
@@ -189,8 +189,8 @@ def build_default_B() -> list[np.ndarray]:
     """Hand-crafted factored transition matrices.
 
     Returns [B_phase, B_hand, B_target, B_role] where:
-      B_phase:  (6, 6, 3, 13)  P(phase' | phase, hand, action)
-      B_hand:   (3, 6, 3, 13)  P(hand'  | phase, hand, action)
+      B_phase:  (6, 6, 4, 13)  P(phase' | phase, hand, action)
+      B_hand:   (4, 6, 4, 13)  P(hand'  | phase, hand, action)
       B_target: (3, 3, 13)     P(target' | target, action)
       B_role:   (4, 4, 13)     P(role'  | role, action) — identity
     """
@@ -240,7 +240,13 @@ def _normalize_B_factor(B, dims, axes):
 
 
 def _fill_phase_hand(B_p, B_h, a):
-    """Set phase and hand transition probabilities for action a."""
+    """Set phase and hand transition probabilities for action a.
+
+    HOLDING_BOTH (gear + resources simultaneously) transitions:
+    - DEPOSIT: removes resources, keeps gear → HOLDING_GEAR
+    - CAPTURE: consumes gear, keeps resources → HOLDING_RESOURCE
+    - Most other actions: hand stays HOLDING_BOTH
+    """
     P = Phase
     H = Hand
 
@@ -251,6 +257,10 @@ def _fill_phase_hand(B_p, B_h, a):
                     B_p[P.MINE, p, h, a] += 0.6
                     B_p[P.EXPLORE, p, h, a] += 0.3
                     B_p[p, p, h, a] += 0.1
+                elif h == H.HOLDING_BOTH:
+                    # Already has resources — should deposit
+                    B_p[p, p, h, a] += 0.7
+                    B_p[P.DEPOSIT, p, h, a] += 0.3
                 else:
                     B_p[p, p, h, a] += 0.8
                     B_p[P.EXPLORE, p, h, a] += 0.2
@@ -265,6 +275,16 @@ def _fill_phase_hand(B_p, B_h, a):
                     B_p[P.MINE, p, h, a] += 0.9
                     B_p[P.DEPOSIT, p, h, a] += 0.1
                     B_h[h, p, h, a] += 1.0
+                elif p == P.MINE and h == H.HOLDING_GEAR:
+                    # Mining with gear → picks up resource → HOLDING_BOTH
+                    B_p[P.MINE, p, h, a] += 1.0
+                    B_h[H.HOLDING_BOTH, p, h, a] += 0.7
+                    B_h[H.HOLDING_GEAR, p, h, a] += 0.3
+                elif p == P.MINE and h == H.HOLDING_BOTH:
+                    # Already full — should deposit
+                    B_p[P.MINE, p, h, a] += 0.8
+                    B_p[P.DEPOSIT, p, h, a] += 0.2
+                    B_h[h, p, h, a] += 1.0
                 else:
                     B_p[p, p, h, a] += 0.9
                     B_p[P.EXPLORE, p, h, a] += 0.1
@@ -272,6 +292,10 @@ def _fill_phase_hand(B_p, B_h, a):
 
             elif a == TaskPolicy.NAV_DEPOT:
                 if h == H.HOLDING_RESOURCE:
+                    B_p[P.DEPOSIT, p, h, a] += 0.6
+                    B_p[p, p, h, a] += 0.4
+                elif h == H.HOLDING_BOTH:
+                    # Has resources to deposit
                     B_p[P.DEPOSIT, p, h, a] += 0.6
                     B_p[p, p, h, a] += 0.4
                 else:
@@ -285,6 +309,12 @@ def _fill_phase_hand(B_p, B_h, a):
                     B_p[P.DEPOSIT, p, h, a] += 0.5
                     B_h[H.EMPTY, p, h, a] += 0.7
                     B_h[H.HOLDING_RESOURCE, p, h, a] += 0.3
+                elif p == P.DEPOSIT and h == H.HOLDING_BOTH:
+                    # Deposit resources, keep gear → HOLDING_GEAR
+                    B_p[P.MINE, p, h, a] += 0.5
+                    B_p[P.DEPOSIT, p, h, a] += 0.5
+                    B_h[H.HOLDING_GEAR, p, h, a] += 0.7
+                    B_h[H.HOLDING_BOTH, p, h, a] += 0.3
                 else:
                     B_p[p, p, h, a] += 0.9
                     B_p[P.EXPLORE, p, h, a] += 0.1
@@ -315,7 +345,7 @@ def _fill_phase_hand(B_p, B_h, a):
                     B_h[h, p, h, a] += 1.0
 
             elif a == TaskPolicy.NAV_GEAR:
-                if h in (H.EMPTY, H.HOLDING_GEAR):
+                if h in (H.EMPTY, H.HOLDING_GEAR, H.HOLDING_BOTH):
                     B_p[P.GEAR, p, h, a] += 0.5
                     B_p[p, p, h, a] += 0.4
                     B_p[P.CRAFT, p, h, a] += 0.1
@@ -325,7 +355,12 @@ def _fill_phase_hand(B_p, B_h, a):
                 B_h[h, p, h, a] += 1.0
 
             elif a == TaskPolicy.ACQUIRE_GEAR:
-                if p == P.GEAR:
+                if p == P.GEAR and h == H.HOLDING_RESOURCE:
+                    # Acquiring gear when holding resources → HOLDING_BOTH
+                    B_p[P.GEAR, p, h, a] += 1.0
+                    B_h[H.HOLDING_BOTH, p, h, a] += 0.7
+                    B_h[H.HOLDING_RESOURCE, p, h, a] += 0.3
+                elif p == P.GEAR:
                     B_p[P.GEAR, p, h, a] += 1.0
                     B_h[H.HOLDING_GEAR, p, h, a] += 0.7
                     B_h[h, p, h, a] += 0.3
@@ -335,7 +370,8 @@ def _fill_phase_hand(B_p, B_h, a):
                     B_h[h, p, h, a] += 1.0
 
             elif a == TaskPolicy.NAV_JUNCTION:
-                if h == H.HOLDING_GEAR:
+                if h in (H.HOLDING_GEAR, H.HOLDING_BOTH):
+                    # Has gear → can capture
                     B_p[P.CAPTURE, p, h, a] += 0.6
                     B_p[p, p, h, a] += 0.4
                 else:
@@ -349,6 +385,12 @@ def _fill_phase_hand(B_p, B_h, a):
                     B_p[P.CAPTURE, p, h, a] += 0.6
                     B_h[H.EMPTY, p, h, a] += 0.4
                     B_h[H.HOLDING_GEAR, p, h, a] += 0.6
+                elif p == P.CAPTURE and h == H.HOLDING_BOTH:
+                    # Capture consumes gear, keeps resources → HOLDING_RESOURCE
+                    B_p[P.EXPLORE, p, h, a] += 0.4
+                    B_p[P.CAPTURE, p, h, a] += 0.6
+                    B_h[H.HOLDING_RESOURCE, p, h, a] += 0.4
+                    B_h[H.HOLDING_BOTH, p, h, a] += 0.6
                 else:
                     B_p[p, p, h, a] += 0.9
                     B_p[P.EXPLORE, p, h, a] += 0.1
@@ -412,8 +454,8 @@ def build_option_B() -> list[np.ndarray]:
     """Option-level B matrices for the strategic POMDP (5 macro-options).
 
     Returns [B_phase, B_hand, B_target, B_role] where:
-      B_phase:  (6, 6, 3, 5)  P(phase' | phase, hand, option)
-      B_hand:   (3, 6, 3, 5)  P(hand'  | phase, hand, option)
+      B_phase:  (6, 6, 4, 5)  P(phase' | phase, hand, option)
+      B_hand:   (4, 6, 4, 5)  P(hand'  | phase, hand, option)
       B_target: (3, 3, 5)     P(target' | target, option)
       B_role:   (4, 4, 5)     P(role'  | role, option) — identity
 
@@ -458,18 +500,24 @@ def build_option_B() -> list[np.ndarray]:
                     B_phase[p, p, h, a] += 0.6
                 B_hand[H.EMPTY, p, h, a] += 0.6
                 B_hand[H.HOLDING_RESOURCE, p, h, a] += 0.4
-            elif h == H.HOLDING_RESOURCE:
+            elif h in (H.HOLDING_RESOURCE, H.HOLDING_BOTH):
+                # Has resources (with or without gear) → go deposit
                 if p in (P.MINE, P.EXPLORE):
                     B_phase[P.DEPOSIT, p, h, a] += 0.6
                     B_phase[p, p, h, a] += 0.4
                 elif p == P.DEPOSIT:
                     B_phase[P.DEPOSIT, p, h, a] += 0.5
-                    B_phase[P.EXPLORE, p, h, a] += 0.5
+                    B_phase[P.MINE, p, h, a] += 0.5
                 else:
                     B_phase[P.DEPOSIT, p, h, a] += 0.5
                     B_phase[p, p, h, a] += 0.5
-                B_hand[H.HOLDING_RESOURCE, p, h, a] += 0.6
-                B_hand[H.EMPTY, p, h, a] += 0.4
+                if h == H.HOLDING_BOTH:
+                    # Depositing removes resources, keeps gear → HOLDING_GEAR
+                    B_hand[H.HOLDING_BOTH, p, h, a] += 0.4
+                    B_hand[H.HOLDING_GEAR, p, h, a] += 0.6
+                else:
+                    B_hand[H.HOLDING_RESOURCE, p, h, a] += 0.6
+                    B_hand[H.EMPTY, p, h, a] += 0.4
             else:  # HOLDING_GEAR — shouldn't be in mine cycle
                 B_phase[p, p, h, a] += 0.9
                 B_phase[P.EXPLORE, p, h, a] += 0.1
@@ -495,11 +543,11 @@ def build_option_B() -> list[np.ndarray]:
                     B_phase[p, p, h, a] += 0.6
                 B_hand[H.EMPTY, p, h, a] += 0.5
                 B_hand[H.HOLDING_GEAR, p, h, a] += 0.5
-            elif h == H.HOLDING_GEAR:
-                # Goal achieved — craft cycle complete
+            elif h in (H.HOLDING_GEAR, H.HOLDING_BOTH):
+                # Goal achieved — craft cycle complete (has gear)
                 B_phase[P.GEAR, p, h, a] += 0.7
                 B_phase[p, p, h, a] += 0.3
-                B_hand[H.HOLDING_GEAR, p, h, a] += 1.0
+                B_hand[h, p, h, a] += 1.0
             else:  # HOLDING_RESOURCE — deposit first
                 B_phase[P.DEPOSIT, p, h, a] += 0.5
                 B_phase[p, p, h, a] += 0.5
@@ -520,6 +568,17 @@ def build_option_B() -> list[np.ndarray]:
                     B_phase[p, p, h, a] += 0.4
                 B_hand[H.HOLDING_GEAR, p, h, a] += 0.6
                 B_hand[H.EMPTY, p, h, a] += 0.4
+            elif h == H.HOLDING_BOTH:
+                # Has gear (and resources) — can capture
+                if p == P.CAPTURE:
+                    B_phase[P.CAPTURE, p, h, a] += 0.6
+                    B_phase[P.EXPLORE, p, h, a] += 0.4
+                else:
+                    B_phase[P.CAPTURE, p, h, a] += 0.6
+                    B_phase[p, p, h, a] += 0.4
+                # Capture consumes gear, resources stay → HOLDING_RESOURCE
+                B_hand[H.HOLDING_BOTH, p, h, a] += 0.6
+                B_hand[H.HOLDING_RESOURCE, p, h, a] += 0.4
             else:
                 # No gear — can't capture effectively
                 B_phase[p, p, h, a] += 0.9
@@ -584,7 +643,7 @@ def build_C() -> list[np.ndarray]:
     """
     c_res = np.array([0.0, 0.5, 1.0])           # NONE, NEAR, AT
     c_sta = np.array([0.0, 0.5, 1.0, 3.0])      # NONE, HUB, CRAFT, JUNCTION
-    c_inv = np.array([0.0, 1.0, 2.0])            # EMPTY, RESOURCE, GEAR
+    c_inv = np.array([0.0, 1.0, 2.0, 1.5])      # EMPTY, RESOURCE, GEAR, BOTH
     c_con = np.array([1.0, -0.5, -2.0])          # FREE, CONTESTED, LOST
     c_soc = np.array([0.0, 0.5, -0.5, 0.0])     # ALONE, ALLY, ENEMY, BOTH
     c_role = np.array([0.3, 0.0])                # SAME_ROLE, DIFFERENT
@@ -599,7 +658,7 @@ def build_C_miner() -> list[np.ndarray]:
     """
     c_res = np.array([-1.0, 1.0, 3.0])          # penalize NONE, AT resource best
     c_sta = np.array([-1.0, 4.0, -1.0, -1.0])   # HUB best, penalize craft/junction
-    c_inv = np.array([-2.0, 4.0, -2.0])          # penalize EMPTY and GEAR
+    c_inv = np.array([-2.0, 4.0, -2.0, 1.0])    # penalize EMPTY/GEAR; BOTH = has resources, should deposit
     c_con = np.array([0.5, 0.0, 0.0])            # prefer FREE (avoid combat)
     c_soc = np.array([0.0, 0.5, -0.5, 0.0])     # ALONE, ALLY, ENEMY, BOTH
     c_role = np.array([0.3, 0.0])                # SAME_ROLE, DIFFERENT
@@ -614,10 +673,30 @@ def build_C_aligner() -> list[np.ndarray]:
     """
     c_res = np.array([-0.5, 0.0, 0.5])          # penalize NONE
     c_sta = np.array([-1.0, 0.0, 3.0, 7.0])     # JUNCTION strongest, penalize NONE
-    c_inv = np.array([-1.0, -1.0, 5.0])          # penalize EMPTY and RESOURCE
+    c_inv = np.array([-1.0, -1.0, 5.0, 2.0])    # penalize EMPTY/RESOURCE; BOTH = has gear, can still capture
     c_con = np.array([2.5, -1.0, -3.0])          # FREE strong, LOST very bad
     c_soc = np.array([0.0, 1.0, -1.0, 0.0])     # prefer allies, avoid enemies
     c_role = np.array([0.3, 0.0])                # SAME_ROLE, DIFFERENT
+    return [c_res, c_sta, c_inv, c_con, c_soc, c_role]
+
+
+def build_C_scout() -> list[np.ndarray]:
+    """Preferences for scout role — near-uniform for epistemic dominance.
+
+    When C is approximately uniform, the pragmatic component of EFE
+    (D_KL[q(o|pi) || P(o|C)]) approaches zero.  The agent is then driven
+    purely by epistemic value (information gain), naturally exploring
+    to reduce uncertainty about the world state.
+
+    Scout: +400 HP, +100 energy in cogames.  Explores and shares
+    station discoveries via SharedSpatialMemory (Catal et al. 2024).
+    """
+    c_res = np.array([0.0, 0.1, 0.1])           # near-uniform: no resource preference
+    c_sta = np.array([0.0, 0.1, 0.1, 0.1])      # near-uniform: no station preference
+    c_inv = np.array([0.0, 0.0, 0.0, 0.0])      # flat: scout doesn't care about inventory
+    c_con = np.array([0.1, 0.0, -0.1])           # slight: prefer FREE (avoid combat)
+    c_soc = np.array([0.0, 0.0, 0.0, 0.0])      # flat: no social preference
+    c_role = np.array([0.1, 0.0])                # slight: prefer same-role neighbors
     return [c_res, c_sta, c_inv, c_con, c_soc, c_role]
 
 
@@ -652,10 +731,22 @@ def build_D() -> list[np.ndarray]:
 # POMDP wrapper
 # ---------------------------------------------------------------------------
 
+def _agent_role(agent_id: int, n_agents: int = 8) -> str:
+    """Role assignment: 4 miners, 3 aligners, 1 scout.
+
+    Last agent is the dedicated epistemic scout (flat C-vector →
+    information gain dominates EFE → natural exploration).
+    Remaining: even=miner, odd=aligner.
+    """
+    if n_agents >= 4 and agent_id == n_agents - 1:
+        return "scout"
+    return "miner" if agent_id % 2 == 0 else "aligner"
+
+
 class CogsGuardPOMDP:
     """CogsGuard POMDP generative model (factored).
 
-    Uses a factored state representation: [phase(6), hand(3), target_mode(3), role(4)]
+    Uses a factored state representation: [phase(6), hand(4), target_mode(3), role(4)]
     with dependency-aware A and B matrices for pymdp 1.0.
 
     Parameters
@@ -683,7 +774,8 @@ class CogsGuardPOMDP:
         Parameters
         ----------
         role : str
-            "miner" (extractor→hub loop) or "aligner" (craft→junction capture).
+            "miner" (extractor→hub loop), "aligner" (craft→junction capture),
+            or "scout" (epistemic explorer with flat C).
             Any other value returns the default (generalist) model.
         """
         if role == "miner":
@@ -700,6 +792,13 @@ class CogsGuardPOMDP:
             D[3][Role.CAPTURER] = 0.94
             D[3] /= D[3].sum()
             return cls(C=build_C_aligner(), D=D)
+        elif role == "scout":
+            D = build_D()
+            # Scout: role prior peaked on SUPPORT (epistemic explorer)
+            D[3] = np.full(NUM_ROLES, 0.02)
+            D[3][Role.SUPPORT] = 0.94
+            D[3] /= D[3].sum()
+            return cls(C=build_C_scout(), D=D)
         return cls()
 
     @classmethod
@@ -782,7 +881,7 @@ class CogsGuardPOMDP:
     def create_batched_agent(n_agents: int = 8, **kwargs):
         """Create one ``Agent(batch_size=n_agents)`` with per-role C/D.
 
-        Even-indexed agents are miners, odd-indexed are aligners.
+        Role assignment: 4 miners (even), 3 aligners (odd<last), 1 scout (last).
         A and B matrices are shared (same model structure).
         C and D are replaced after construction with per-batch values
         using ``eqx.tree_at`` (the Agent constructor always broadcasts
@@ -791,8 +890,11 @@ class CogsGuardPOMDP:
         import equinox as eqx
         import jax.numpy as jnp
 
-        pomdp_miner = CogsGuardPOMDP.for_role("miner")
-        pomdp_aligner = CogsGuardPOMDP.for_role("aligner")
+        role_pomdps = {
+            "miner": CogsGuardPOMDP.for_role("miner"),
+            "aligner": CogsGuardPOMDP.for_role("aligner"),
+            "scout": CogsGuardPOMDP.for_role("scout"),
+        }
 
         # Create agent with uniform C/D (constructor adds batch dim)
         base = CogsGuardPOMDP()
@@ -803,8 +905,8 @@ class CogsGuardPOMDP:
         for m in range(len(NUM_OBS)):
             per_agent = []
             for i in range(n_agents):
-                c = pomdp_miner.C[m] if i % 2 == 0 else pomdp_aligner.C[m]
-                per_agent.append(c)
+                role = _agent_role(i, n_agents)
+                per_agent.append(role_pomdps[role].C[m])
             C_batched.append(jnp.array(np.stack(per_agent)))
 
         # Build per-batch D: (n_agents, n_states_f)
@@ -812,8 +914,8 @@ class CogsGuardPOMDP:
         for f in range(len(NUM_STATE_FACTORS)):
             per_agent = []
             for i in range(n_agents):
-                d = pomdp_miner.D[f] if i % 2 == 0 else pomdp_aligner.D[f]
-                per_agent.append(d)
+                role = _agent_role(i, n_agents)
+                per_agent.append(role_pomdps[role].D[f])
             D_batched.append(jnp.array(np.stack(per_agent)))
 
         # Replace C and D with per-batch versions
@@ -830,16 +932,19 @@ class CogsGuardPOMDP:
         Different B matrices (5 options instead of 13 task policies).
         25 two-step policies (5²) instead of 169 (13²).
 
-        Even-indexed agents are miners, odd-indexed are aligners
-        (per-role C/D via eqx.tree_at).
+        Role assignment: 4 miners (even), 3 aligners (odd<last), 1 scout (last).
+        Per-role C/D/E via eqx.tree_at.
         """
         import equinox as eqx
         import itertools
         import jax.numpy as jnp
         from pymdp.agent import Agent
 
-        pomdp_miner = CogsGuardPOMDP.for_role("miner")
-        pomdp_aligner = CogsGuardPOMDP.for_role("aligner")
+        role_pomdps = {
+            "miner": CogsGuardPOMDP.for_role("miner"),
+            "aligner": CogsGuardPOMDP.for_role("aligner"),
+            "scout": CogsGuardPOMDP.for_role("scout"),
+        }
         base = CogsGuardPOMDP()
 
         A = [jnp.array(a) for a in base.A]
@@ -884,21 +989,21 @@ class CogsGuardPOMDP:
         agent = Agent(A=A, B=B_option, C=C, D=D,
                       batch_size=n_agents, **defaults)
 
-        # Per-batch C/D (miner vs aligner)
+        # Per-batch C/D (miner / aligner / scout)
         C_batched = []
         for m in range(len(NUM_OBS)):
             per_agent = []
             for i in range(n_agents):
-                c = pomdp_miner.C[m] if i % 2 == 0 else pomdp_aligner.C[m]
-                per_agent.append(c)
+                role = _agent_role(i, n_agents)
+                per_agent.append(role_pomdps[role].C[m])
             C_batched.append(jnp.array(np.stack(per_agent)))
 
         D_batched = []
         for f in range(len(NUM_STATE_FACTORS)):
             per_agent = []
             for i in range(n_agents):
-                d = pomdp_miner.D[f] if i % 2 == 0 else pomdp_aligner.D[f]
-                per_agent.append(d)
+                role = _agent_role(i, n_agents)
+                per_agent.append(role_pomdps[role].D[f])
             D_batched.append(jnp.array(np.stack(per_agent)))
 
         agent = eqx.tree_at(lambda a: a.C, agent, C_batched)
@@ -912,6 +1017,7 @@ class CogsGuardPOMDP:
         n_policies = policies.shape[0]
         E_miner = np.ones(n_policies)
         E_aligner = np.ones(n_policies)
+        E_scout = np.ones(n_policies)
 
         E_miner[0:5] = 4.0     # MINE first — core role
         E_miner[15:20] = 2.0   # EXPLORE first (find resources)
@@ -925,13 +1031,24 @@ class CogsGuardPOMDP:
         E_aligner[15:20] = 1.5   # EXPLORE — find stations
         E_aligner[0:5] = 0.001   # MINE first — blocked (not aligner's job)
 
+        # Scout: epistemic agent — EXPLORE and DEFEND only.
+        # Flat C makes epistemic term dominate EFE; E biases toward
+        # exploration policies as a precision gate.
+        E_scout[15:20] = 4.0     # EXPLORE first — core scout role
+        E_scout[20:25] = 2.0     # DEFEND — secondary (hold territory)
+        E_scout[0:5] = 0.001     # MINE first — blocked
+        E_scout[5:10] = 0.001    # CRAFT first — blocked
+        E_scout[10:15] = 0.001   # CAPTURE first — blocked
+
         E_miner /= E_miner.sum()
         E_aligner /= E_aligner.sum()
+        E_scout /= E_scout.sum()
 
+        E_map = {"miner": E_miner, "aligner": E_aligner, "scout": E_scout}
         E_batched = []
         for i in range(n_agents):
-            e = E_miner if i % 2 == 0 else E_aligner
-            E_batched.append(e)
+            role = _agent_role(i, n_agents)
+            E_batched.append(E_map[role])
         E_batched = jnp.array(np.stack(E_batched))
 
         agent = eqx.tree_at(lambda a: a.E, agent, E_batched)

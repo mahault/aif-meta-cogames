@@ -96,20 +96,25 @@ def inner_loop(theta, support_data, steps):
 
 ## AIF Agent
 
-### Phase 3b (Current): Full 216-State Discrete AIF Agent
+### Phase 3b (Current): Deep AIF v9.6 — 288-State with Two Nested POMDPs
 
-#### State Space (216 states = phase × hand × target_mode × role)
+#### State Space (288 states = phase × hand × target_mode × role)
 
 ```
 phase(6):        EXPLORE, MINE, DEPOSIT, CRAFT, GEAR, CAPTURE
-hand(3):         EMPTY, HOLDING_RESOURCE, HOLDING_GEAR
+hand(4):         EMPTY, HOLDING_RESOURCE, HOLDING_GEAR, HOLDING_BOTH
 target_mode(3):  FREE, CONTESTED, LOST
 role(4):         GATHERER, CRAFTER, CAPTURER, SUPPORT
 ```
 
+**HOLDING_BOTH** (v9.6): CogsGuard uses bag-based inventory — agents hold gear AND
+resources simultaneously. MINE with gear → HOLDING_BOTH. DEPOSIT with HOLDING_BOTH
+→ HOLDING_GEAR (resources deposited, gear stays). CAPTURE with HOLDING_BOTH →
+HOLDING_RESOURCE (gear consumed, resources stay).
+
 All four factors are meaningful because the POMDP action space is task-level
 policies (not primitive movements), making B matrices action-dependent:
-- **phase × hand**: Economy-chain progress
+- **phase × hand**: Economy-chain progress — HOLDING_BOTH enables natural gear+resource co-holding
 - **target_mode**: Junction contest status — affects EFE for CAPTURE vs YIELD
 - **role**: Agent specialisation — affects which task policies are preferred via C
 
@@ -149,7 +154,7 @@ Task-level policies abstract over spatial movement, producing action-dependent B
 |----------|-----|--------|-----------|
 | o_resource | 3 | tag tokens (extractor proximity) | phase |
 | o_station | 4 | tag tokens (hub/craft/junction) | phase |
-| o_inventory | 3 | global inventory tokens | hand |
+| o_inventory | 4 | global inventory tokens (EMPTY/RESOURCE/GEAR/BOTH) | hand |
 | o_contest | 3 | junction + agent:group tokens | target_mode |
 | o_social | 4 | agent:group spatial tokens | weakly informative |
 | o_role_signal | 2 | vibe tokens | role |
@@ -163,14 +168,23 @@ ObservationDiscretizer
         ↓
 (o_res, o_sta, o_inv, o_contest, o_social, o_role) — 6 discrete modalities
         ↓
-pymdp.Agent (JAX, equinox Module)
-  ├── infer_states() → posterior beliefs over 216 states
-  ├── infer_policies() → EFE over 13 task policies
-  └── update_empirical_prior() → state prediction for next step
+Level 2: Strategic POMDP (288 states, 5 macro-options)
+  ├── pymdp.Agent (JAX, equinox Module, batch_size=8)
+  ├── infer_states() → posterior beliefs over 288 states
+  ├── infer_policies() → EFE over 5 macro-options (25 two-step policies)
+  └── update_empirical_prior() → state prediction
         ↓
-Task policy selection (argmax EFE)
+Level 1: OptionExecutor (reactive state machines)
+  ├── mine_cycle, craft_cycle, capture_cycle, explore, wait
+  ├── Role filter: miners≠CRAFT/CAPTURE, aligners≠MINE
+  └── EFE-optimal element selection (Level 0.5)
         ↓
-Navigator: task policy → primitive movement action
+Level 0: Navigation POMDP (16 states, 5 actions)
+  ├── Online B-learning via Dirichlet updates
+  ├── Frontier exploration for unknown areas
+  └── SharedSpatialMemory (belief sharing)
+        ↓
+Primitive movement action
 ```
 
 #### EFE Decomposition
@@ -189,22 +203,22 @@ observations → different risk and information gain → meaningful policy selec
 
 #### Matrices
 
-**A** (observation likelihood): 6 matrices, each `(n_obs_m, 216)`.
-Hand-crafted defaults encode factor-observation dependencies:
-- A[inventory] near-deterministic from hand
+**A** (observation likelihood): 6 matrices with A_dependencies `[[0], [0], [1], [2], [3, 2], [3]]`.
+- A[inventory] `(4, 4)`: near-deterministic from hand (HOLDING_BOTH → HAS_BOTH)
 - A[contest] near-deterministic from target_mode
 - A[resource/station] depend on phase
 
-**B** (transition): `(216, 216, 13)`. Hand-crafted defaults, MAML-refinable.
-Each task policy column encodes expected state transitions.
-Role factor: self-transition (doesn't change within episode).
-Target_mode: changes based on capture/contest outcomes.
+**B** (transition): Factored with B_dependencies `[[0, 1], [0, 1], [2], [3]]`.
+- B[phase] `(6, 6, 4, 5)`: phase transitions coupled with hand state
+- B[hand] `(4, 6, 4, 5)`: hand transitions coupled with phase
+- HOLDING_BOTH cases: MINE+GEAR→BOTH, DEPOSIT+BOTH→GEAR, CAPTURE+BOTH→RESOURCE
 
-**C** (preferences): 6 vectors.
-- Prefer: AT resource, JUNCTION station, HAS_GEAR inventory, FREE contest, ALLY_NEAR
+**C** (preferences): 6 vectors, role-dependent.
+- o_inventory: `[EMPTY=-2, RESOURCE=4, GEAR=-2, BOTH=1]` (miner), `[-1, -1, 5, 2]` (aligner)
+- Prefer: AT resource, JUNCTION station, FREE contest, ALLY_NEAR
 - Avoid: LOST contest, ENEMY_NEAR
 
-**D** (prior): `(216,)`. Peak at EXPLORE/EMPTY/FREE/GATHERER.
+**D** (prior): `(288,)`. Peak at EXPLORE/EMPTY/FREE/GATHERER.
 
 #### MAML Target
 
@@ -212,7 +226,7 @@ For meta-learning (Luca's Phase 2):
 - A/B matrices are the meta-learning parameters
 - Inner loop: fit A/B from 2-3 episodes of a new variant via MLE + Dirichlet smoothing
 - Outer loop: learn initialization θ* that minimizes post-adaptation loss across variants
-- B matrix has 606K entries but is block-sparse (most transitions are within-factor)
+- B matrices are factored (phase/hand coupled, target_mode/role independent) — sparse and structured
 
 ### Phase 4 (NEXT): Neural AIF + Meta-Learned World Model
 

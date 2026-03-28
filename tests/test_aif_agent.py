@@ -153,10 +153,10 @@ def disc():
 class TestDimensions:
     def test_state_dimensions(self):
         assert NUM_PHASES == 6
-        assert NUM_HANDS == 3
+        assert NUM_HANDS == 4
         assert NUM_TARGET_MODES == 3
         assert NUM_ROLES == 4
-        assert NUM_STATES == 216  # 6 * 3 * 3 * 4
+        assert NUM_STATES == 288  # 6 * 4 * 3 * 4
 
     def test_action_dimensions(self):
         assert NUM_TASK_POLICIES == 13
@@ -165,7 +165,7 @@ class TestDimensions:
 
     def test_obs_dimensions(self):
         assert len(NUM_OBS) == 6
-        assert NUM_OBS == [3, 4, 3, 3, 4, 2]
+        assert NUM_OBS == [3, 4, 4, 3, 4, 2]
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +296,7 @@ class TestHandInference:
         obs = _empty_obs()
         obs[0] = [LOC_GLOBAL, 30, 5]   # carbon
         obs[1] = [LOC_GLOBAL, 39, 1]   # aligner gear
-        assert disc.infer_hand(obs) == Hand.HOLDING_GEAR
+        assert disc.infer_hand(obs) == Hand.HOLDING_BOTH
 
     def test_zero_value_ignored(self, disc):
         obs = _obs_with_inventory(30, 0)  # inv:carbon = 0 (empty)
@@ -415,7 +415,7 @@ class TestGenerativeModel:
         expected_shapes = [
             (3, 6),       # resource depends on phase
             (4, 6),       # station depends on phase
-            (3, 3),       # inventory depends on hand
+            (4, 4),       # inventory depends on hand
             (3, 3),       # contest depends on target_mode
             (4, 4, 3),   # social depends on role, target_mode
             (2, 4),       # role_signal depends on role
@@ -436,8 +436,8 @@ class TestGenerativeModel:
         assert len(B) == 4  # 4 state factors
         # B[f] shape: (n_states_f', *dep_dims, n_actions)
         expected_shapes = [
-            (6, 6, 3, 13),   # phase: (p', p, h, actions)
-            (3, 6, 3, 13),   # hand: (h', p, h, actions)
+            (6, 6, 4, 13),   # phase: (p', p, h, actions)
+            (4, 6, 4, 13),   # hand: (h', p, h, actions)
             (3, 3, 13),      # target: (t', t, actions)
             (4, 4, 13),      # role: (r', r, actions)
         ]
@@ -553,7 +553,7 @@ class TestCogsGuardPOMDP:
     def test_summary(self):
         model = CogsGuardPOMDP()
         text = model.summary()
-        assert "216" in text
+        assert "288" in text
         assert "factored" in text.lower()
         assert "13" in text
 
@@ -584,8 +584,8 @@ class TestOptionB:
     def test_shapes(self):
         B = build_option_B()
         assert len(B) == 4
-        assert B[0].shape == (6, 6, 3, 5)   # phase: (p', p, h, options)
-        assert B[1].shape == (3, 6, 3, 5)   # hand: (h', p, h, options)
+        assert B[0].shape == (6, 6, 4, 5)   # phase: (p', p, h, options)
+        assert B[1].shape == (4, 6, 4, 5)   # hand: (h', p, h, options)
         assert B[2].shape == (3, 3, 5)       # target: (t', t, options)
         assert B[3].shape == (4, 4, 5)       # role: (r', r, options)
 
@@ -641,8 +641,8 @@ class TestStrategicAgent:
         assert len(agent.A) == 6
         assert len(agent.B) == 4
         # B shapes: (batch, n_states_f', *dep_dims, n_controls_f=5)
-        assert agent.B[0].shape == (8, 6, 6, 3, 5)
-        assert agent.B[1].shape == (8, 3, 6, 3, 5)
+        assert agent.B[0].shape == (8, 6, 6, 4, 5)
+        assert agent.B[1].shape == (8, 4, 6, 4, 5)
         assert agent.B[2].shape == (8, 3, 3, 5)
         assert agent.B[3].shape == (8, 4, 4, 5)
         # 25 policies (5^2)
@@ -661,3 +661,54 @@ class TestStrategicAgent:
         # All factors share same action (constrained)
         assert int(action[0, 0]) == int(action[0, 1])
         assert 0 <= int(action[0, 0]) < 5
+
+
+# ---------------------------------------------------------------------------
+# v9.7: Scout C-vector, role assignment, E-vector
+# ---------------------------------------------------------------------------
+
+from aif_meta_cogames.aif_agent.generative_model import (
+    _agent_role,
+    build_C_scout,
+)
+
+
+class TestScoutCVector:
+    """Test that scout C-vector is near-uniform (epistemic dominance)."""
+
+    def test_c_scout_near_uniform(self):
+        """Scout C-vector entries should have small range (<0.5 per modality)."""
+        C = build_C_scout()
+        for i, c in enumerate(C):
+            c_range = float(c.max() - c.min())
+            assert c_range < 0.5, (
+                f"C[{i}] range={c_range:.2f} — too large for epistemic dominance"
+            )
+
+
+@pytest.mark.skipif(not HAS_PYMDP, reason="pymdp (JAX) not installed")
+class TestScoutStrategicAgent:
+    """Test scout integration in batched strategic agent."""
+
+    def test_agent_role_assignment(self):
+        """Verify 4M/3A/1S split for 8 agents."""
+        roles = [_agent_role(i, 8) for i in range(8)]
+        assert roles == [
+            "miner", "aligner", "miner", "aligner",
+            "miner", "aligner", "miner", "scout",
+        ]
+
+    def test_scout_E_vector(self):
+        """Scout agent E-vector should bias toward EXPLORE/DEFEND."""
+        agent = CogsGuardPOMDP.create_strategic_agent(n_agents=8, policy_len=2)
+        # Agent 7 = scout, check E-vector
+        E = agent.E
+        assert E is not None
+        scout_E = np.asarray(E[7])
+        # EXPLORE policies (indices 15-19) should have highest values
+        explore_vals = scout_E[15:20]
+        mine_vals = scout_E[0:5]
+        assert explore_vals.min() > mine_vals.max(), (
+            f"Scout EXPLORE E ({explore_vals.min():.3f}) should exceed "
+            f"MINE E ({mine_vals.max():.3f})"
+        )

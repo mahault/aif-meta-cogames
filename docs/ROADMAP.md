@@ -117,58 +117,53 @@ The v1 prototype mapped the POMDP action space to 5 primitive movement actions (
 
 ---
 
-## Phase 3b: Discrete AIF Agent — Full 216-State Design (Current) — IN PROGRESS
+## Phase 3b: Discrete AIF Agent — Deep AIF v9.6 (288-State, Two Nested POMDPs) — IN PROGRESS
 
-**Lead**: Mahault | **Target**: 2026-03-20
+**Lead**: Mahault | **Started**: 2026-03-19
 
-### Core Fix: Task-Level Policies as POMDP Actions
+### Core Architecture: Two Nested POMDPs + Shared Beliefs
 
-The POMDP action space is changed from 5 primitive movements to **13 task-level policies**. Each task policy has distinct B matrix transitions, giving pymdp meaningful EFE differences for planning. A navigator then executes the selected task policy spatially.
+**Level 2** (Strategic POMDP): 288-state factored POMDP with 5 macro-options (25 two-step policies). Replans at option termination (~42ms).
+**Level 1** (OptionExecutor): Reactive state machines with role filter (miners≠CRAFT/CAPTURE, aligners≠MINE).
+**Level 0.5** (EFE Goal Generation): G(e)=D_KL(Q(res|mine_e)||C_uniform) — scarcest element = lowest EFE.
+**Level 0** (Navigation POMDP): 16-state, 5 relative actions, 25 two-step policies, online B-learning (~3-5ms/step).
 
 | Task | Description | Status |
 |------|-------------|--------|
-| Task-level action space | 13 policies: NAV_RESOURCE, MINE, NAV_DEPOT, DEPOSIT, NAV_CRAFT, CRAFT, NAV_GEAR, ACQUIRE_GEAR, NAV_JUNCTION, CAPTURE, EXPLORE, YIELD, WAIT | In Progress |
-| 216-state space | phase(6) × hand(3) × target_mode(3) × role(4) = 216 | In Progress |
-| 6 observation modalities | resource, station, inventory + contest, social, role_signal | In Progress |
-| Action-dependent B matrices | Hand-crafted B[216, 216, 13] with distinct transitions per task policy | TODO |
-| Task-policy inference | Map trajectory (state_t → state_{t+1}) to task-level policy labels for fitting | TODO |
-| pymdp task-policy dispatch | `infer_policies()` over 13 tasks → navigator executes selected task | TODO |
-| Updated tests | 216 states, 13 actions, 6 modalities, 4-factor indexing | TODO |
-| Commit and push | Push to GitHub for Luca's MAML work | TODO |
+| Task-level action space | 13 policies → 5 macro-options (mine_cycle, craft_cycle, capture_cycle, explore, wait) | Done |
+| 288-state space | phase(6) × hand(4) × target_mode(3) × role(4) = 288 | Done |
+| 6 observation modalities | resource, station, inventory(4), contest, social, role_signal | Done |
+| Action-dependent B matrices | Hand-crafted B with distinct transitions per macro-option | Done |
+| Navigation POMDP | 16-state nav with B-learning, frontier exploration | Done |
+| SharedSpatialMemory | Belief sharing (Catal et al. 2024) — agents share station/wall observations | Done |
+| Element-typed world model | `extractor:carbon`, `extractor:silicon` etc. + EFE element selection | Done |
+| HOLDING_BOTH (v9.6) | 4-state hand: EMPTY, HOLDING_RESOURCE, HOLDING_GEAR, HOLDING_BOTH | Done |
+| Tests | 170 tests pass, mock eval: 8 captures/500 steps | Done |
+| AWS eval | Deploy v9.6 and run 3-episode eval on arena | TODO |
 
-### State Space (216 states)
+### State Space (288 states)
 
 ```
 phase(6):        EXPLORE, MINE, DEPOSIT, CRAFT, GEAR, CAPTURE
-hand(3):         EMPTY, HOLDING_RESOURCE, HOLDING_GEAR
+hand(4):         EMPTY, HOLDING_RESOURCE, HOLDING_GEAR, HOLDING_BOTH
 target_mode(3):  FREE, CONTESTED, LOST
 role(4):         GATHERER, CRAFTER, CAPTURER, SUPPORT
 ```
 
 With action-dependent B matrices, all four factors are meaningful:
-- **phase × hand**: Economy-chain progress (same as v1)
+- **phase × hand**: Economy-chain progress — HOLDING_BOTH enables gear+resource co-holding
 - **target_mode**: Junction contest status — affects EFE for CAPTURE vs YIELD
-- **role**: Agent specialisation — affects which task policies are preferred
+- **role**: Agent specialisation — affects which task policies are preferred via C
 
-### Action Space (13 task-level policies)
+### Action Space (5 macro-options, resolved to 13 task policies)
 
-Each task policy maps to a different B matrix column:
-
-| Policy | What it does | Key B transition |
-|--------|-------------|-----------------|
-| NAV_RESOURCE | Navigate to extractor | EXPLORE → MINE |
-| MINE | Extract resources | hand → HOLDING_RESOURCE |
-| NAV_DEPOT | Navigate to hub | → DEPOSIT phase |
-| DEPOSIT | Deposit at hub | hand → EMPTY |
-| NAV_CRAFT | Navigate to craft station | → CRAFT phase |
-| CRAFT | Craft gear | hand → HOLDING_GEAR |
-| NAV_GEAR | Navigate to gear pickup | → GEAR phase |
-| ACQUIRE_GEAR | Pick up gear | hand → HOLDING_GEAR |
-| NAV_JUNCTION | Navigate to junction | → CAPTURE phase |
-| CAPTURE | Capture junction | cycle resets to EXPLORE |
-| EXPLORE | Random exploration | self-transition |
-| YIELD | Give way to teammate | self-transition |
-| WAIT | Wait / noop | self-transition |
+| Macro-Option | OptionExecutor Steps | Key Transitions |
+|-------------|---------------------|-----------------|
+| MINE_CYCLE | NAV_RESOURCE → MINE → NAV_DEPOT → DEPOSIT | hand: EMPTY → RESOURCE → BOTH(if gear) → EMPTY/GEAR |
+| CRAFT_CYCLE | NAV_CRAFT → CRAFT → NAV_GEAR → ACQUIRE_GEAR | hand: EMPTY → GEAR, RESOURCE → BOTH |
+| CAPTURE_CYCLE | NAV_JUNCTION → CAPTURE | hand: GEAR → EMPTY, BOTH → RESOURCE |
+| EXPLORE | Frontier exploration via nav POMDP | Epistemic foraging |
+| WAIT | Noop | Self-transition |
 
 ### Observation Modalities (6)
 
@@ -176,7 +171,7 @@ Each task policy maps to a different B matrix column:
 |----------|--------|--------|
 | o_resource(3) | NONE, NEAR, AT | extractor tag proximity |
 | o_station(4) | NONE, HUB, CRAFT, JUNCTION | station tag proximity |
-| o_inventory(3) | EMPTY, HAS_RESOURCE, HAS_GEAR | global inventory tokens |
+| o_inventory(4) | EMPTY, HAS_RESOURCE, HAS_GEAR, HAS_BOTH | global inventory tokens |
 | o_contest(3) | FREE, CONTESTED, LOST | junction + agent:group tokens |
 | o_social(4) | ALONE, ALLY_NEAR, ENEMY_NEAR, BOTH | agent:group tokens |
 | o_role_signal(2) | SAME_ROLE, DIFFERENT_ROLE | vibe tokens |
@@ -205,11 +200,11 @@ Observation → Discretizer → 6 modalities
 
 ### MAML Integration (for Luca)
 
-The A/B matrices at 216 states are the meta-learning target:
+The A/B matrices at 288 states are the meta-learning target:
 - **Inner loop**: Fit A/B from 2-3 episodes of a new variant
 - **Outer loop**: Learn initialization that adapts fastest across variants
 - **Task distribution**: 36 CogsGuard variants (30 train / 6 test)
-- B matrix: 216 × 216 × 13 = 606K entries — sparse but structured
+- B matrix: factored as phase(6×6×4×5), hand(4×6×4×5), target_mode(3×3×5), role(4×4×5) — sparse but structured
 - More trajectory data can be collected as needed
 
 ---

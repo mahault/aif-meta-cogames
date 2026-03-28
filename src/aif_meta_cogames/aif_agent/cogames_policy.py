@@ -1,7 +1,7 @@
 """Live CogsGuard policy using deep active inference (two nested POMDPs).
 
 Architecture (deep AIF with nested generative models):
-- **Level 2**: Strategic POMDP (216 states, 5 macro-options, replans every
+- **Level 2**: Strategic POMDP (288 states, 5 macro-options, replans every
   ~30-80 steps). Decides WHAT to do via Expected Free Energy (EFE).
 - **Level 1**: OptionExecutor (reactive state machines) maps option + obs ->
   task policy (~0ms).
@@ -51,7 +51,7 @@ from .discretizer import (
     TaskPolicy,
     state_factors,
 )
-from .generative_model import CogsGuardPOMDP, create_nav_agent
+from .generative_model import CogsGuardPOMDP, _agent_role, create_nav_agent
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -84,6 +84,11 @@ class SpatialMemory:
     Tracks absolute position (from lp:* observation tokens), walls,
     stations, and explored territory.  Enables navigating toward
     remembered targets when they're outside the 13x13 observation window.
+
+    Positions are stored in **spawn-relative** coordinates (per-agent frame).
+    The ``hub_offset`` records the hub's position in this frame, enabling
+    conversion to a **hub-relative** shared frame via ``to_shared()`` /
+    ``from_shared()``.
     """
 
     def __init__(self):
@@ -92,6 +97,8 @@ class SpatialMemory:
         self.stations: dict[tuple[int, int], str] = {}
         self.explored: set[tuple[int, int]] = set()
         self.position_history: list[tuple[int, int]] = []
+        # Hub position in this agent's spawn-relative frame
+        self.hub_offset: Optional[tuple[int, int]] = None
 
     def update(self, obs: Any, center: tuple[int, int],
                wall_tag_ids: set[int], station_tag_map: dict[int, str]):
@@ -133,13 +140,30 @@ class SpatialMemory:
             if val in wall_tag_ids:
                 self.walls.add(abs_pos)
             elif val in station_tag_map:
-                self.stations[abs_pos] = station_tag_map[val]
+                cat = station_tag_map[val]
+                self.stations[abs_pos] = cat
+                # Record hub position for coordinate frame conversion
+                if cat == "hub" and self.hub_offset is None:
+                    self.hub_offset = abs_pos
 
         # 3. Mark observed area as explored
         for dr in range(-cr, cr + 1):
             for dc in range(-cc, cc + 1):
                 self.explored.add((self.position[0] + dr,
                                    self.position[1] + dc))
+
+    def to_shared(self, pos: tuple[int, int]) -> Optional[tuple[int, int]]:
+        """Convert spawn-relative position to hub-relative (shared frame)."""
+        if self.hub_offset is None:
+            return None
+        return (pos[0] - self.hub_offset[0], pos[1] - self.hub_offset[1])
+
+    def from_shared(self, shared_pos: tuple[int, int]) -> Optional[tuple[int, int]]:
+        """Convert hub-relative (shared frame) position to spawn-relative."""
+        if self.hub_offset is None:
+            return None
+        return (shared_pos[0] + self.hub_offset[0],
+                shared_pos[1] + self.hub_offset[1])
 
     def is_wall_adjacent(self, direction: str) -> bool:
         """Check if moving in direction hits a known wall."""
@@ -178,8 +202,12 @@ class SharedSpatialMemory:
 
     Following Catal, Van de Maele, ..., Albarracin et al. (2024) "Belief
     sharing: a blessing or a curse": agent factual observations (station
-    locations, walls) are shared as a social observation modality.  Each
-    agent's spatial discoveries propagate to all other agents.
+    locations) are shared as a social observation modality.  Each agent's
+    spatial discoveries propagate to all other agents.
+
+    All positions are stored in **hub-relative** coordinates (hub = origin).
+    Each agent converts to/from its own spawn-relative frame via
+    ``SpatialMemory.to_shared()`` / ``from_shared()``.
 
     Shares ground-truth observations (not posterior beliefs) to avoid echo
     chambers.  Agents maintain independent beliefs about what to DO.
@@ -187,28 +215,67 @@ class SharedSpatialMemory:
 
     def __init__(self):
         self.stations: dict[tuple[int, int], str] = {}
-        self.walls: set[tuple[int, int]] = set()
         self.explored: set[tuple[int, int]] = set()
 
     def contribute(self, agent_memory: SpatialMemory):
-        """Merge one agent's factual observations into the shared pool."""
-        self.stations.update(agent_memory.stations)
-        self.walls.update(agent_memory.walls)
-        self.explored.update(agent_memory.explored)
+        """Merge one agent's station discoveries into the shared pool.
+
+        Converts from agent's spawn-relative frame to hub-relative.
+        Skips contribution if the agent hasn't discovered the hub yet
+        (no coordinate frame available).
+        """
+        if agent_memory.hub_offset is None:
+            return  # can't convert without knowing hub position
+        for pos, cat in agent_memory.stations.items():
+            shared_pos = agent_memory.to_shared(pos)
+            if shared_pos is not None:
+                self.stations[shared_pos] = cat
+        # Share explored cells in hub-relative coords
+        for pos in agent_memory.explored:
+            shared_pos = agent_memory.to_shared(pos)
+            if shared_pos is not None:
+                self.explored.add(shared_pos)
 
     def find_nearest_station(
         self, category: str, position: tuple[int, int]
     ) -> Optional[tuple[int, int]]:
-        """Find nearest station of given category from shared knowledge."""
+        """Find nearest station from shared knowledge.
+
+        Both ``position`` and the returned position are in hub-relative
+        coordinates.  The caller must convert using ``SpatialMemory``
+        ``to_shared()`` / ``from_shared()``.
+        """
         best, best_dist = None, float("inf")
         for pos, cat in self.stations.items():
-            if cat != category:
+            if cat != category and not (
+                category == "extractor" and cat.startswith("extractor")
+            ):
                 continue
             dist = abs(pos[0] - position[0]) + abs(pos[1] - position[1])
             if dist < best_dist:
                 best_dist = dist
                 best = pos
         return best
+
+    def find_least_explored_direction(
+        self, position: tuple[int, int], radius: int = 15
+    ) -> Optional[tuple[int, int]]:
+        """Find target in the least-explored cardinal direction.
+
+        For scouts: navigate toward the area with the most unexplored
+        cells (maximum epistemic value / information gain).
+        """
+        best_target, best_unexplored = None, 0
+        for dr, dc in [(-radius, 0), (radius, 0), (0, -radius), (0, radius)]:
+            target = (position[0] + dr, position[1] + dc)
+            unexplored = sum(
+                1 for r in range(-3, 4) for c in range(-3, 4)
+                if (target[0] + r, target[1] + c) not in self.explored
+            )
+            if unexplored > best_unexplored:
+                best_unexplored = unexplored
+                best_target = target
+        return best_target
 
 
 # ---------------------------------------------------------------------------
@@ -356,8 +423,10 @@ class OptionExecutor:
     def __init__(self, n_agents: int):
         self.n_agents = n_agents
         self.states = [OptionState() for _ in range(n_agents)]
-        # Role: even=miner, odd=aligner
-        self._is_aligner = [i % 2 == 1 for i in range(n_agents)]
+        # Roles: 4 miners (even), 3 aligners (odd<7), 1 scout (agent 7)
+        self._role = [_agent_role(i, n_agents) for i in range(n_agents)]
+        self._is_aligner = [r == "aligner" for r in self._role]
+        self._is_scout = [r == "scout" for r in self._role]
 
     def get_task_policy(self, agent_id: int, obs_ints: list[int]) -> int:
         """Map current option + observation -> task policy."""
@@ -396,27 +465,33 @@ class OptionExecutor:
         o_contest = obs_ints[3]
 
         if option == MacroOption.MINE_CYCLE:
-            # Deposit complete: had resource, now empty
-            if st.prev_inv == ObsInventory.HAS_RESOURCE and o_inv == ObsInventory.EMPTY:
+            # Deposit complete: had resource (or both), now empty (or gear only)
+            if (st.prev_inv in (ObsInventory.HAS_RESOURCE, ObsInventory.HAS_BOTH)
+                    and o_inv in (ObsInventory.EMPTY, ObsInventory.HAS_GEAR)):
                 return True
         elif option == MacroOption.CRAFT_CYCLE:
             # Gear acquired
-            if o_inv == ObsInventory.HAS_GEAR:
+            if o_inv in (ObsInventory.HAS_GEAR, ObsInventory.HAS_BOTH):
                 return True
         elif option == MacroOption.CAPTURE_CYCLE:
-            # Gear used (had gear, now empty)
-            if st.prev_inv == ObsInventory.HAS_GEAR and o_inv != ObsInventory.HAS_GEAR:
+            # Gear used (had gear/both, now no gear)
+            if (st.prev_inv in (ObsInventory.HAS_GEAR, ObsInventory.HAS_BOTH)
+                    and o_inv not in (ObsInventory.HAS_GEAR, ObsInventory.HAS_BOTH)):
                 return True
             # Started without gear -- bail after grace period
-            if o_inv != ObsInventory.HAS_GEAR and st.steps_in_option > 5:
+            if o_inv not in (ObsInventory.HAS_GEAR, ObsInventory.HAS_BOTH) and st.steps_in_option > 5:
                 return True
         elif option == MacroOption.EXPLORE:
-            # Miners: any resource or station ends exploration
-            # Aligners: only craft/junction (hub is useless for exploration)
-            if self._is_aligner[agent_id]:
+            # Scouts: never self-terminate on station (only timeout)
+            # — epistemic agent explores continuously
+            if self._is_scout[agent_id]:
+                pass
+            elif self._is_aligner[agent_id]:
+                # Aligners: only craft/junction (hub is useless)
                 if o_sta >= ObsStation.CRAFT:
                     return True
             else:
+                # Miners: any resource or station ends exploration
                 if o_res >= ObsResource.AT or o_sta > ObsStation.NONE:
                     return True
         elif option == MacroOption.DEFEND:
@@ -437,10 +512,20 @@ class OptionExecutor:
         miners cannot initiate CRAFT/CAPTURE, aligners cannot initiate MINE.
         If a disallowed option is selected, fall back to role-appropriate default.
         """
-        # Role filter: restrict option initiation by role
-        if self._is_aligner[agent_id]:
-            if option == MacroOption.MINE_CYCLE:
+        # Role filter: restrict option initiation by role (precision gate)
+        if self._is_scout[agent_id]:
+            # Scout: only EXPLORE/DEFEND allowed (epistemic initiation set)
+            if option not in (MacroOption.EXPLORE, MacroOption.DEFEND):
                 option = MacroOption.EXPLORE
+        elif self._is_aligner[agent_id]:
+            if option == MacroOption.MINE_CYCLE:
+                # Redirect to next-best from aligner initiation set
+                # (not EXPLORE — that was causing the stuck loop)
+                inv = self.states[agent_id].prev_inv
+                if inv in (ObsInventory.HAS_GEAR, ObsInventory.HAS_BOTH):
+                    option = MacroOption.CAPTURE_CYCLE
+                else:
+                    option = MacroOption.CRAFT_CYCLE
         else:  # miner
             if option in (MacroOption.CRAFT_CYCLE, MacroOption.CAPTURE_CYCLE):
                 option = MacroOption.MINE_CYCLE
@@ -463,7 +548,7 @@ class OptionExecutor:
     @staticmethod
     def _mine_cycle(o_res, o_sta, o_inv):
         """MINE_CYCLE: NAV_RESOURCE until pickup -> NAV_DEPOT until deposit."""
-        if o_inv == ObsInventory.HAS_RESOURCE:
+        if o_inv in (ObsInventory.HAS_RESOURCE, ObsInventory.HAS_BOTH):
             return TaskPolicy.NAV_DEPOT  # Navigate to hub (auto-deposits at dist=0)
         # Keep navigating to extractor — auto-extracts at dist=0 (noop via dr==dc==0)
         return TaskPolicy.NAV_RESOURCE
@@ -475,8 +560,8 @@ class OptionExecutor:
         Aligners need hearts from the hub before crafting. Bumping a craft
         station without hearts does nothing.
         """
-        if o_inv == ObsInventory.HAS_GEAR:
-            return TaskPolicy.WAIT
+        if o_inv in (ObsInventory.HAS_GEAR, ObsInventory.HAS_BOTH):
+            return TaskPolicy.WAIT  # Already has gear
         if o_inv == ObsInventory.HAS_RESOURCE:
             return TaskPolicy.NAV_CRAFT  # Have hearts, go craft gear
         return TaskPolicy.NAV_DEPOT  # Need hearts from hub first
@@ -484,7 +569,7 @@ class OptionExecutor:
     @staticmethod
     def _capture_cycle(o_sta, o_inv):
         """CAPTURE_CYCLE: requires gear, NAV_JUNCTION (auto-captures at dist=0)."""
-        if o_inv != ObsInventory.HAS_GEAR:
+        if o_inv not in (ObsInventory.HAS_GEAR, ObsInventory.HAS_BOTH):
             return TaskPolicy.WAIT
         return TaskPolicy.NAV_JUNCTION  # Navigate to junction (auto-captures at dist=0)
 
@@ -702,6 +787,12 @@ class BatchedAIFEngine:
             opt_steps = [self.option_executor.states[i].steps_in_option
                         for i in range(self.n_agents)]
             extras.append(f"opt_steps={opt_steps}")
+            extras.append(f"shared_stations={len(self.shared_memory.stations)}")
+            # Count unique shared station categories
+            shared_cats: dict[str, int] = {}
+            for _p, _c in self.shared_memory.stations.items():
+                shared_cats[_c] = shared_cats.get(_c, 0) + 1
+            extras.append(f"shared_cats={shared_cats}")
             extra_str = f", {', '.join(extras)}" if extras else ""
             print(f"[AIF step={self._step_count}] options={option_names}")
             print(f"  tasks={task_names}{extra_str}")
@@ -948,16 +1039,17 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
         # 4. Submit to batched engine -> get task policy (hierarchical)
         task_policy = self._engine.submit_and_get_policy(self._agent_id, jax_obs)
 
-        # 4b. Gear check: override task policy if agent lacks role gear
-        if not state.has_role_gear:
+        # 4b. Gear check: always verify gear each step (handles death/respawn)
+        # Scouts skip — epistemic agent doesn't need role gear
+        role = _agent_role(self._agent_id, self._engine.n_agents)
+        if role != "scout":
             items = self._inventory_amounts(obs)
-            is_aligner = self._agent_id % 2 == 1
-            role_gear = "aligner" if is_aligner else "miner"
+            role_gear = "aligner" if role == "aligner" else "miner"
             if items.get(role_gear, 0) > 0:
                 state.has_role_gear = True
             else:
-                # Navigate to role-specific gear station
-                task_policy = TaskPolicy.NAV_GEAR  # special: gear-up mode
+                state.has_role_gear = False
+                task_policy = TaskPolicy.NAV_GEAR
 
         # 5. Execute selected task policy via navigator
         action, state = self._execute_task_policy(task_policy, obs, state)
@@ -1062,8 +1154,8 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
             tag_ids, category = self._craft_tags, "craft"
         elif task_policy == TaskPolicy.NAV_GEAR:
             # Role-specific gear station
-            is_aligner = self._agent_id % 2 == 1
-            tag_ids = self._aligner_gear_tags if is_aligner else self._miner_gear_tags
+            role = _agent_role(self._agent_id, self._engine.n_agents)
+            tag_ids = self._aligner_gear_tags if role == "aligner" else self._miner_gear_tags
             category = "craft"  # gear stations are categorized as "craft" in spatial memory
         elif task_policy == TaskPolicy.NAV_JUNCTION:
             tag_ids, category = self._junction_tags, "junction"
@@ -1088,11 +1180,16 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
                 return station_pos
 
         # 2b. Try shared spatial memory (belief sharing — Catal et al. 2024)
+        #     Shared memory uses hub-relative coords; convert both ways.
         if mem is not None and mem.position is not None:
             shared = self._engine.shared_memory
-            station_pos = shared.find_nearest_station(category, mem.position)
-            if station_pos is not None:
-                return station_pos
+            shared_pos = mem.to_shared(mem.position)
+            if shared_pos is not None:
+                station_shared = shared.find_nearest_station(category, shared_pos)
+                if station_shared is not None:
+                    station_local = mem.from_shared(station_shared)
+                    if station_local is not None:
+                        return station_local
 
         # 2c. Fallback for NAV_RESOURCE: try any element's extractor
         if task_policy == TaskPolicy.NAV_RESOURCE and mem is not None and mem.position is not None:
@@ -1108,11 +1205,16 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
                 pos = mem.find_nearest_station(cat)
                 if pos is not None:
                     return pos
-                pos = self._engine.shared_memory.find_nearest_station(
-                    cat, mem.position
-                )
-                if pos is not None:
-                    return pos
+                # Shared memory fallback (hub-relative conversion)
+                shared_pos = mem.to_shared(mem.position)
+                if shared_pos is not None:
+                    shared_result = self._engine.shared_memory.find_nearest_station(
+                        cat, shared_pos
+                    )
+                    if shared_result is not None:
+                        local_result = mem.from_shared(shared_result)
+                        if local_result is not None:
+                            return local_result
 
         # 3. Fall back to frontier exploration
         if mem is not None:
@@ -1318,14 +1420,57 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
                 if nb not in mem.explored and nb not in mem.walls:
                     frontiers.add(nb)
 
-        if not frontiers:
+        if frontiers:
+            return min(
+                frontiers,
+                key=lambda f: (abs(f[0] - mem.position[0])
+                               + abs(f[1] - mem.position[1]))
+            )
+
+        # Frontier exhausted → shared memory fallback
+        return self._get_shared_fallback_target(mem)
+
+    def _get_shared_fallback_target(
+        self, mem: SpatialMemory
+    ) -> Optional[tuple[int, int]]:
+        """Role-appropriate fallback when local frontier is exhausted.
+
+        Uses shared spatial memory (social epistemic inference) to find
+        a meaningful target based on role:
+        - Scout: least-explored direction (max epistemic value)
+        - Miner: nearest extractor from shared knowledge
+        - Aligner: nearest craft/junction from shared knowledge
+        """
+        if mem.position is None:
             return None
 
-        return min(
-            frontiers,
-            key=lambda f: (abs(f[0] - mem.position[0])
-                           + abs(f[1] - mem.position[1]))
-        )
+        shared = self._engine.shared_memory
+        shared_pos = mem.to_shared(mem.position)
+        if shared_pos is None:
+            return None
+
+        role = _agent_role(self._agent_id, self._engine.n_agents)
+
+        if role == "scout":
+            # Max epistemic value direction from shared explored cells
+            target_shared = shared.find_least_explored_direction(shared_pos)
+            if target_shared is not None:
+                return mem.from_shared(target_shared)
+        elif role == "miner":
+            # Nearest extractor from shared knowledge
+            for elem in RESOURCE_NAMES:
+                cat = f"extractor:{elem}"
+                station = shared.find_nearest_station(cat, shared_pos)
+                if station is not None:
+                    return mem.from_shared(station)
+        else:  # aligner
+            # Try junction first, then craft station
+            for cat in ("junction", "craft"):
+                station = shared.find_nearest_station(cat, shared_pos)
+                if station is not None:
+                    return mem.from_shared(station)
+
+        return None
 
     def _action(self, name: str) -> _Action:
         """Create Action, falling back to noop if name is unavailable."""
@@ -1341,12 +1486,12 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
 class AIFPolicy(_MultiAgentPolicy):
     """Deep active inference policy for CogsGuard (two nested POMDPs).
 
-    Level 2: Strategic POMDP (216 states, 5 macro-options, ~42ms replan).
+    Level 2: Strategic POMDP (288 states, 5 macro-options, ~42ms replan).
     Level 1: Option state machines map obs -> task policy (~0ms).
     Level 0: Navigation POMDP (16 states, 5 relative actions, ~3-5ms/step).
 
     All 8 agents share one BatchedAIFEngine (JIT-compiled, batched inference).
-    Even agents are miners, odd agents are aligners (per-role C/D vectors).
+    4 miners (even), 3 aligners (odd<7), 1 scout (agent 7).
     """
 
     short_names = ["aif"]
