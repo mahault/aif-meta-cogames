@@ -319,13 +319,9 @@ def _nav_learn_B(agent, beliefs_T2, obs_T2, actions_T1):
     Dirichlet posterior pB.  The expected B matrices are recomputed so
     that future policy evaluation uses the learned dynamics.
     """
+    # Use all positional args: param name is 'outcomes' locally, 'observations' on AWS
     return agent.infer_parameters(
-        beliefs_A=beliefs_T2,
-        outcomes=obs_T2,
-        actions=actions_T1,
-        beliefs_B=beliefs_T2,
-        lr_pA=0.0,
-        lr_pB=1.0,
+        beliefs_T2, obs_T2, actions_T1, beliefs_T2, 0.0, 1.0,
     )
 
 
@@ -815,13 +811,9 @@ class BatchedAIFEngine:
         ]
         actions_T1 = self._prev_actions[:, None, :]
 
+        # Use all positional args: param name differs across pymdp versions
         self.agent = self.agent.infer_parameters(
-            beliefs_A=beliefs_T2,
-            outcomes=obs_T2,
-            actions=actions_T1,
-            beliefs_B=beliefs_T2,
-            lr_pA=0.0,
-            lr_pB=1.0,
+            beliefs_T2, obs_T2, actions_T1, beliefs_T2, 0.0, 1.0,
         )
 
 
