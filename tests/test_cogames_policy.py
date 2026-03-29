@@ -406,18 +406,27 @@ class TestOptionExecutor:
                ObsContest.FREE, 0, 0]
         assert executor.get_task_policy(1, obs) == TaskPolicy.NAV_CRAFT
 
-    def test_capture_cycle_nav_junction(self):
+    def test_capture_cycle_gear_only_gets_hearts(self):
+        """HAS_GEAR only: need hearts first (alignment costs gear + heart)."""
         executor = OptionExecutor(n_agents=2)
         executor.set_option(1, MacroOption.CAPTURE_CYCLE)  # agent 1 = aligner
         obs = [ObsResource.NONE, ObsStation.NONE, ObsInventory.HAS_GEAR,
                ObsContest.FREE, 0, 0]
-        assert executor.get_task_policy(1, obs) == TaskPolicy.NAV_JUNCTION
+        assert executor.get_task_policy(1, obs) == TaskPolicy.NAV_DEPOT
 
-    def test_capture_cycle_nav_junction_at_junction(self):
-        """Even at JUNCTION, use NAV_JUNCTION (auto-captures at dist=0)."""
+    def test_capture_cycle_gear_at_junction_gets_hearts(self):
+        """HAS_GEAR at junction: still need hearts first."""
         executor = OptionExecutor(n_agents=2)
         executor.set_option(1, MacroOption.CAPTURE_CYCLE)  # agent 1 = aligner
         obs = [ObsResource.NONE, ObsStation.JUNCTION, ObsInventory.HAS_GEAR,
+               ObsContest.FREE, 0, 0]
+        assert executor.get_task_policy(1, obs) == TaskPolicy.NAV_DEPOT
+
+    def test_capture_cycle_has_both_goes_to_junction(self):
+        """HAS_BOTH (gear + hearts): ready to capture, go to junction."""
+        executor = OptionExecutor(n_agents=2)
+        executor.set_option(1, MacroOption.CAPTURE_CYCLE)  # agent 1 = aligner
+        obs = [ObsResource.NONE, ObsStation.NONE, ObsInventory.HAS_BOTH,
                ObsContest.FREE, 0, 0]
         assert executor.get_task_policy(1, obs) == TaskPolicy.NAV_JUNCTION
 
@@ -440,6 +449,22 @@ class TestOptionExecutor:
         executor = OptionExecutor(n_agents=1)
         executor.set_option(0, MacroOption.DEFEND)
         obs = [ObsResource.NONE, ObsStation.JUNCTION, ObsInventory.EMPTY,
+               ObsContest.FREE, 0, 0]
+        assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_JUNCTION
+
+    def test_defend_with_gear_gets_hearts_first(self):
+        """DEFEND with HAS_GEAR: need hearts before junction alignment."""
+        executor = OptionExecutor(n_agents=1)
+        executor.set_option(0, MacroOption.DEFEND)
+        obs = [ObsResource.NONE, ObsStation.NONE, ObsInventory.HAS_GEAR,
+               ObsContest.FREE, 0, 0]
+        assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_DEPOT
+
+    def test_defend_with_both_goes_to_junction(self):
+        """DEFEND with HAS_BOTH: has gear + hearts, go defend junction."""
+        executor = OptionExecutor(n_agents=1)
+        executor.set_option(0, MacroOption.DEFEND)
+        obs = [ObsResource.NONE, ObsStation.NONE, ObsInventory.HAS_BOTH,
                ObsContest.FREE, 0, 0]
         assert executor.get_task_policy(0, obs) == TaskPolicy.NAV_JUNCTION
 

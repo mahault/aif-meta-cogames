@@ -152,11 +152,14 @@ def step_env(agent: MockAgent, direction: str) -> dict:
                 agent.inventory[role_gear] = 1
                 info["interaction"] = "craft_gear"
                 agent.just_deposited = False
-        elif station == "junction" and agent.has_gear():
-            # Capture: consume gear
+        elif station == "junction" and agent.has_gear() and agent.has_hearts():
+            # Capture: consume gear AND heart (like real CogsGuard)
             role = _agent_role(agent.agent_id, 2)
             role_gear = "aligner" if role == "aligner" else "miner"
             agent.inventory.pop(role_gear, None)
+            agent.inventory["heart"] = agent.inventory.get("heart", 0) - 1
+            if agent.inventory.get("heart", 0) <= 0:
+                agent.inventory.pop("heart", None)
             info["interaction"] = "capture"
             agent.just_deposited = False
         # Stay at current position (bumped)

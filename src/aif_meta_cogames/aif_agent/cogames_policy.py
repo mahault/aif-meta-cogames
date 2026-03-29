@@ -446,7 +446,7 @@ class OptionExecutor:
         elif option == MacroOption.EXPLORE:
             return TaskPolicy.EXPLORE
         elif option == MacroOption.DEFEND:
-            return self._defend(o_sta)
+            return self._defend(o_sta, o_inv)
         return TaskPolicy.EXPLORE
 
     def check_termination(self, agent_id: int, obs_ints: list[int]) -> bool:
@@ -568,15 +568,24 @@ class OptionExecutor:
 
     @staticmethod
     def _capture_cycle(o_sta, o_inv):
-        """CAPTURE_CYCLE: requires gear, NAV_JUNCTION (auto-captures at dist=0)."""
+        """CAPTURE_CYCLE: get hearts if needed, then navigate to junction.
+
+        Junction alignment costs 1 gear + 1 heart. HAS_GEAR alone means
+        the agent has gear but no hearts — must visit hub first.
+        """
         if o_inv not in (ObsInventory.HAS_GEAR, ObsInventory.HAS_BOTH):
-            return TaskPolicy.WAIT
-        return TaskPolicy.NAV_JUNCTION  # Navigate to junction (auto-captures at dist=0)
+            return TaskPolicy.WAIT  # No gear, bail
+        if o_inv == ObsInventory.HAS_GEAR:
+            return TaskPolicy.NAV_DEPOT  # Get hearts first
+        # HAS_BOTH: has gear + hearts → go capture
+        return TaskPolicy.NAV_JUNCTION
 
     @staticmethod
-    def _defend(o_sta):
-        """DEFEND: go to junction and hold it."""
-        return TaskPolicy.NAV_JUNCTION  # Navigate to junction (auto-captures at dist=0)
+    def _defend(o_sta, o_inv):
+        """DEFEND: go to junction and hold it. Get hearts if has gear only."""
+        if o_inv == ObsInventory.HAS_GEAR:
+            return TaskPolicy.NAV_DEPOT  # Need hearts for alignment
+        return TaskPolicy.NAV_JUNCTION
 
 
 # ---------------------------------------------------------------------------
@@ -1038,18 +1047,6 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
 
         # 4. Submit to batched engine -> get task policy (hierarchical)
         task_policy = self._engine.submit_and_get_policy(self._agent_id, jax_obs)
-
-        # 4b. Gear check: always verify gear each step (handles death/respawn)
-        # Scouts skip — epistemic agent doesn't need role gear
-        role = _agent_role(self._agent_id, self._engine.n_agents)
-        if role != "scout":
-            items = self._inventory_amounts(obs)
-            role_gear = "aligner" if role == "aligner" else "miner"
-            if items.get(role_gear, 0) > 0:
-                state.has_role_gear = True
-            else:
-                state.has_role_gear = False
-                task_policy = TaskPolicy.NAV_GEAR
 
         # 5. Execute selected task policy via navigator
         action, state = self._execute_task_policy(task_policy, obs, state)
