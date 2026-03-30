@@ -629,11 +629,12 @@ class BatchedAIFEngine:
 
     def __init__(self, n_agents: int = 8, learn_B: bool = False,
                  learn_interval: int = 50, policy_len: int = 2,
-                 auto_chain: bool = True):
+                 auto_chain: bool = True, context_E: bool = False):
         self.n_agents = n_agents
         self.learn_B = learn_B
         self.learn_interval = learn_interval
         self.auto_chain = auto_chain
+        self.context_E = context_E
         self._step_count = 0
 
         # Level 2: Strategic agent with 5 macro-options
@@ -720,6 +721,30 @@ class BatchedAIFEngine:
             self.nav_agent, dummy_nav_obs, self.nav_prior, dummy_nav_act
         )
 
+        # Context-dependent E vectors for principled hierarchical AIF.
+        # E(π | context) where context = inventory state.
+        # Higher level (inventory) sets the habit prior for the lower level
+        # (policy selection), modulating which options are favoured.
+        if self.context_E:
+            self._base_E = np.array(self.agent.E)  # (n_agents, 25)
+            n_pol = self._base_E.shape[1]
+            # Aligner contexts: CRAFT-biased (need gear) vs CAPTURE-biased (have gear)
+            self._E_aligner_craft = np.ones(n_pol)
+            self._E_aligner_craft[5:10] = 6.0    # CRAFT first — strong bias
+            self._E_aligner_craft[10:15] = 1.5   # CAPTURE — available but low
+            self._E_aligner_craft[15:20] = 1.5   # EXPLORE — find stations
+            self._E_aligner_craft[20:25] = 1.0   # DEFEND
+            self._E_aligner_craft[0:5] = 0.001   # MINE — blocked
+            self._E_aligner_craft /= self._E_aligner_craft.sum()
+
+            self._E_aligner_capture = np.ones(n_pol)
+            self._E_aligner_capture[10:15] = 6.0  # CAPTURE first — strong bias
+            self._E_aligner_capture[5:10] = 1.5   # CRAFT — fallback
+            self._E_aligner_capture[20:25] = 2.0  # DEFEND — hold junctions
+            self._E_aligner_capture[15:20] = 1.0  # EXPLORE
+            self._E_aligner_capture[0:5] = 0.001  # MINE — blocked
+            self._E_aligner_capture /= self._E_aligner_capture.sum()
+
     def submit_and_get_policy(self, agent_id: int, jax_obs: list) -> int:
         """Store obs for agent_id and return its task policy.
 
@@ -798,7 +823,9 @@ class BatchedAIFEngine:
                 replan_needed = terminated
 
             if replan_needed:
-                options, _q_pi = self._jit_select_option(self.agent, qs)
+                # Context-dependent E: update habit prior based on inventory
+                agent = self._apply_context_E() if self.context_E else self.agent
+                options, _q_pi = self._jit_select_option(agent, qs)
                 for i in replan_needed:
                     new_option = int(options[i])
                     self.option_executor.set_option(i, new_option)
@@ -856,6 +883,28 @@ class BatchedAIFEngine:
     # ------------------------------------------------------------------
     # Aligner auto-chaining (option composition)
     # ------------------------------------------------------------------
+
+    def _apply_context_E(self):
+        """Context-dependent E: update habit prior from inventory state.
+
+        Principled hierarchical AIF: the higher level (inventory observation)
+        sets E(π | context) for the lower level (policy selection).
+
+            context = HAS_BOTH | HAS_GEAR  →  E biased toward CAPTURE
+            context = EMPTY | HAS_RESOURCE →  E biased toward CRAFT
+
+        Returns an updated agent (equinox functional update — immutable).
+        """
+        new_E = np.array(self._base_E)  # (n_agents, 25)
+        for i in range(self.n_agents):
+            if not self.option_executor._is_aligner[i]:
+                continue
+            inv = self._discrete_obs[i][2]
+            if inv in (ObsInventory.HAS_GEAR, ObsInventory.HAS_BOTH):
+                new_E[i] = self._E_aligner_capture
+            else:
+                new_E[i] = self._E_aligner_craft
+        return eqx.tree_at(lambda a: a.E, self.agent, jnp.array(new_E))
 
     def _auto_chain_aligner(self, agent_id: int) -> bool:
         """Auto-chain CRAFT↔CAPTURE for aligners, skipping POMDP replan.

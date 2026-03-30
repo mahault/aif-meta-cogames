@@ -223,7 +223,22 @@ Observation → Discretizer → 6 modalities
 
 **v9.8 analysis**: First junction alignment! Two fixes: (1) CRAFT_CYCLE now uses NAV_GEAR (role-specific station) instead of NAV_CRAFT (any station) — aligners reliably get aligner gear. (2) NAV_JUNCTION now prefers junctions within hub alignment radius (25 tiles). Reward 0.96-1.78 in 2/3 episodes.
 
-**v9.9 analysis**: Junction captures +133% (0.75→1.75). Two fixes: (1) Aligner C vector corrected: c_inv[HAS_BOTH]=5.0 > c_inv[HAS_GEAR]=2.0 (was inverted at 2.0 < 5.0 — penalized capture-ready state). (2) Auto-chain: CRAFT→CAPTURE→CRAFT loop for aligners bypasses POMDP replan between phases. All 5/5 episodes score reward (was 2/3). Machina_1: 0.75j, 0.98 reward. Ablation pending: C-vector-only vs auto-chain contribution.
+**v9.9 analysis**: Junction captures +133% (0.75→1.75). Two fixes: (1) Aligner C vector corrected: c_inv[HAS_BOTH]=5.0 > c_inv[HAS_GEAR]=2.0 (was inverted at 2.0 < 5.0 — penalized capture-ready state). (2) Auto-chain: CRAFT→CAPTURE→CRAFT loop for aligners bypasses POMDP replan between phases. All 5/5 episodes score reward (was 2/3). Machina_1: 0.75j, 0.98 reward.
+
+### Ablation: What Drives Junction Capture?
+
+| Condition | Mechanism | Junctions | Reward | Principled? |
+|-----------|-----------|-----------|--------|-------------|
+| v9.8 baseline | old C (GEAR>BOTH) | 0.75 | 0.91 | yes (wrong C) |
+| **C-only** | **fixed C, static E** | **1.50** | **0.85** | **yes** |
+| C+E | fixed C, context-dep E | 0.50 | 0.35 | yes (E too strong) |
+| v9.9 | fixed C, auto-chain | 1.75 | 1.27 | no (bypasses EFE) |
+
+**Conclusions**:
+- **C-vector correction is the primary driver**: +100% (0.75→1.50), fully principled AIF.
+- **Auto-chain adds marginal +17%** (1.50→1.75) but bypasses `infer_policies()`.
+- **Context-dependent E hurts** (-67%): E bias of ln(6.0/1.5)≈1.4 nats overrides EFE, causing wrong option selection. The static E with CRAFT=CAPTURE=4.0 already provides balanced habit priors; asymmetric context-switching disrupts this.
+- **Recommendation**: Use C-vector fix as the principled baseline. Auto-chain kept as optional pragmatic improvement (`auto_chain=True`). Context-dependent E needs gentler biases or learned (not hand-tuned) values — candidate for meta-learning.
 
 ### MAML Integration (for Luca)
 
