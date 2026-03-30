@@ -670,10 +670,15 @@ def build_C_aligner() -> list[np.ndarray]:
 
     Aligners focus on the hub→craft→junction chain: craft gear at stations,
     then navigate to junctions and capture them. Strongly prefers junctions.
+
+    Inventory preference order: BOTH > GEAR > RESOURCE > EMPTY.
+    HAS_BOTH is the capture-ready state (gear + hearts) and must be the
+    peak preference.  Previous c_inv had HAS_GEAR=5.0 > HAS_BOTH=2.0,
+    which made the EFE penalize capture (it consumes gear → leaves BOTH).
     """
     c_res = np.array([-0.5, 0.0, 0.5])          # penalize NONE
     c_sta = np.array([-1.0, 0.0, 3.0, 7.0])     # JUNCTION strongest, penalize NONE
-    c_inv = np.array([-1.0, -1.0, 5.0, 2.0])    # penalize EMPTY/RESOURCE; BOTH = has gear, can still capture
+    c_inv = np.array([-1.0, 0.0, 2.0, 5.0])     # BOTH peak (capture-ready), GEAR intermediate
     c_con = np.array([2.5, -1.0, -3.0])          # FREE strong, LOST very bad
     c_soc = np.array([0.0, 1.0, -1.0, 0.0])     # prefer allies, avoid enemies
     c_role = np.array([0.3, 0.0])                # SAME_ROLE, DIFFERENT

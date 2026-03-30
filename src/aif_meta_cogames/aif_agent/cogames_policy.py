@@ -172,14 +172,28 @@ class SpatialMemory:
         dr, dc = DIRECTION_DELTAS.get(direction, (0, 0))
         return (self.position[0] + dr, self.position[1] + dc) in self.walls
 
-    def find_nearest_station(self, category: str) -> Optional[tuple[int, int]]:
-        """Find nearest remembered station of given category (absolute pos)."""
+    def find_nearest_station(self, category: str,
+                             ref_pos: Optional[tuple[int, int]] = None,
+                             max_ref_dist: Optional[int] = None,
+                             ) -> Optional[tuple[int, int]]:
+        """Find nearest remembered station of given category (absolute pos).
+
+        If *ref_pos* and *max_ref_dist* are given, only consider stations
+        within *max_ref_dist* Manhattan distance of *ref_pos*.  This is used
+        for junction targeting: only junctions within alignment range of the
+        hub (25 tiles) or existing network (15 tiles) are eligible.
+        """
         if self.position is None:
             return None
         best, best_dist = None, float("inf")
         for pos, cat in self.stations.items():
             if cat != category:
                 continue
+            # Proximity filter (e.g. junction within hub radius)
+            if ref_pos is not None and max_ref_dist is not None:
+                ref_dist = abs(pos[0] - ref_pos[0]) + abs(pos[1] - ref_pos[1])
+                if ref_dist > max_ref_dist:
+                    continue
             dist = abs(pos[0] - self.position[0]) + abs(pos[1] - self.position[1])
             if dist < best_dist:
                 best_dist = dist
@@ -237,13 +251,17 @@ class SharedSpatialMemory:
                 self.explored.add(shared_pos)
 
     def find_nearest_station(
-        self, category: str, position: tuple[int, int]
+        self, category: str, position: tuple[int, int],
+        max_hub_dist: Optional[int] = None,
     ) -> Optional[tuple[int, int]]:
         """Find nearest station from shared knowledge.
 
         Both ``position`` and the returned position are in hub-relative
         coordinates.  The caller must convert using ``SpatialMemory``
         ``to_shared()`` / ``from_shared()``.
+
+        If *max_hub_dist* is given, only stations within that Manhattan
+        distance of hub origin (0,0) are considered.
         """
         best, best_dist = None, float("inf")
         for pos, cat in self.stations.items():
@@ -251,6 +269,11 @@ class SharedSpatialMemory:
                 category == "extractor" and cat.startswith("extractor")
             ):
                 continue
+            # Hub proximity filter (shared coords are hub-relative, hub=(0,0))
+            if max_hub_dist is not None:
+                hub_dist = abs(pos[0]) + abs(pos[1])
+                if hub_dist > max_hub_dist:
+                    continue
             dist = abs(pos[0] - position[0]) + abs(pos[1] - position[1])
             if dist < best_dist:
                 best_dist = dist
@@ -555,15 +578,16 @@ class OptionExecutor:
 
     @staticmethod
     def _craft_cycle(o_sta, o_inv):
-        """CRAFT_CYCLE: hub (get hearts) -> craft station (craft gear).
+        """CRAFT_CYCLE: hub (get hearts) -> role-specific gear station.
 
-        Aligners need hearts from the hub before crafting. Bumping a craft
-        station without hearts does nothing.
+        Hub pays element costs; agent just needs to be on the right station.
+        NAV_GEAR targets role-specific craft station (c:aligner for aligners,
+        c:miner for miners) instead of any craft station.
         """
         if o_inv in (ObsInventory.HAS_GEAR, ObsInventory.HAS_BOTH):
             return TaskPolicy.WAIT  # Already has gear
         if o_inv == ObsInventory.HAS_RESOURCE:
-            return TaskPolicy.NAV_CRAFT  # Have hearts, go craft gear
+            return TaskPolicy.NAV_GEAR  # Have hearts, go to role-specific station
         return TaskPolicy.NAV_DEPOT  # Need hearts from hub first
 
     @staticmethod
@@ -604,10 +628,12 @@ class BatchedAIFEngine:
     """
 
     def __init__(self, n_agents: int = 8, learn_B: bool = False,
-                 learn_interval: int = 50, policy_len: int = 2):
+                 learn_interval: int = 50, policy_len: int = 2,
+                 auto_chain: bool = True):
         self.n_agents = n_agents
         self.learn_B = learn_B
         self.learn_interval = learn_interval
+        self.auto_chain = auto_chain
         self._step_count = 0
 
         # Level 2: Strategic agent with 5 macro-options
@@ -758,11 +784,27 @@ class BatchedAIFEngine:
 
         # Level 2b: Replan for terminated agents (~42ms if any)
         if terminated:
-            options, _q_pi = self._jit_select_option(self.agent, qs)
+            if self.auto_chain:
+                # Aligner auto-chain: CRAFT→CAPTURE→CRAFT loop without
+                # replanning.  Pragmatic option composition — see ROADMAP
+                # "Context-Dependent Preferences" for principled alternative.
+                replan_needed = []
+                for i in terminated:
+                    if self._auto_chain_aligner(i):
+                        pass  # Option already set by auto-chain
+                    else:
+                        replan_needed.append(i)
+            else:
+                replan_needed = terminated
+
+            if replan_needed:
+                options, _q_pi = self._jit_select_option(self.agent, qs)
+                for i in replan_needed:
+                    new_option = int(options[i])
+                    self.option_executor.set_option(i, new_option)
+
+            # Record post-filter options for all terminated agents
             for i in terminated:
-                new_option = int(options[i])
-                self.option_executor.set_option(i, new_option)
-                # Record the post-filter option (role filter may redirect)
                 self._current_options[i] = self.option_executor.states[i].current_option
             # Update option actions for next belief update
             self._option_actions = jnp.tile(
@@ -810,6 +852,43 @@ class BatchedAIFEngine:
         self._prev_qs = qs
         self._prev_obs = batched_obs
         self._prev_actions = self._option_actions
+
+    # ------------------------------------------------------------------
+    # Aligner auto-chaining (option composition)
+    # ------------------------------------------------------------------
+
+    def _auto_chain_aligner(self, agent_id: int) -> bool:
+        """Auto-chain CRAFT↔CAPTURE for aligners, skipping POMDP replan.
+
+        The aligner economy loop is deterministic:
+          CRAFT_CYCLE (hub→gear station→HAS_BOTH) → CAPTURE_CYCLE (junction)
+          → CRAFT_CYCLE (restock) → CAPTURE_CYCLE → ...
+
+        Returns True if auto-chaining was applied (option set directly),
+        False if the agent should go through normal POMDP replanning.
+        """
+        if not self.option_executor._is_aligner[agent_id]:
+            return False
+        st = self.option_executor.states[agent_id]
+        current = st.current_option
+        inv = self._discrete_obs[agent_id][2]
+
+        if (current == MacroOption.CRAFT_CYCLE
+                and inv in (ObsInventory.HAS_GEAR, ObsInventory.HAS_BOTH)):
+            # Got gear → go capture
+            st.current_option = MacroOption.CAPTURE_CYCLE
+            st.steps_in_option = 0
+            st.free_steps = 0
+            return True
+
+        if current == MacroOption.CAPTURE_CYCLE:
+            # Capture done (or timed out) → go craft again
+            st.current_option = MacroOption.CRAFT_CYCLE
+            st.steps_in_option = 0
+            st.free_steps = 0
+            return True
+
+        return False
 
     # ------------------------------------------------------------------
     # Level 0: Nav POMDP batch inference
@@ -1155,7 +1234,9 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
             tag_ids = self._aligner_gear_tags if role == "aligner" else self._miner_gear_tags
             category = "craft"  # gear stations are categorized as "craft" in spatial memory
         elif task_policy == TaskPolicy.NAV_JUNCTION:
-            tag_ids, category = self._junction_tags, "junction"
+            # Junction alignment requires proximity: ≤25 from hub or ≤15
+            # from existing team network.  Target junctions in range first.
+            return self._resolve_junction_target(obs, mem)
         elif task_policy in (TaskPolicy.EXPLORE, TaskPolicy.YIELD):
             if mem is not None:
                 return self._get_frontier_target(mem)
@@ -1402,6 +1483,94 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
 
         state.last_heading = direction
         return direction
+
+    # Junction alignment radius constants (from TeamJunctionVariant)
+    _HUB_ALIGN_RADIUS = 25
+    _NET_ALIGN_RADIUS = 15
+
+    def _resolve_junction_target(
+        self,
+        obs: _AgentObservation,
+        mem: Optional[SpatialMemory],
+    ) -> Optional[tuple[int, int]]:
+        """Find the nearest junction within alignment range.
+
+        Junction alignment requires the junction to be within 25 tiles of
+        the team hub or 15 tiles of an existing network junction.  We target
+        junctions satisfying this constraint first, falling back to the
+        nearest junction if none are in range (to at least move toward
+        junction-dense areas).
+        """
+        hub_pos = mem.hub_offset if mem is not None else None
+        tag_ids = self._junction_tags
+
+        # Helper: check if a position (spawn-relative) is within alignment range
+        def _in_range(pos: tuple[int, int]) -> bool:
+            if hub_pos is None:
+                return True  # Can't filter without hub knowledge
+            return (abs(pos[0] - hub_pos[0]) + abs(pos[1] - hub_pos[1])
+                    <= self._HUB_ALIGN_RADIUS)
+
+        # 1. Try visible junctions — prefer those in range
+        visible_candidates = []
+        if mem is not None and mem.position is not None:
+            for token in obs.tokens:
+                if token.feature.name != "tag":
+                    continue
+                if token.value not in tag_ids:
+                    continue
+                loc = token.location
+                if loc is None:
+                    continue
+                abs_r = mem.position[0] + loc[0] - self._center[0]
+                abs_c = mem.position[1] + loc[1] - self._center[1]
+                visible_candidates.append((abs_r, abs_c))
+
+        if visible_candidates:
+            in_range = [p for p in visible_candidates if _in_range(p)]
+            candidates = in_range if in_range else visible_candidates
+            # Return nearest candidate
+            my_pos = mem.position
+            return min(candidates, key=lambda p: abs(p[0] - my_pos[0]) + abs(p[1] - my_pos[1]))
+
+        # 2. Try own spatial memory — prefer junctions in hub range
+        if mem is not None and mem.position is not None and hub_pos is not None:
+            station_pos = mem.find_nearest_station(
+                "junction", ref_pos=hub_pos,
+                max_ref_dist=self._HUB_ALIGN_RADIUS,
+            )
+            if station_pos is not None:
+                return station_pos
+
+        # 3. Try shared spatial memory (hub-relative coords, hub=(0,0))
+        if mem is not None and mem.position is not None:
+            shared = self._engine.shared_memory
+            shared_pos = mem.to_shared(mem.position)
+            if shared_pos is not None:
+                station_shared = shared.find_nearest_station(
+                    "junction", shared_pos,
+                    max_hub_dist=self._HUB_ALIGN_RADIUS,
+                )
+                if station_shared is not None:
+                    station_local = mem.from_shared(station_shared)
+                    if station_local is not None:
+                        return station_local
+
+        # 4. Fallback: nearest junction regardless of range
+        if mem is not None and mem.position is not None:
+            station_pos = mem.find_nearest_station("junction")
+            if station_pos is not None:
+                return station_pos
+            shared = self._engine.shared_memory
+            shared_pos = mem.to_shared(mem.position)
+            if shared_pos is not None:
+                station_shared = shared.find_nearest_station("junction", shared_pos)
+                if station_shared is not None:
+                    station_local = mem.from_shared(station_shared)
+                    if station_local is not None:
+                        return station_local
+
+        return None
 
     def _get_frontier_target(
         self, mem: SpatialMemory

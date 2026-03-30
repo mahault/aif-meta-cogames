@@ -398,13 +398,13 @@ class TestOptionExecutor:
                ObsContest.FREE, 0, 0]
         assert executor.get_task_policy(1, obs) == TaskPolicy.NAV_DEPOT
 
-    def test_craft_cycle_with_resource_goes_to_craft(self):
-        """Has hearts (resource): go to craft station."""
+    def test_craft_cycle_with_resource_goes_to_gear(self):
+        """Has hearts (resource): go to role-specific gear station."""
         executor = OptionExecutor(n_agents=2)
         executor.set_option(1, MacroOption.CRAFT_CYCLE)  # agent 1 = aligner
         obs = [ObsResource.NONE, ObsStation.NONE, ObsInventory.HAS_RESOURCE,
                ObsContest.FREE, 0, 0]
-        assert executor.get_task_policy(1, obs) == TaskPolicy.NAV_CRAFT
+        assert executor.get_task_policy(1, obs) == TaskPolicy.NAV_GEAR
 
     def test_capture_cycle_gear_only_gets_hearts(self):
         """HAS_GEAR only: need hearts first (alignment costs gear + heart)."""

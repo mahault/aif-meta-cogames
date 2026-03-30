@@ -144,7 +144,7 @@ The v1 prototype mapped the POMDP action space to 5 primitive movement actions (
 | Mock realism (v9.7) | No pre-seeded stations, no free gear, discovery on adjacency | Done |
 | Tests | 186 tests pass, mock eval: 7 captures/500 steps (no pre-seeded knowledge) | Done |
 | AWS eval v9.7 (no_clips) | stuck=22.62, timeouts=3, all 4 resources mined, 0 junctions | Done |
-| Junction captures | Aligners craft gear but never reach junctions — next focus | TODO |
+| Junction captures (v9.8) | NAV_GEAR fix + hub-proximity junction targeting → 0.75 j/agent | Done |
 
 ### State Space (288 states)
 
@@ -205,22 +205,25 @@ Observation → Discretizer → 6 modalities
 
 ### AWS Eval Results
 
-| Metric | v9.5c | v9.6 | v9.7 (no_clips) |
-|--------|-------|------|-----------------|
-| max_stuck | 1160 | 985 | **22.62** |
-| timeouts | ~100 | 182 | **3** |
-| carbon.gained | 17 | 0.25 | **11.50** |
-| silicon.gained | 22.62 | 16.38 | **23.88** |
-| germanium.gained | 0 | 0 | **9.00** |
-| oxygen.gained | 0 | 0 | **6.38** |
-| aligner.gained | 0 | 0 | **1.75** |
-| miner.gained | 0 | 0 | **1.88** |
-| junction.aligned | 0 | 0 | 0 |
-| death | - | 3.0 | **1.25** |
-| shared_stations | 0 | 0 | **83-96** |
-| move.failed | - | 4280 | **2511** |
+| Metric | v9.5c | v9.6 | v9.7 (no_clips) | v9.8 (junction fix) | v9.9 (C-vector + auto-chain) |
+|--------|-------|------|-----------------|---------------------|-------------------------------|
+| max_stuck | 1160 | 985 | **22.62** | **52.25** | **31.50** |
+| timeouts | ~100 | 182 | **3** | **2** | **1** |
+| carbon.gained | 17 | 0.25 | **11.50** | **3.00** | **6.00** |
+| silicon.gained | 22.62 | 16.38 | **23.88** | **3.00** | **3.75** |
+| germanium.gained | 0 | 0 | **9.00** | **3.00** | **6.00** |
+| oxygen.gained | 0 | 0 | **6.38** | **7.00** | **12.75** |
+| aligner.gained | 0 | 0 | **1.75** | **1.00** | - |
+| miner.gained | 0 | 0 | **1.88** | **0.25** | **0.75** |
+| heart.gained | - | - | - | - | **7.50** |
+| junction.aligned | 0 | 0 | 0 | **0.75** | **1.75** |
+| death | - | 3.0 | **1.25** | **0** | **0** |
+| move.failed | - | 4280 | **2511** | **504** | - |
+| reward | 0 | 0 | 0 | **0.91** | **1.27** |
 
-**v9.7 analysis**: All subsystems working — mining, depositing, heart withdrawal, gear crafting, spatial exploration, belief sharing. Remaining bottleneck: aligners craft gear but get stuck navigating to junctions (CRAFT_CYCLE timeout up to 192 steps). Junction capture is the last missing piece of the economy chain.
+**v9.8 analysis**: First junction alignment! Two fixes: (1) CRAFT_CYCLE now uses NAV_GEAR (role-specific station) instead of NAV_CRAFT (any station) — aligners reliably get aligner gear. (2) NAV_JUNCTION now prefers junctions within hub alignment radius (25 tiles). Reward 0.96-1.78 in 2/3 episodes.
+
+**v9.9 analysis**: Junction captures +133% (0.75→1.75). Two fixes: (1) Aligner C vector corrected: c_inv[HAS_BOTH]=5.0 > c_inv[HAS_GEAR]=2.0 (was inverted at 2.0 < 5.0 — penalized capture-ready state). (2) Auto-chain: CRAFT→CAPTURE→CRAFT loop for aligners bypasses POMDP replan between phases. All 5/5 episodes score reward (was 2/3). Machina_1: 0.75j, 0.98 reward. Ablation pending: C-vector-only vs auto-chain contribution.
 
 ### MAML Integration (for Luca)
 
@@ -250,6 +253,48 @@ The A/B matrices at 288 states are the meta-learning target:
 2. Predicts next states: `z_{t+1} = transition(z_t, a_t)` — this IS the B matrix
 3. Computes EFE in latent space with epistemic uncertainty
 4. Starts from MAML initialization → fast adaptation
+
+### Research Direction: Context-Dependent (Switching) Preferences
+
+**Motivation**: The discrete POMDP uses static C vectors, but the aligner economy chain requires *phase-dependent* preferences — an agent with EMPTY hands should prefer observing RESOURCE (to get hearts), while an agent with BOTH should prefer JUNCTION (to capture). With a fixed C vector, one preference dominates and suppresses the others, leading to either capture-avoidance (c_inv[GEAR]>c_inv[BOTH]) or complacency (c_inv[BOTH] peak → stay in comfortable state).
+
+**Principled formulation**: Hierarchical active inference with **context-conditioned preferences** (Friston et al., 2017; Pezzulo et al., 2018):
+
+```
+C_m(o | context) where context ∈ {CRAFT_CONTEXT, CAPTURE_CONTEXT, EXPLORE_CONTEXT}
+```
+
+The higher-level POMDP selects a goal context (macro-option), which modulates the C vector for the lower level. This is a *deep temporal model* where each level of the hierarchy sets preferences for the level below.
+
+**Full principled formulation**: ALL planning parameters are context-dependent:
+
+```
+q(π | context) = σ(-G(π; C_context) + ln E(π | context))
+```
+
+| Parameter | CRAFT_CONTEXT | CAPTURE_CONTEXT | EXPLORE_CONTEXT |
+|-----------|--------------|-----------------|-----------------|
+| C_inv | prefer GEAR/BOTH | prefer JUNCTION obs | flat (epistemic) |
+| C_sta | prefer HUB/CRAFT | prefer JUNCTION | flat |
+| E(π) | bias toward CRAFT_CYCLE | bias toward CAPTURE_CYCLE | bias toward EXPLORE |
+| π set | {CRAFT, NAV_DEPOT, NAV_GEAR} | {CAPTURE, NAV_JUNCTION} | {EXPLORE, all nav} |
+
+The higher-level POMDP selects context, the lower level plans within it. Context transitions are triggered by belief state changes (inventory transition → context switch). This IS how deep temporal models work: each level sets priors (C, E, π) for the level below.
+
+**Current implementation**: Pragmatic approximation via option auto-chaining (`auto_chain=True`) — the OptionExecutor acts as the hierarchical context switch. The macro-option implicitly determines which observations matter (CRAFT_CYCLE → prefer HUB/GEAR stations; CAPTURE_CYCLE → prefer JUNCTION stations). Ablation: `auto_chain=False` tests whether corrected C vector alone is sufficient.
+
+**Neural AIF path**: In Phase 4, context-dependent C/E/π can be implemented as:
+- `C = f_C(z_context)`, `E = f_E(z_context)` where z_context is the higher-level latent state
+- The world model learns context→{preference, habit, policy set} mappings jointly with transition dynamics
+- MAML initialization would capture which hierarchical structures transfer across variants
+- Innovation for paper: meta-learned context-dependent priors that generalize across environment variants
+
+**Key references**:
+- Friston et al. (2017): Active Inference, Curiosity and Insight — deep temporal models
+- Pezzulo et al. (2018): Hierarchical Active Inference — multi-level goal selection
+- Hesp et al. (2021): Deeply Felt Affect — emotion as precision on hierarchical priors
+- Da Costa et al. (2020): Active Inference on Discrete State-Spaces — factored C vectors
+- Sajid et al. (2021): Active Inference: Demystified and Compared — E vector as habit prior
 
 **Done when**: Neural AIF with meta-learned WM outperforms discrete AIF on held-out variants AND adapts faster than non-meta-learned neural AIF.
 
