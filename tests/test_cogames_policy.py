@@ -4,6 +4,8 @@ These tests mock the mettagrid types so they can run locally
 without cogames/mettagrid installed. pymdp (JAX) is required.
 """
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -1201,8 +1203,13 @@ class TestAgentRole:
             roles = [_agent_role(i, n) for i in range(n)]
             assert "scout" not in roles
 
+    def test_4_agent_split(self):
+        """4 agents: 1 miner, 2 aligners, 1 scout — maximize junctions."""
+        roles = [_agent_role(i, 4) for i in range(4)]
+        assert roles == ["miner", "aligner", "aligner", "scout"]
+
     def test_even_miners_odd_aligners(self):
-        """Even IDs are miners, odd (non-scout) are aligners."""
+        """Even IDs are miners, odd (non-scout) are aligners (n=8)."""
         for i in range(7):
             role = _agent_role(i, 8)
             if i % 2 == 0:
@@ -1305,3 +1312,205 @@ class TestSharedExploredCells:
         assert target[0] < 0 or target[1] < 0, (
             f"Expected target away from explored area, got {target}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase B: Parameter learning tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not HAS_PYMDP, reason="pymdp not installed")
+class TestTrajectoryLogging:
+    """Test trajectory logging for parameter learning."""
+
+    def test_engine_logs_trajectory(self):
+        """BatchedAIFEngine with log_trajectory=True collects data."""
+        import jax.numpy as jnp
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+
+        engine = BatchedAIFEngine(n_agents=2, log_trajectory=True)
+        obs = [jnp.array([0]) for _ in range(6)]
+
+        # Run 3 steps
+        for _ in range(3):
+            for agent_id in range(2):
+                engine.submit_and_get_policy(agent_id, obs)
+
+        traj = engine.get_trajectory()
+        assert len(traj) == 3
+        assert "obs" in traj[0]
+        assert "qs" in traj[0]
+        assert "prior" in traj[0]
+        assert "actions" in traj[0]
+        assert len(traj[0]["obs"]) == 6   # 6 modalities
+        assert len(traj[0]["qs"]) == 4    # 4 state factors
+
+    def test_get_model_params(self):
+        """get_model_params returns A, B, C, D matrices."""
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+
+        engine = BatchedAIFEngine(n_agents=2)
+        params = engine.get_model_params()
+
+        assert "A" in params
+        assert "B" in params
+        assert "C" in params
+        assert "D" in params
+        assert len(params["A"]) == 6   # 6 observation modalities
+        assert len(params["B"]) == 4   # 4 state factors
+        assert len(params["C"]) == 6   # 6 C vectors
+        assert len(params["D"]) == 4   # 4 D vectors
+
+    def test_trajectory_clear_after_get(self):
+        """get_trajectory() clears the buffer."""
+        import jax.numpy as jnp
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+
+        engine = BatchedAIFEngine(n_agents=2, log_trajectory=True)
+        obs = [jnp.array([0]) for _ in range(6)]
+
+        for agent_id in range(2):
+            engine.submit_and_get_policy(agent_id, obs)
+
+        traj1 = engine.get_trajectory()
+        assert len(traj1) == 1
+
+        traj2 = engine.get_trajectory()
+        assert len(traj2) == 0
+
+
+@pytest.mark.skipif(not HAS_PYMDP, reason="pymdp not installed")
+class TestParameterLearning:
+    """Test offline parameter learning via VFE gradients."""
+
+    def test_softmax_roundtrip(self):
+        """Softmax parameterization preserves structure."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        from learn_parameters import params_to_logits, logits_to_params
+        from aif_meta_cogames.aif_agent.generative_model import build_default_A
+
+        A = build_default_A()
+        logits = params_to_logits(A)
+        A_recovered = logits_to_params(logits)
+
+        for i in range(len(A)):
+            # Should be close to original (softmax(log(x)) ≈ x for valid dists)
+            np.testing.assert_allclose(
+                np.asarray(A_recovered[i]), A[i],
+                atol=1e-4, rtol=1e-3,
+            )
+            # Should sum to 1 along axis 0
+            sums = np.asarray(A_recovered[i]).sum(axis=0)
+            np.testing.assert_allclose(sums, 1.0, atol=1e-5)
+
+    def test_trajectory_vfe_computes(self):
+        """VFE can be computed over a synthetic trajectory."""
+        import jax.numpy as jnp
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        from learn_parameters import trajectory_vfe, params_to_logits
+        from aif_meta_cogames.aif_agent.generative_model import (
+            build_default_A, build_default_B,
+        )
+
+        # Collect a short trajectory
+        engine = BatchedAIFEngine(n_agents=2, log_trajectory=True)
+        obs = [jnp.array([0]) for _ in range(6)]
+        for _ in range(5):
+            for agent_id in range(2):
+                engine.submit_and_get_policy(agent_id, obs)
+
+        traj = engine.get_trajectory()
+        assert len(traj) == 5
+
+        A_logits = params_to_logits(build_default_A())
+        B_logits = params_to_logits(build_default_B())
+
+        vfe = trajectory_vfe(A_logits, B_logits, traj, agent_idx=0)
+        assert np.isfinite(float(vfe))
+        assert float(vfe) > 0  # VFE should be positive
+
+    def test_vfe_gradient_exists(self):
+        """JAX can compute gradients of VFE w.r.t. A logits."""
+        import jax
+        import jax.numpy as jnp
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        from learn_parameters import trajectory_vfe, params_to_logits
+        from aif_meta_cogames.aif_agent.generative_model import (
+            build_default_A, build_default_B,
+        )
+
+        # Collect trajectory
+        engine = BatchedAIFEngine(n_agents=2, log_trajectory=True)
+        obs = [jnp.array([0]) for _ in range(6)]
+        for _ in range(3):
+            for agent_id in range(2):
+                engine.submit_and_get_policy(agent_id, obs)
+        traj = engine.get_trajectory()
+
+        A_logits = params_to_logits(build_default_A())
+        B_logits = params_to_logits(build_default_B())
+
+        # Compute gradient
+        grad_fn = jax.grad(trajectory_vfe, argnums=0)
+        grads = grad_fn(A_logits, B_logits, traj, 0)
+
+        # Should have same structure as A_logits
+        assert len(grads) == len(A_logits)
+        for i in range(len(grads)):
+            assert grads[i].shape == A_logits[i].shape
+            assert np.isfinite(np.asarray(grads[i])).all()
+
+    def test_save_load_trajectory(self, tmp_path):
+        """Trajectory save/load round-trips correctly."""
+        import jax.numpy as jnp
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        from learn_parameters import save_trajectory, load_trajectory
+
+        engine = BatchedAIFEngine(n_agents=2, log_trajectory=True)
+        obs = [jnp.array([0]) for _ in range(6)]
+        for _ in range(3):
+            for agent_id in range(2):
+                engine.submit_and_get_policy(agent_id, obs)
+        traj = engine.get_trajectory()
+
+        path = str(tmp_path / "test_traj.npz")
+        save_trajectory(path, traj)
+        loaded = load_trajectory(path)
+
+        assert len(loaded) == len(traj)
+        for t in range(len(traj)):
+            assert len(loaded[t]["obs"]) == len(traj[t]["obs"])
+            for m in range(len(traj[t]["obs"])):
+                np.testing.assert_array_equal(
+                    loaded[t]["obs"][m], traj[t]["obs"][m]
+                )
+
+    def test_save_load_params(self, tmp_path):
+        """Parameter save/load round-trips correctly."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        from learn_parameters import save_params, load_params
+        from aif_meta_cogames.aif_agent.generative_model import (
+            build_default_A, build_default_B, build_C, build_D,
+        )
+
+        A = build_default_A()
+        B = build_default_B()
+        C = build_C()
+        D = build_D()
+
+        path = str(tmp_path / "test_params.npz")
+        save_params(path, A, B, C, D)
+        loaded = load_params(path)
+
+        assert len(loaded["A"]) == len(A)
+        assert len(loaded["B"]) == len(B)
+        for i in range(len(A)):
+            np.testing.assert_allclose(loaded["A"][i], A[i], atol=1e-6)

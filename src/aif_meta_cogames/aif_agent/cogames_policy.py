@@ -23,7 +23,9 @@ for testing, while the full policy classes require mettagrid at runtime.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 import equinox as eqx
@@ -225,11 +227,36 @@ class SharedSpatialMemory:
 
     Shares ground-truth observations (not posterior beliefs) to avoid echo
     chambers.  Agents maintain independent beliefs about what to DO.
+
+    **Plan broadcasting** (Phase C): agents publish their current navigation
+    target so that other agents can avoid targeting the same station.  This
+    prevents 3 aligners from all heading to the same junction.
     """
 
     def __init__(self):
         self.stations: dict[tuple[int, int], str] = {}
         self.explored: set[tuple[int, int]] = set()
+        # Plan broadcasting: agent_id -> (shared_pos, target_type)
+        self.intended_targets: dict[int, tuple[tuple[int, int], str]] = {}
+
+    def broadcast_intent(self, agent_id: int, shared_pos: tuple[int, int],
+                         target_type: str):
+        """Broadcast this agent's current navigation target (hub-relative)."""
+        self.intended_targets[agent_id] = (shared_pos, target_type)
+
+    def clear_intent(self, agent_id: int):
+        """Clear this agent's broadcast (e.g., on option termination)."""
+        self.intended_targets.pop(agent_id, None)
+
+    def is_claimed(self, shared_pos: tuple[int, int], target_type: str,
+                   exclude_agent: int = -1) -> bool:
+        """Check if another agent is already targeting this position."""
+        for aid, (pos, ttype) in self.intended_targets.items():
+            if aid == exclude_agent:
+                continue
+            if ttype == target_type and pos == shared_pos:
+                return True
+        return False
 
     def contribute(self, agent_memory: SpatialMemory):
         """Merge one agent's station discoveries into the shared pool.
@@ -437,9 +464,9 @@ class OptionExecutor:
 
     TIMEOUTS = {
         MacroOption.MINE_CYCLE: 80,
-        MacroOption.CRAFT_CYCLE: 200,
-        MacroOption.CAPTURE_CYCLE: 200,
-        MacroOption.EXPLORE: 50,
+        MacroOption.CRAFT_CYCLE: 120,
+        MacroOption.CAPTURE_CYCLE: 120,
+        MacroOption.EXPLORE: 30,
         MacroOption.DEFEND: 60,
     }
 
@@ -628,18 +655,35 @@ class BatchedAIFEngine:
     """
 
     def __init__(self, n_agents: int = 8, learn_B: bool = False,
-                 learn_interval: int = 50, policy_len: int = 2,
-                 auto_chain: bool = True, context_E: bool = False):
+                 learn_A: bool = False, learn_interval: int = 50,
+                 policy_len: int = 2,
+                 auto_chain: bool = True, context_E: bool = False,
+                 log_trajectory: bool = False,
+                 learned_params_path: Optional[str] = None):
         self.n_agents = n_agents
         self.learn_B = learn_B
+        self.learn_A = learn_A
         self.learn_interval = learn_interval
         self.auto_chain = auto_chain
         self.context_E = context_E
         self._step_count = 0
 
+        # Trajectory logging for offline parameter learning (Phase B)
+        self.log_trajectory = log_trajectory
+        self._trajectory: list[dict] = []  # list of per-step records
+
+        # Load learned A matrices if provided (Phase B offline learning)
+        custom_A = None
+        if learned_params_path:
+            params_data = np.load(learned_params_path)
+            n_A = len(NUM_OBS)
+            custom_A = [params_data[f"A_{i}"] for i in range(n_A)]
+            print(f"[AIF] Loaded learned A matrices from {learned_params_path}")
+
         # Level 2: Strategic agent with 5 macro-options
         self.agent = CogsGuardPOMDP.create_strategic_agent(
-            n_agents, learn_B=learn_B, policy_len=policy_len
+            n_agents, learn_B=learn_B, learn_A=learn_A,
+            custom_A=custom_A, policy_len=policy_len,
         )
 
         # Level 1: Option executor
@@ -846,11 +890,11 @@ class BatchedAIFEngine:
                 i, self._discrete_obs[i]
             )
 
-        # Online B-learning
+        # Online parameter learning (A and/or B via Dirichlet updates)
         self._step_count += 1
-        if (self.learn_B and self._prev_qs is not None
+        if ((self.learn_B or self.learn_A) and self._prev_qs is not None
                 and self._step_count % self.learn_interval == 0):
-            self._update_B(batched_obs, qs)
+            self._update_parameters(batched_obs, qs)
 
         # Periodic logging (every 500 steps)
         if self._step_count % 500 == 0:
@@ -862,6 +906,9 @@ class BatchedAIFEngine:
             if self.learn_B and hasattr(self.agent, 'pB') and self.agent.pB is not None:
                 pB_sum = sum(float(pb.sum()) for pb in self.agent.pB)
                 extras.append(f"pB={pB_sum:.0f}")
+            if self.learn_A and hasattr(self.agent, 'pA') and self.agent.pA is not None:
+                pA_sum = sum(float(pa.sum()) for pa in self.agent.pA)
+                extras.append(f"pA={pA_sum:.0f}")
             opt_steps = [self.option_executor.states[i].steps_in_option
                         for i in range(self.n_agents)]
             extras.append(f"opt_steps={opt_steps}")
@@ -874,6 +921,17 @@ class BatchedAIFEngine:
             extra_str = f", {', '.join(extras)}" if extras else ""
             print(f"[AIF step={self._step_count}] options={option_names}")
             print(f"  tasks={task_names}{extra_str}")
+
+        # Trajectory logging for offline parameter learning
+        if self.log_trajectory:
+            self._trajectory.append({
+                "step": self._step_count,
+                "obs": [np.asarray(o) for o in batched_obs],      # 6 × (N, T)
+                "qs": [np.asarray(q) for q in qs],                # 4 × (N, S_f)
+                "prior": [np.asarray(p) for p in self.empirical_prior],
+                "actions": np.asarray(self._option_actions),       # (N, 4)
+                "options": self._current_options.copy(),           # (N,)
+            })
 
         # Store for next B-learning step
         self._prev_qs = qs
@@ -1024,11 +1082,30 @@ class BatchedAIFEngine:
                     )
 
     # ------------------------------------------------------------------
+    # Trajectory access for parameter learning
+    # ------------------------------------------------------------------
+
+    def get_trajectory(self) -> list[dict]:
+        """Return collected trajectory data and clear buffer."""
+        traj = self._trajectory
+        self._trajectory = []
+        return traj
+
+    def get_model_params(self) -> dict:
+        """Return current A, B, C, D as numpy arrays."""
+        return {
+            "A": [np.asarray(a) for a in self.agent.A],
+            "B": [np.asarray(b) for b in self.agent.B],
+            "C": [np.asarray(c) for c in self.agent.C],
+            "D": [np.asarray(d) for d in self.agent.D],
+        }
+
+    # ------------------------------------------------------------------
     # B-learning (Dirichlet updates)
     # ------------------------------------------------------------------
 
-    def _update_B(self, curr_obs, curr_qs):
-        """Update B matrices via online Dirichlet learning."""
+    def _update_parameters(self, curr_obs, curr_qs):
+        """Update A and/or B matrices via online Dirichlet learning."""
         beliefs_T2 = [
             jnp.concatenate([self._prev_qs[f], curr_qs[f]], axis=1)
             for f in range(len(curr_qs))
@@ -1039,9 +1116,10 @@ class BatchedAIFEngine:
         ]
         actions_T1 = self._prev_actions[:, None, :]
 
-        # Use all positional args: param name differs across pymdp versions
+        lr_pA = 1.0 if self.learn_A else 0.0
+        lr_pB = 1.0 if self.learn_B else 0.0
         self.agent = self.agent.infer_parameters(
-            beliefs_T2, obs_T2, actions_T1, beliefs_T2, 0.0, 1.0,
+            beliefs_T2, obs_T2, actions_T1, beliefs_T2, lr_pA, lr_pB,
         )
 
 
@@ -1225,10 +1303,14 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
             TaskPolicy.MINE, TaskPolicy.DEPOSIT, TaskPolicy.CRAFT,
             TaskPolicy.ACQUIRE_GEAR, TaskPolicy.CAPTURE, TaskPolicy.WAIT,
         ):
+            self._engine.shared_memory.clear_intent(self._agent_id)
             return self._action("noop"), state
 
         # Resolve target position (absolute coordinates)
         target = self._resolve_nav_target(task_policy, obs, state)
+
+        # Plan broadcasting: publish target for deconfliction (Phase C)
+        self._broadcast_intent(task_policy, target, state)
 
         # Compute nav POMDP observations
         obs_range, obs_movement = self._compute_nav_obs(target, state)
@@ -1542,84 +1624,85 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
         obs: _AgentObservation,
         mem: Optional[SpatialMemory],
     ) -> Optional[tuple[int, int]]:
-        """Find the nearest junction within alignment range.
+        """Find the best junction to target, considering alignment range and
+        plan broadcasting (Phase C deconfliction).
 
         Junction alignment requires the junction to be within 25 tiles of
-        the team hub or 15 tiles of an existing network junction.  We target
-        junctions satisfying this constraint first, falling back to the
-        nearest junction if none are in range (to at least move toward
-        junction-dense areas).
+        the team hub.  Collects ALL known junctions from visible tokens,
+        own memory, and shared memory, then ranks them by:
+          1. In alignment range (preferred)
+          2. Not claimed by another agent (plan broadcasting)
+          3. Manhattan distance (closer is better)
         """
-        hub_pos = mem.hub_offset if mem is not None else None
+        if mem is None or mem.position is None:
+            return None
+
+        hub_pos = mem.hub_offset
+        my_pos = mem.position
         tag_ids = self._junction_tags
 
-        # Helper: check if a position (spawn-relative) is within alignment range
-        def _in_range(pos: tuple[int, int]) -> bool:
-            if hub_pos is None:
-                return True  # Can't filter without hub knowledge
-            return (abs(pos[0] - hub_pos[0]) + abs(pos[1] - hub_pos[1])
-                    <= self._HUB_ALIGN_RADIUS)
+        # Collect ALL candidate junctions (spawn-relative coords, deduplicated)
+        candidates: list[tuple[int, int]] = []
+        seen: set[tuple[int, int]] = set()
 
-        # 1. Try visible junctions — prefer those in range
-        visible_candidates = []
-        if mem is not None and mem.position is not None:
-            for token in obs.tokens:
-                if token.feature.name != "tag":
-                    continue
-                if token.value not in tag_ids:
-                    continue
-                loc = token.location
-                if loc is None:
-                    continue
-                abs_r = mem.position[0] + loc[0] - self._center[0]
-                abs_c = mem.position[1] + loc[1] - self._center[1]
-                visible_candidates.append((abs_r, abs_c))
+        def _add(pos: tuple[int, int]):
+            if pos not in seen:
+                candidates.append(pos)
+                seen.add(pos)
 
-        if visible_candidates:
-            in_range = [p for p in visible_candidates if _in_range(p)]
-            candidates = in_range if in_range else visible_candidates
-            # Return nearest candidate
-            my_pos = mem.position
-            return min(candidates, key=lambda p: abs(p[0] - my_pos[0]) + abs(p[1] - my_pos[1]))
+        # 1. Visible junctions
+        for token in obs.tokens:
+            if token.feature.name != "tag" or token.value not in tag_ids:
+                continue
+            loc = token.location
+            if loc is None:
+                continue
+            _add((my_pos[0] + loc[0] - self._center[0],
+                  my_pos[1] + loc[1] - self._center[1]))
 
-        # 2. Try own spatial memory — prefer junctions in hub range
-        if mem is not None and mem.position is not None and hub_pos is not None:
-            station_pos = mem.find_nearest_station(
-                "junction", ref_pos=hub_pos,
-                max_ref_dist=self._HUB_ALIGN_RADIUS,
-            )
-            if station_pos is not None:
-                return station_pos
+        # 2. Own spatial memory
+        for pos, cat in mem.stations.items():
+            if cat == "junction":
+                _add(pos)
 
-        # 3. Try shared spatial memory (hub-relative coords, hub=(0,0))
-        if mem is not None and mem.position is not None:
-            shared = self._engine.shared_memory
-            shared_pos = mem.to_shared(mem.position)
-            if shared_pos is not None:
-                station_shared = shared.find_nearest_station(
-                    "junction", shared_pos,
-                    max_hub_dist=self._HUB_ALIGN_RADIUS,
-                )
-                if station_shared is not None:
-                    station_local = mem.from_shared(station_shared)
-                    if station_local is not None:
-                        return station_local
+        # 3. Shared spatial memory (convert hub-relative → spawn-relative)
+        if hub_pos is not None:
+            for shared_pos, cat in self._engine.shared_memory.stations.items():
+                if cat == "junction":
+                    local = mem.from_shared(shared_pos)
+                    if local is not None:
+                        _add(local)
 
-        # 4. Fallback: nearest junction regardless of range
-        if mem is not None and mem.position is not None:
-            station_pos = mem.find_nearest_station("junction")
-            if station_pos is not None:
-                return station_pos
-            shared = self._engine.shared_memory
-            shared_pos = mem.to_shared(mem.position)
-            if shared_pos is not None:
-                station_shared = shared.find_nearest_station("junction", shared_pos)
-                if station_shared is not None:
-                    station_local = mem.from_shared(station_shared)
-                    if station_local is not None:
-                        return station_local
+        if not candidates:
+            return None
 
-        return None
+        # Rank: (not_in_range, claimed, distance)  — lower is better
+        def _score(pos: tuple[int, int]) -> tuple[int, int, int]:
+            dist = abs(pos[0] - my_pos[0]) + abs(pos[1] - my_pos[1])
+            in_range = True
+            if hub_pos is not None:
+                in_range = (abs(pos[0] - hub_pos[0]) + abs(pos[1] - hub_pos[1])
+                            <= self._HUB_ALIGN_RADIUS)
+            claimed = self._is_junction_claimed(pos, mem)
+            return (0 if in_range else 1, 1 if claimed else 0, dist)
+
+        candidates.sort(key=_score)
+        return candidates[0]
+
+    def _is_junction_claimed(
+        self,
+        pos: tuple[int, int],
+        mem: Optional[SpatialMemory],
+    ) -> bool:
+        """Check if a junction (spawn-relative) is claimed by another agent."""
+        if mem is None or mem.hub_offset is None:
+            return False
+        shared_pos = mem.to_shared(pos)
+        if shared_pos is None:
+            return False
+        return self._engine.shared_memory.is_claimed(
+            shared_pos, "junction", exclude_agent=self._agent_id
+        )
 
     def _get_frontier_target(
         self, mem: SpatialMemory
@@ -1687,6 +1770,39 @@ class AIFCogPolicyImpl(_StatefulPolicyImpl):
 
         return None
 
+    def _broadcast_intent(
+        self,
+        task_policy: int,
+        target: Optional[tuple[int, int]],
+        state: AIFBeliefState,
+    ):
+        """Broadcast navigation target for plan deconfliction (Phase C).
+
+        Converts spawn-relative target to hub-relative shared coordinates
+        and publishes to SharedSpatialMemory.  Other agents can then check
+        ``is_claimed()`` before selecting the same target.
+        """
+        shared = self._engine.shared_memory
+        if target is None:
+            shared.clear_intent(self._agent_id)
+            return
+        mem = state.spatial_memory
+        if mem is None or mem.hub_offset is None:
+            return
+        shared_pos = mem.to_shared(target)
+        if shared_pos is None:
+            return
+        # Map task policy to target type
+        if task_policy == TaskPolicy.NAV_JUNCTION:
+            target_type = "junction"
+        elif task_policy == TaskPolicy.NAV_RESOURCE:
+            target_type = "extractor"
+        elif task_policy in (TaskPolicy.NAV_GEAR, TaskPolicy.NAV_CRAFT):
+            target_type = "craft"
+        else:
+            target_type = "other"
+        shared.broadcast_intent(self._agent_id, shared_pos, target_type)
+
     def _action(self, name: str) -> _Action:
         """Create Action, falling back to noop if name is unavailable."""
         if name in self._action_name_set:
@@ -1705,8 +1821,8 @@ class AIFPolicy(_MultiAgentPolicy):
     Level 1: Option state machines map obs -> task policy (~0ms).
     Level 0: Navigation POMDP (16 states, 5 relative actions, ~3-5ms/step).
 
-    All 8 agents share one BatchedAIFEngine (JIT-compiled, batched inference).
-    4 miners (even), 3 aligners (odd<7), 1 scout (agent 7).
+    All agents share one BatchedAIFEngine (JIT-compiled, batched inference).
+    Agent count auto-detected from PolicyEnvInterface.num_agents.
     """
 
     short_names = ["aif"]
@@ -1715,10 +1831,15 @@ class AIFPolicy(_MultiAgentPolicy):
         self,
         policy_env_info: _PolicyEnvInterface,
         device: str = "cpu",
-        n_agents: int = 8,
+        n_agents: int = 0,
         **kwargs: Any,
     ):
         super().__init__(policy_env_info, device=device, **kwargs)
+
+        # Auto-detect agent count from game config (cogames -c flag)
+        if n_agents <= 0:
+            n_agents = getattr(policy_env_info, "num_agents", 8)
+        print(f"[AIFPolicy] n_agents={n_agents}")
 
         # Build feature name list ordered by ID
         obs_features = policy_env_info.obs_features
@@ -1732,11 +1853,28 @@ class AIFPolicy(_MultiAgentPolicy):
 
         self._discretizer = ObservationDiscretizer(feat_names, tag_categories)
 
+        # Trajectory logging: AIF_LOG_TRAJECTORY=1 to enable
+        log_traj = os.environ.get("AIF_LOG_TRAJECTORY", "0") == "1"
+
+        # Online A-learning: AIF_LEARN_A=1 to enable Dirichlet updates
+        learn_A = os.environ.get("AIF_LEARN_A", "0") == "1"
+
+        # Learned parameters: load pre-trained A matrices at construction
+        learned_params_path = os.environ.get("AIF_LEARNED_PARAMS", "")
+        if learned_params_path:
+            print(f"[AIFPolicy] Loading learned params from {learned_params_path}")
+
         # Hierarchical engine: strategic POMDP + option state machines
         self._engine = BatchedAIFEngine(
-            n_agents=n_agents, learn_B=True,
+            n_agents=n_agents, learn_B=True, learn_A=learn_A,
             policy_len=2, learn_interval=50,
+            log_trajectory=log_traj,
+            learned_params_path=learned_params_path or None,
         )
+        if log_traj:
+            print(f"[AIFPolicy] Trajectory logging ENABLED")
+        if learn_A:
+            print(f"[AIFPolicy] Online A-learning ENABLED")
         self._agents: dict[int, _StatefulAgentPolicy] = {}
 
     def agent_policy(self, agent_id: int) -> _StatefulAgentPolicy:
@@ -1752,5 +1890,44 @@ class AIFPolicy(_MultiAgentPolicy):
             )
         return self._agents[agent_id]
 
+    def _load_learned_params(self, path: str):
+        """Replace agent A matrices with learned parameters from .npz file."""
+        import numpy as _np
+        data = _np.load(path, allow_pickle=True)
+        A_learned = []
+        i = 0
+        while f"A_{i}" in data:
+            A_learned.append(jnp.array(data[f"A_{i}"], dtype=jnp.float32))
+            i += 1
+        if A_learned:
+            # Tile A matrices for batch dimension
+            A_batched = []
+            for m, a in enumerate(A_learned):
+                a_tiled = jnp.broadcast_to(
+                    a, (self._engine.n_agents,) + a.shape
+                )
+                A_batched.append(a_tiled)
+            self._engine.agent = eqx.tree_at(
+                lambda agent: agent.A, self._engine.agent, A_batched
+            )
+            print(f"[AIFPolicy] Loaded learned A matrices ({len(A_learned)} modalities) "
+                  f"from {path}")
+
     def is_recurrent(self) -> bool:
         return True
+
+    def __del__(self):
+        """Save trajectory data on cleanup if logging was enabled."""
+        if hasattr(self, "_engine") and self._engine.log_trajectory:
+            traj = self._engine.get_trajectory()
+            if traj:
+                import sys
+                sys.path.insert(0, str(
+                    Path(__file__).resolve().parent.parent.parent.parent / "scripts"
+                ))
+                try:
+                    from learn_parameters import save_trajectory
+                    out = os.environ.get("AIF_TRAJECTORY_PATH", "/tmp/aif_trajectory.npz")
+                    save_trajectory(out, traj)
+                except Exception as e:
+                    print(f"[AIFPolicy] Failed to save trajectory: {e}")

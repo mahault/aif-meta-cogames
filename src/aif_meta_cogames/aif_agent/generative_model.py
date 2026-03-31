@@ -737,14 +737,20 @@ def build_D() -> list[np.ndarray]:
 # ---------------------------------------------------------------------------
 
 def _agent_role(agent_id: int, n_agents: int = 8) -> str:
-    """Role assignment: 4 miners, 3 aligners, 1 scout.
+    """Role assignment tuned per team size.
+
+    n=8: 4 miners (even), 3 aligners (odd<7), 1 scout (agent 7).
+    n=4: 1 miner, 2 aligners, 1 scout — maximise junction output.
+    n<=3: even=miner, odd=aligner (no scout).
 
     Last agent is the dedicated epistemic scout (flat C-vector →
     information gain dominates EFE → natural exploration).
-    Remaining: even=miner, odd=aligner.
     """
     if n_agents >= 4 and agent_id == n_agents - 1:
         return "scout"
+    if n_agents == 4:
+        # agent 0=miner, 1=aligner, 2=aligner, 3=scout
+        return "aligner" if agent_id in (1, 2) else "miner"
     return "miner" if agent_id % 2 == 0 else "aligner"
 
 
@@ -950,7 +956,9 @@ class CogsGuardPOMDP:
             "aligner": CogsGuardPOMDP.for_role("aligner"),
             "scout": CogsGuardPOMDP.for_role("scout"),
         }
-        base = CogsGuardPOMDP()
+        # Optional: use custom (learned) A matrices instead of hand-crafted
+        custom_A = kwargs.pop("custom_A", None)
+        base = CogsGuardPOMDP(A=custom_A) if custom_A is not None else CogsGuardPOMDP()
 
         A = [jnp.array(a) for a in base.A]
         B_option = [jnp.array(b) for b in build_option_B()]
@@ -972,6 +980,13 @@ class CogsGuardPOMDP:
         if learn_B:
             pB = [jnp.array(b * pB_scale + 0.1) for b in build_option_B()]
 
+        # A-learning setup (online Dirichlet updates)
+        learn_A = kwargs.pop("learn_A", False)
+        pA = None
+        if learn_A:
+            pA_scale = kwargs.pop("pA_scale", 5.0)
+            pA = [jnp.array(a * pA_scale + 0.1) for a in base.A]
+
         defaults = {
             "A_dependencies": A_DEPENDENCIES,
             "B_dependencies": B_DEPENDENCIES,
@@ -983,13 +998,16 @@ class CogsGuardPOMDP:
             "num_iter": 16,
             "use_utility": True,
             "use_states_info_gain": True,
-            "use_param_info_gain": learn_B,
+            "use_param_info_gain": learn_B or learn_A,
             "learn_B": learn_B,
+            "learn_A": learn_A,
             "action_selection": "deterministic",
             "gamma": 8.0,
         }
         if pB is not None:
             defaults["pB"] = pB
+        if pA is not None:
+            defaults["pA"] = pA
         defaults.update(kwargs)
         agent = Agent(A=A, B=B_option, C=C, D=D,
                       batch_size=n_agents, **defaults)

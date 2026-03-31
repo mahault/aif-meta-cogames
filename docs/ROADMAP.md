@@ -251,6 +251,273 @@ The A/B matrices at 288 states are the meta-learning target:
 
 ---
 
+## Phase 3c: Parameter Learning + Social Coordination (Current Focus)
+
+**Lead**: Mahault | **Started**: 2026-03-31
+
+### Motivation
+
+v9.9 achieves 1.75 junctions/agent (4-agent) and 0.62 j/agent (8-agent). The remaining gap
+comes from two sources:
+1. **Hand-tuned parameters**: A, B, C, D matrices are hand-crafted — suboptimal for actual
+   environment dynamics. The agent's internal model doesn't match reality.
+2. **No social coordination**: 8 agents compete for the same targets (3 aligners go to
+   the same junction). No plan broadcasting, no theory of mind, no coordination.
+
+### Phased Approach
+
+The plan is six phases (A-F), each building on the previous:
+
+| Phase | Goal | Key Mechanism | Status |
+|-------|------|--------------|--------|
+| A | Stabilize baseline | Revert nav regression, confirm 1.50j (4-agent) | **COMPLETE** |
+| B | Learn optimal parameters | JAX gradient descent on VFE over trajectories | **COMPLETE** |
+| C | Plan broadcasting | Agents share intended targets to avoid overlap | Pending |
+| D | Bayesian model comparison | Compare learned vs hand-tuned via VFE evidence | Pending |
+| E | Factorised social AIF | Joint preferences, factored multi-agent beliefs | Pending |
+| F | Full theory of mind | Recursive agent models via sophisticated inference | Pending |
+
+---
+
+### Phase A: Stabilize Baseline
+
+**Problem**: Experimental nav changes (stronger B-bias, lower pB_scale, 4-step oscillation
+detection) caused regression from 2.00 to 0.50 junctions. Also discovered critical bug:
+`n_agents` was always 8 regardless of `-c` flag, so role optimization for n=4 was never used.
+
+**Fixes applied**:
+- Reverted B-matrix TOWARD bias to +0.10 (was +0.25)
+- Reverted pB_scale to 5.0 (was 2.0)
+- Reverted oscillation detection to 2-step inline (was 4-step _detect_blocked)
+- Fixed n_agents auto-detection: `n_agents = getattr(policy_env_info, "num_agents", 8)`
+
+**Results (2026-03-31)**:
+- 4-agent: **1.50 j/agent** (matches C-only ablation, stable baseline)
+- 8-agent: **0.12 j/agent** (3 aligners compete for same targets — needs Phase C)
+- Status: **COMPLETE**
+
+---
+
+### Phase B: Differentiable Parameter Learning
+
+**Why**: Hand-tuned A/B/C/D matrices are the #1 bottleneck. pymdp 1.0 is fully
+JAX-differentiable, enabling `jax.grad(VFE)` through the inference pipeline.
+
+**Infrastructure built**:
+- Trajectory logging in `BatchedAIFEngine` (obs, beliefs, priors, actions per step)
+- Custom `_compute_vfe_factored()` for factored A matrices with `A_DEPENDENCIES`
+- Softmax parameterization: unconstrained logits θ → valid distributions via `softmax(θ, axis=0)`
+- `scripts/learn_parameters.py`: gradient descent, Bayesian model comparison, save/load
+- 8 tests (3 trajectory logging + 5 parameter learning), all passing
+
+**Experiment sweep (2026-03-31)**:
+
+| ID | Method | Agent(s) | KL reg | VFE reduction | Junctions | Status |
+|----|--------|----------|--------|---------------|-----------|--------|
+| v1 | Single-agent gradient | agent 0 (miner) | 0.0 | -5.5% | **0** (regression) | Done |
+| v2 | Single-agent gradient (aggressive) | agent 0 (miner) | 0.0 | -37.4% | not tested | Done |
+| B3 | **Multi-agent gradient** | **all 4** | **0.0** | **-10.1%** | **1.40** (no regression) | Done |
+| B4 | Multi-agent + mild KL | all 4 | 0.1 | -10.1% | pending eval | Done |
+| B5 | **Multi-agent + strong KL** | **all 4** | **1.0** | **-10.0%** | **2.20** (+47%) | **Done** |
+| B6 | Single aligner (agent 1) | agent 1 | 0.0 | -10.5% | **0** (regression) | Done |
+| B7 | Online Dirichlet (`learn_A=True`) | all (live) | N/A | N/A | **1.80** (+20%) | Done |
+
+**Critical finding: role-biased learning corrupts A matrices**
+
+When learning from a single agent's trajectory (v1/v2), the A matrix columns for
+observation values that agent rarely encounters drift toward noise. Analysis of
+the 4-agent trajectory data:
+
+```
+Agent 0 (miner):   inv=[EMPTY=19%, HAS_RES=80%, HAS_GEAR=0%, HAS_BOTH=0%]
+Agent 1 (aligner): inv=[EMPTY=0%, HAS_RES=45%, HAS_GEAR=0%, HAS_BOTH=54%]
+Agent 2 (aligner): inv=[EMPTY=3%, HAS_RES=6%, HAS_GEAR=0%, HAS_BOTH=90%]
+Agent 3 (scout):   inv=[EMPTY=3%, HAS_RES=96%, HAS_GEAR=0%, HAS_BOTH=0%]
+```
+
+The miner (agent 0) **never observes HAS_GEAR or HAS_BOTH**. Learning from its
+trajectory degrades those A columns:
+
+```
+P(HAS_GEAR | state=HAS_GEAR):
+  default: 0.941  →  v2: 0.668 (BROKEN — 15% prob of observing EMPTY!)
+  default: 0.941  →  B3: 0.932 (preserved — multi-agent averaging)
+```
+
+Multi-agent learning (B3) averages VFE across ALL agents, so aligner data
+keeps the HAS_GEAR/HAS_BOTH columns accurate. Result: **no regression**.
+
+**B3 live eval results (4-agent, 5 episodes)**:
+
+| Metric | B3 (learned) | Default |
+|--------|-------------|---------|
+| Mean reward | **1.15** | 1.00 |
+| Junctions | 1.40 | 1.40 |
+| Move failures | **910** | 1035 |
+| Aligner gear | 1.25 | 2.50 |
+| Zero-reward episodes | **0/5** | 1/5 |
+
+B3 is more consistent (no zero-reward episodes) and has 12% fewer movement
+failures, suggesting the learned A matrices improve navigation. Junction rate
+is equal. More episodes needed for statistical significance.
+
+**Full live eval results (4-agent, 5 episodes each)**:
+
+| Metric | Default | B3 (multi, kl=0) | B5 (multi, kl=1.0) | B6 (aligner) | B7 (online) |
+|--------|---------|-------------------|---------------------|--------------|-------------|
+| Junctions | 1.40 | 1.40 | **2.20** | 0 | 1.80 |
+| Hearts (net) | - | - | 4.00 | 0 | 3.75 |
+| Aligner gear (net) | 2.50 | 1.25 | 2.25 | 0 | 1.75 |
+| Move failures | 1035 | 910 | 940 | 927 | 955 |
+| Zero episodes | 1/5 | 0/5 | - | - | - |
+
+**Key findings from live evals**:
+- **B5 is the clear winner**: +47% junctions over default (2.20 vs 1.50 baseline).
+  Strong KL regularization (kl_weight=1.0) prevents A drift while allowing
+  meaningful improvement. Multi-agent averaging prevents role bias.
+- **B6 produces complete regression**: Aligner-only learning creates degenerate
+  A matrices. The aligner trajectory (54% HAS_BOTH) warps columns for
+  observation states other roles depend on. Heart/gear gained exactly equals
+  lost (net zero) — the agent acquires and immediately loses everything.
+- **B7 (online Dirichlet) works without pre-training**: 1.80 junctions (+20%)
+  from pure online Bayesian learning during live play. No pre-collected data
+  needed. Could be combined with B5 (start from learned params + continue
+  online adaptation).
+- **Navigation is not the bottleneck**: Move failures are similar across all
+  variants (~910-955), confirming the improvement comes from better state
+  estimation (A matrices), not navigation.
+
+**B5/B6 A-matrix analysis**:
+
+All three multi-agent runs (B3, B5, B6) converge to the same A[2] (inventory)
+structure. KL regularization has negligible effect at this scale:
+
+```
+P(HAS_GEAR|GEAR):   default=0.941  B3=0.932  B5=0.934  B6=0.923
+P(HAS_BOTH|BOTH):   default=0.941  B3=0.959  B5=0.959  B6=0.959
+Max A[2] diff:       --             0.018     0.017     0.019
+Overall max diff:    --             0.098     0.086     0.098
+```
+
+B6 (aligner-only, agent 1) preserves inventory structure despite being single-agent
+because aligners observe all inventory states (HAS_RES=45%, HAS_BOTH=54%).
+
+**Technical findings**:
+1. **Static-leaf JIT issue disproven**: All 33 agent leaves are dynamic (verified
+   via `eqx.partition`). The `eqx.tree_at` replacement works correctly through JIT.
+2. **VFE minimization improves perception, not planning directly**: A matrices map
+   P(observation | state). Better A → better state estimation → indirectly better EFE.
+   C vectors (preferences) drive policy selection directly.
+3. **KL regularization (B4, B5)**: Both kl_weight=0.1 and kl_weight=1.0 have
+   negligible effect — nearly identical VFE and A matrices as B3 (kl=0.0).
+   The learned A matrices naturally stay close to default with multi-agent learning.
+4. **VFE doesn't signal junction captures**: VFE increases on inventory transitions
+   (surprise signal). Junction capture (HAS_BOTH→HAS_RES) produces a negligible
+   VFE drop (-0.08). Junction value is encoded in C (preferences), not A.
+5. **C-vector optimization is out of scope for VFE-based learning**: C affects EFE
+   (planning) not VFE (inference). The hand-tuned C vectors (miner/aligner/scout)
+   are already well-optimized — the v9.8→v9.9 ablation showed C-vector correction
+   alone gives +100% junctions. Further C optimization would require black-box
+   search (CMA-ES) with junction captures as the objective, which is expensive.
+
+**B7: Online Dirichlet A-learning** (implemented):
+- `AIF_LEARN_A=1` enables Dirichlet updates on the strategic POMDP A matrices
+  during live play. Uses pymdp's built-in `infer_parameters()` with `pA` priors.
+- Most conservative approach: Bayesian conjugate updates, no gradient descent.
+- Complements offline learning (B3-B6) by adapting to the actual environment
+  dynamics rather than pre-collected trajectory statistics.
+- Implementation: `learn_A=True` in `create_strategic_agent`, `pA_scale=5.0`
+  controls prior strength. Updates via `_update_parameters()` every 50 steps.
+
+**References**:
+- Da Costa et al. (2020): Active Inference on Discrete State-Spaces — Dirichlet parameter learning
+- Fountas et al. (2020): Deep Active Inference — end-to-end differentiable AIF
+- Sajid et al. (2021): Active Inference: Demystified and Compared — parameter learning review
+
+---
+
+### Phase C: Plan Broadcasting for 8-Agent Coordination
+
+**Why**: 8-agent performance (0.62 j/agent) is much worse than 4-agent (1.75 j/agent).
+Root cause: multiple aligners target the same junctions, no target deconfliction.
+
+**Mechanism**: Extend `SharedSpatialMemory` to include agent intent:
+- Each agent broadcasts: `(agent_id, current_option, target_position, target_type)`
+- Before selecting a junction target, check if another aligner already claims it
+- Social modality: count of allied agents targeting same junction → `o_contest`
+- Cost: just a dict lookup, no inference overhead
+
+**Implementation**:
+- Add `intended_targets: dict[int, tuple[int, int, str]]` to SharedSpatialMemory
+- In `_find_nearest_target()`, penalize or skip already-claimed targets
+- Nav POMDP social obs: `CLAIMED_BY_ALLY` → lower EFE for alternative targets
+
+**Expected impact**: 8-agent should match or exceed 4-agent per-agent rate since
+more miners supply more resources.
+
+---
+
+### Phase D: Bayesian Model Comparison
+
+**Why**: After learning parameters (Phase B), we need a principled way to compare
+model variants. Bayesian model comparison uses VFE as an approximation to log
+model evidence: lower F = better model.
+
+**Mechanism**:
+- Run N episodes with parameter set θ₁ → compute mean F₁
+- Run N episodes with parameter set θ₂ → compute mean F₂
+- Bayes factor: BF = exp(F₁ - F₂) — if BF > 3, strong evidence for θ₂
+- Also track junction captures as external validation
+
+**Bayesian Model Reduction (BMR)**:
+- Analytically compare nested models without refitting
+- If removing a parameter doesn't increase F, the simpler model is preferred
+- pymdp has `dirichlet_kl_divergence` for computing KL between Dirichlet posteriors
+
+---
+
+### Phase E: Factorised Social AIF
+
+**Why**: Plan broadcasting (Phase C) is a simple deconfliction mechanism. Factorised
+AIF goes further: each agent maintains beliefs about other agents' states and
+preferences, enabling principled multi-agent coordination.
+
+**Key paper**: Pitliya et al. (AAMAS 2025) — "Factorised Active Inference for
+Strategic Multi-Agent Interactions". Code: github.com/RuizSerra/factorised-MA-AIF
+
+**Mechanism**:
+- State factors: `q(s_self) · q(s_ally_1) · q(s_ally_2) · ...`
+- Joint preferences: `p*(o_self, o_ally) = softmax(joint_payoff)`
+- EFE includes: G_self (own risk+info) + G_social (ally risk+info)
+- Natural extension of our existing factored POMDP (4 factors → 4+N_allies)
+
+**Challenge**: State space explosion. With 8 agents × 288 states each, full factorisation
+is intractable. Solutions: (a) group agents by role, (b) only model nearest 2 allies,
+(c) mean-field approximation.
+
+---
+
+### Phase F: Full Theory of Mind (Stretch Goal)
+
+**Why**: Factorised AIF assumes agents share preferences. Full ToM models OTHER agents'
+generative models — each agent has a model of what other agents believe and want.
+
+**Key papers**:
+- Vasil et al. (2020): Generalised Free Energy for multi-agent systems
+- "Theory of Mind via Sophisticated Inference" (2025, pymdp implementation)
+- "Emergent Joint Agency" (2025): synergistic information via nested Markov blankets
+
+**Mechanism**:
+- Level 1: q(s_self) — own beliefs (existing)
+- Level 2: q(s_other; model_other) — beliefs about other's beliefs
+- Level 3: q(model_other) — beliefs about what model the other agent uses
+- Sophisticated inference: recursive depth-limited ToM
+
+**This connects to social-layer project**: CommitmentInference, IntentParticleFilter,
+SocialEFE, GatedToM patterns from social-layer provide the architecture template.
+
+---
+
 ## Phase 4: Neural AIF + Meta-Learned World Model (Weeks 5-7)
 
 **Lead**: All three
