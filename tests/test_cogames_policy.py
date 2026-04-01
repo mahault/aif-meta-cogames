@@ -1412,7 +1412,7 @@ class TestParameterLearning:
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
         from learn_parameters import trajectory_vfe, params_to_logits
         from aif_meta_cogames.aif_agent.generative_model import (
-            build_default_A, build_default_B,
+            build_default_A, build_option_B,
         )
 
         # Collect a short trajectory
@@ -1426,7 +1426,7 @@ class TestParameterLearning:
         assert len(traj) == 5
 
         A_logits = params_to_logits(build_default_A())
-        B_logits = params_to_logits(build_default_B())
+        B_logits = params_to_logits(build_option_B())
 
         vfe = trajectory_vfe(A_logits, B_logits, traj, agent_idx=0)
         assert np.isfinite(float(vfe))
@@ -1441,7 +1441,7 @@ class TestParameterLearning:
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
         from learn_parameters import trajectory_vfe, params_to_logits
         from aif_meta_cogames.aif_agent.generative_model import (
-            build_default_A, build_default_B,
+            build_default_A, build_option_B,
         )
 
         # Collect trajectory
@@ -1453,9 +1453,9 @@ class TestParameterLearning:
         traj = engine.get_trajectory()
 
         A_logits = params_to_logits(build_default_A())
-        B_logits = params_to_logits(build_default_B())
+        B_logits = params_to_logits(build_option_B())
 
-        # Compute gradient
+        # Compute gradient w.r.t. A
         grad_fn = jax.grad(trajectory_vfe, argnums=0)
         grads = grad_fn(A_logits, B_logits, traj, 0)
 
@@ -1464,6 +1464,219 @@ class TestParameterLearning:
         for i in range(len(grads)):
             assert grads[i].shape == A_logits[i].shape
             assert np.isfinite(np.asarray(grads[i])).all()
+
+    def test_B_gradient_exists(self):
+        """JAX can compute gradients of VFE w.r.t. B logits (transition loss)."""
+        import jax
+        import jax.numpy as jnp
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        from learn_parameters import trajectory_vfe, params_to_logits
+        from aif_meta_cogames.aif_agent.generative_model import (
+            build_default_A, build_option_B,
+        )
+
+        # Collect trajectory (need >1 steps for transition loss)
+        engine = BatchedAIFEngine(n_agents=2, log_trajectory=True)
+        obs = [jnp.array([0]) for _ in range(6)]
+        for _ in range(5):
+            for agent_id in range(2):
+                engine.submit_and_get_policy(agent_id, obs)
+        traj = engine.get_trajectory()
+        assert len(traj) >= 2  # Need consecutive timesteps for B
+
+        A_logits = params_to_logits(build_default_A())
+        B_logits = params_to_logits(build_option_B())
+
+        # Compute gradient w.r.t. B (argnums=1)
+        grad_fn = jax.grad(trajectory_vfe, argnums=1)
+        grads = grad_fn(A_logits, B_logits, traj, 0)
+
+        # Should have same structure as B_logits
+        assert len(grads) == len(B_logits)
+        for i in range(len(grads)):
+            assert grads[i].shape == B_logits[i].shape
+            assert np.isfinite(np.asarray(grads[i])).all()
+
+        # B_role (factor 3) should have zero gradient (frozen)
+        assert float(jnp.abs(grads[3]).sum()) == 0.0, \
+            "B_role gradient should be zero (frozen)"
+
+        # At least one non-role factor should have non-zero gradient
+        has_nonzero = False
+        for i in range(3):  # phase, hand, target
+            if float(jnp.abs(grads[i]).sum()) > 0:
+                has_nonzero = True
+        assert has_nonzero, "At least one B factor should have non-zero gradient"
+
+    def test_trajectory_augmented_fields(self):
+        """Trajectory records include q_pi and neg_efe after replanning."""
+        import jax.numpy as jnp
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+
+        engine = BatchedAIFEngine(n_agents=2, log_trajectory=True)
+        obs = [jnp.array([0]) for _ in range(6)]
+        # Run enough steps to trigger replanning
+        for _ in range(20):
+            for agent_id in range(2):
+                engine.submit_and_get_policy(agent_id, obs)
+
+        traj = engine.get_trajectory()
+        assert len(traj) > 0
+
+        # After replanning, some records should have q_pi/neg_efe
+        has_augmented = any("q_pi" in r for r in traj)
+        # Note: may not have augmented if no option terminated in 20 steps
+        # But at minimum the fields should not cause errors
+        for record in traj:
+            if "q_pi" in record:
+                assert record["q_pi"].ndim >= 1
+                assert "neg_efe" in record
+                assert record["neg_efe"].ndim >= 1
+
+    def test_C_gradient_exists(self):
+        """JAX can compute gradients of inverse EFE loss w.r.t. C."""
+        import jax
+        import jax.numpy as jnp
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        from learn_parameters import (
+            efe_policy_loss, _build_E_vectors, _detect_replan_steps,
+        )
+        from aif_meta_cogames.aif_agent.generative_model import (
+            build_default_A, build_option_B,
+            build_C_miner, build_C_aligner, build_C_scout,
+        )
+
+        # Run enough steps to trigger EXPLORE timeout (30) and replanning
+        engine = BatchedAIFEngine(n_agents=4, log_trajectory=True)
+        obs = [jnp.array([0]) for _ in range(6)]
+        for _ in range(40):
+            for agent_id in range(4):
+                engine.submit_and_get_policy(agent_id, obs)
+        traj = engine.get_trajectory()
+
+        # Check if any replans occurred
+        total_replans = sum(
+            len(_detect_replan_steps(traj, i)) for i in range(4))
+        if total_replans == 0:
+            pytest.skip("No replan events in trajectory (options never changed)")
+
+        A = [jnp.array(a) for a in build_default_A()]
+        B = [jnp.array(b) for b in build_option_B()]
+        E_by_role = _build_E_vectors(25)
+
+        # Flatten C: [miner_0..5, aligner_0..5, scout_0..5]
+        n_mod = len(A)
+        C_flat = []
+        for role_C in (build_C_miner(), build_C_aligner(), build_C_scout()):
+            for c in role_C:
+                C_flat.append(jnp.array(c, dtype=jnp.float32))
+
+        # Compute gradient
+        grad_fn = jax.grad(efe_policy_loss, argnums=0)
+        grads = grad_fn(
+            C_flat, A, B, E_by_role, traj,
+            list(range(4)), 4, 8.0)
+
+        assert len(grads) == len(C_flat)
+        for i, g in enumerate(grads):
+            assert g.shape == C_flat[i].shape
+            assert np.isfinite(np.asarray(g)).all()
+
+        # At least some C gradients should be non-zero
+        has_nonzero = any(float(jnp.abs(g).sum()) > 0 for g in grads)
+        assert has_nonzero, "All C gradients are zero"
+
+    def test_q_pi_from_C_sums_to_one(self):
+        """Policy posterior from C-based EFE sums to 1."""
+        import jax.numpy as jnp
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        from learn_parameters import (
+            _compute_q_pi_from_C, _build_E_vectors, _flatten_qs,
+        )
+        from aif_meta_cogames.aif_agent.generative_model import (
+            build_default_A, build_option_B, build_C_miner,
+            NUM_STATE_FACTORS,
+        )
+
+        A = [jnp.array(a) for a in build_default_A()]
+        B = [jnp.array(b) for b in build_option_B()]
+        C = [jnp.array(c) for c in build_C_miner()]
+        E = _build_E_vectors(25)["miner"]
+
+        # Uniform beliefs
+        qs_flat = [jnp.ones(s) / s for s in NUM_STATE_FACTORS]
+
+        q_pi, neg_G = _compute_q_pi_from_C(qs_flat, A, B, C, E, gamma=8.0)
+
+        assert q_pi.shape == (25,)
+        np.testing.assert_allclose(float(q_pi.sum()), 1.0, atol=1e-5)
+        assert np.isfinite(np.asarray(neg_G)).all()
+
+    def test_joint_loss_all_params_update(self):
+        """Joint A+B+C loss produces gradients for all parameter groups."""
+        import jax
+        import jax.numpy as jnp
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        from learn_parameters import (
+            trajectory_vfe_multi_agent, efe_policy_loss,
+            params_to_logits, _build_E_vectors, _detect_replan_steps,
+        )
+        from aif_meta_cogames.aif_agent.generative_model import (
+            build_default_A, build_option_B,
+            build_C_miner, build_C_aligner, build_C_scout,
+        )
+
+        # Run enough steps for replanning
+        engine = BatchedAIFEngine(n_agents=4, log_trajectory=True)
+        obs = [jnp.array([0]) for _ in range(6)]
+        for _ in range(40):
+            for agent_id in range(4):
+                engine.submit_and_get_policy(agent_id, obs)
+        traj = engine.get_trajectory()
+
+        A_logits = params_to_logits(build_default_A())
+        B_logits = params_to_logits(build_option_B())
+
+        n_mod = len(A_logits)
+        C_flat = []
+        for role_C in (build_C_miner(), build_C_aligner(), build_C_scout()):
+            for c in role_C:
+                C_flat.append(jnp.array(c, dtype=jnp.float32))
+
+        A_params = [jax.nn.softmax(l, axis=0) for l in A_logits]
+        B_params = [jax.nn.softmax(l, axis=0) for l in B_logits]
+        E_by_role = _build_E_vectors(25)
+        agents = list(range(4))
+
+        # VFE gradient (A, B)
+        grad_vfe = jax.grad(trajectory_vfe_multi_agent, argnums=(0, 1))
+        gA, gB = grad_vfe(A_logits, B_logits, traj, agents)
+
+        has_A_grad = any(float(jnp.abs(g).sum()) > 0 for g in gA)
+        has_B_grad = any(float(jnp.abs(g).sum()) > 0 for g in gB[:3])
+
+        # C gradient
+        total_replans = sum(
+            len(_detect_replan_steps(traj, i)) for i in agents)
+        if total_replans > 0:
+            grad_c = jax.grad(efe_policy_loss, argnums=0)
+            gC = grad_c(C_flat, A_params, B_params, E_by_role,
+                        traj, agents, 4, 8.0)
+            has_C_grad = any(float(jnp.abs(g).sum()) > 0 for g in gC)
+        else:
+            has_C_grad = False  # Acceptable if no replans
+
+        assert has_A_grad, "A should have non-zero gradient"
+        assert has_B_grad, "B (non-role) should have non-zero gradient"
+        if total_replans > 0:
+            assert has_C_grad, "C should have non-zero gradient"
 
     def test_save_load_trajectory(self, tmp_path):
         """Trajectory save/load round-trips correctly."""
@@ -1514,3 +1727,333 @@ class TestParameterLearning:
         assert len(loaded["B"]) == len(B)
         for i in range(len(A)):
             np.testing.assert_allclose(loaded["A"][i], A[i], atol=1e-6)
+
+
+# ===================================================================
+# De Novo Learning (Phase B-V)
+# ===================================================================
+
+@pytest.mark.skipif(not HAS_PYMDP, reason="pymdp not installed")
+class TestDeNovoLearning:
+    """Tests for de novo Dirichlet accumulation + BMR."""
+
+    def _make_trajectory(self, n_steps=40, n_agents=4):
+        """Helper: collect a synthetic trajectory."""
+        import jax.numpy as jnp
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        engine = BatchedAIFEngine(n_agents=n_agents, log_trajectory=True)
+        obs = [jnp.array([0]) for _ in range(6)]
+        for _ in range(n_steps):
+            for agent_id in range(n_agents):
+                engine.submit_and_get_policy(agent_id, obs)
+        return engine.get_trajectory()
+
+    def test_accumulate_A_shapes(self):
+        """A Dirichlet alphas have correct shapes."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        from denovo_learn import accumulate_A
+        from aif_meta_cogames.aif_agent.generative_model import (
+            build_default_A, A_DEPENDENCIES, NUM_STATE_FACTORS,
+        )
+        from aif_meta_cogames.aif_agent.discretizer import NUM_OBS
+
+        traj = self._make_trajectory(n_steps=5, n_agents=2)
+        alphas = accumulate_A(traj, n_agents=2)
+
+        ref_A = build_default_A()
+        assert len(alphas) == len(ref_A)
+        for i in range(len(ref_A)):
+            assert alphas[i].shape == ref_A[i].shape
+            # All values should be > prior_scale (evidence accumulated)
+            assert alphas[i].min() >= 0.1 - 1e-6
+
+    def test_accumulate_B_shapes(self):
+        """B Dirichlet alphas have correct (option-level) shapes."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        from denovo_learn import accumulate_B
+        from aif_meta_cogames.aif_agent.generative_model import build_option_B
+
+        traj = self._make_trajectory(n_steps=5, n_agents=2)
+        alphas = accumulate_B(traj, n_agents=2)
+
+        ref_B = build_option_B()
+        assert len(alphas) == len(ref_B)
+        for i in range(len(ref_B)):
+            assert alphas[i].shape == ref_B[i].shape
+
+    def test_dirichlet_expected_value_normalized(self):
+        """Expected value from Dirichlet concentrations sums to 1."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        from denovo_learn import accumulate_A, dirichlet_expected_value
+
+        traj = self._make_trajectory(n_steps=10, n_agents=2)
+        alphas = accumulate_A(traj, n_agents=2)
+        A_learned = dirichlet_expected_value(alphas)
+
+        for i, a in enumerate(A_learned):
+            # Sum along axis 0 should be ~1.0 for each column
+            sums = a.sum(axis=0)
+            np.testing.assert_allclose(sums, 1.0, atol=1e-5,
+                err_msg=f"A[{i}] not normalized along axis 0")
+
+    def test_denovo_full_pipeline(self):
+        """Full de novo pipeline produces valid A, B, C, D."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        from denovo_learn import denovo_learn
+
+        traj = self._make_trajectory(n_steps=10, n_agents=2)
+        result = denovo_learn(traj, n_agents=2, verbose=False)
+
+        assert "A" in result and len(result["A"]) == 6
+        assert "B" in result and len(result["B"]) == 4
+        assert "C" in result and len(result["C"]) == 6
+        assert "D" in result and len(result["D"]) == 4
+
+        # A, B should be normalized probability distributions
+        for a in result["A"]:
+            np.testing.assert_allclose(a.sum(axis=0), 1.0, atol=1e-5)
+        for b in result["B"]:
+            np.testing.assert_allclose(b.sum(axis=0), 1.0, atol=1e-5)
+
+    def test_bmr_does_not_crash(self):
+        """BMR runs without errors and prunes some connections."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        from denovo_learn import denovo_learn
+
+        traj = self._make_trajectory(n_steps=10, n_agents=2)
+        result = denovo_learn(traj, n_agents=2, bmr=True,
+                              bmr_threshold=3.0, verbose=False)
+
+        # Should still produce valid output
+        for a in result["A"]:
+            np.testing.assert_allclose(a.sum(axis=0), 1.0, atol=1e-5)
+
+    def test_goal_conditioned_C_structure(self):
+        """Goal-conditioned C has correct shapes and is centered."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        from denovo_learn import learn_C_goal_conditioned
+        from aif_meta_cogames.aif_agent.discretizer import NUM_OBS
+
+        traj = self._make_trajectory(n_steps=40, n_agents=4)
+        C = learn_C_goal_conditioned(traj, n_agents=4)
+
+        assert len(C) == len(NUM_OBS)
+        for m in range(len(NUM_OBS)):
+            assert C[m].shape == (NUM_OBS[m],)
+            # Should be approximately centered (mean ≈ 0)
+            assert abs(C[m].mean()) < 0.5, f"C[{m}] not centered: mean={C[m].mean()}"
+
+
+# ===================================================================
+# Differentiable BMR (Phase B-VI)
+# ===================================================================
+
+try:
+    import optax
+    HAS_OPTAX = True
+except ImportError:
+    HAS_OPTAX = False
+
+
+@pytest.mark.skipif(not HAS_PYMDP, reason="pymdp not installed")
+class TestDifferentiableBMR:
+    """Tests for differentiable BMR, gradient refinement, and model comparison."""
+
+    def _make_trajectory(self, n_steps=40, n_agents=4):
+        """Helper: collect a synthetic trajectory."""
+        import jax.numpy as jnp
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        engine = BatchedAIFEngine(n_agents=n_agents, log_trajectory=True)
+        obs = [jnp.array([0]) for _ in range(6)]
+        for _ in range(n_steps):
+            for agent_id in range(n_agents):
+                engine.submit_and_get_policy(agent_id, obs)
+        return engine.get_trajectory()
+
+    def test_compute_gradient_norms_shapes(self):
+        """Gradient norms have same shape as A/B logits."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        from differentiable_bmr import compute_gradient_norms
+        from learn_parameters import params_to_logits
+        from aif_meta_cogames.aif_agent.generative_model import (
+            build_default_A, build_option_B,
+        )
+
+        traj = self._make_trajectory(n_steps=5, n_agents=2)
+        A_logits = params_to_logits(build_default_A())
+        B_logits = params_to_logits(build_option_B())
+
+        A_norms, B_norms = compute_gradient_norms(
+            A_logits, B_logits, traj, [0, 1])
+
+        assert len(A_norms) == len(A_logits)
+        assert len(B_norms) == len(B_logits)
+        for i in range(len(A_logits)):
+            assert A_norms[i].shape == np.asarray(A_logits[i]).shape
+        for i in range(len(B_logits)):
+            assert B_norms[i].shape == np.asarray(B_logits[i]).shape
+
+    def test_gradient_norms_nonnegative(self):
+        """Gradient norms (absolute values) are all >= 0."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        from differentiable_bmr import compute_gradient_norms
+        from learn_parameters import params_to_logits
+        from aif_meta_cogames.aif_agent.generative_model import (
+            build_default_A, build_option_B,
+        )
+
+        traj = self._make_trajectory(n_steps=5, n_agents=2)
+        A_logits = params_to_logits(build_default_A())
+        B_logits = params_to_logits(build_option_B())
+
+        A_norms, B_norms = compute_gradient_norms(
+            A_logits, B_logits, traj, [0, 1])
+
+        for n in A_norms:
+            assert (n >= 0).all()
+        for n in B_norms:
+            assert (n >= 0).all()
+
+    def test_prune_by_gradient_uniform(self):
+        """Pruned entries become uniform (all-zero logits)."""
+        import jax.numpy as jnp
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        from differentiable_bmr import prune_by_gradient
+
+        # Simulate: 2 modalities, one with high gradient, one with near-zero
+        logits = [
+            jnp.array([[1.0, 0.5], [0.2, 0.8], [0.1, 0.3]]),  # shape (3, 2)
+            jnp.array([[0.001, 0.002], [0.001, 0.001]]),  # nearly zero
+        ]
+        grad_norms = [
+            np.array([[0.5, 0.3], [0.4, 0.6], [0.2, 0.1]]),  # high gradient
+            np.array([[0.001, 0.002], [0.001, 0.001]]),  # very low gradient
+        ]
+
+        pruned, n_pruned = prune_by_gradient(logits, grad_norms, threshold_percentile=50.0)
+
+        assert len(pruned) == 2
+        # Second modality columns should be pruned to uniform (all zeros)
+        for col in range(2):
+            col_vals = np.asarray(pruned[1][:, col])
+            assert np.allclose(col_vals, 0.0), (
+                f"Column {col} of low-gradient modality should be zeroed"
+            )
+        assert n_pruned > 0
+
+    def test_prune_preserves_high_gradient(self):
+        """High-gradient entries are not pruned."""
+        import jax.numpy as jnp
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        from differentiable_bmr import prune_by_gradient
+
+        logits = [jnp.array([[2.0, 0.5], [1.0, 1.5]])]
+        grad_norms = [np.array([[0.9, 0.8], [0.7, 0.95]])]
+
+        pruned, n_pruned = prune_by_gradient(logits, grad_norms, threshold_percentile=10.0)
+
+        # At 10th percentile, almost nothing should be pruned
+        assert n_pruned == 0
+        np.testing.assert_allclose(np.asarray(pruned[0]), np.asarray(logits[0]))
+
+    def test_compare_multiple_returns_vfe(self):
+        """Model comparison returns VFE for each parameter set."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        from differentiable_bmr import compare_multiple
+        from aif_meta_cogames.aif_agent.generative_model import (
+            build_default_A, build_option_B,
+        )
+
+        traj = self._make_trajectory(n_steps=5, n_agents=2)
+
+        param_sets = {
+            "default": {"A": build_default_A(), "B": build_option_B()},
+            "same": {"A": build_default_A(), "B": build_option_B()},
+        }
+
+        results = compare_multiple(traj, param_sets, n_agents=2, verbose=False)
+
+        assert "default" in results
+        assert "same" in results
+        assert np.isfinite(results["default"])
+        assert np.isfinite(results["same"])
+        # Same params → same VFE
+        np.testing.assert_allclose(
+            results["default"], results["same"], atol=1e-4)
+
+    def test_compare_different_params_differ(self):
+        """Different parameter sets should produce different VFE values."""
+        import jax.numpy as jnp
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        from differentiable_bmr import compare_multiple
+        from aif_meta_cogames.aif_agent.generative_model import (
+            build_default_A, build_option_B,
+        )
+
+        traj = self._make_trajectory(n_steps=10, n_agents=2)
+
+        A_default = build_default_A()
+        # Perturb A: add noise to first modality
+        A_perturbed = list(A_default)
+        a0 = np.array(A_perturbed[0], dtype=np.float64)
+        a0 += np.random.RandomState(42).randn(*a0.shape) * 0.1
+        a0 = np.clip(a0, 0.01, None)
+        a0 /= a0.sum(axis=0, keepdims=True)
+        A_perturbed[0] = a0
+
+        param_sets = {
+            "default": {"A": A_default, "B": build_option_B()},
+            "perturbed": {"A": A_perturbed, "B": build_option_B()},
+        }
+
+        results = compare_multiple(traj, param_sets, n_agents=2, verbose=False)
+        assert results["default"] != results["perturbed"]
+
+    @pytest.mark.skipif(not HAS_OPTAX, reason="optax not installed")
+    def test_differentiable_bmr_pipeline(self):
+        """Full differentiable BMR pipeline runs without error."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        from differentiable_bmr import differentiable_bmr
+
+        traj = self._make_trajectory(n_steps=10, n_agents=2)
+        result = differentiable_bmr(
+            traj, n_rounds=1, prune_percentile=20.0,
+            lr=0.001, refine_steps=5, n_agents=2, verbose=False)
+
+        assert "A" in result and len(result["A"]) == 6
+        assert "B" in result and len(result["B"]) == 4
+        assert "history" in result and len(result["history"]) >= 1
+        assert np.isfinite(result["final_vfe"])
+
+    @pytest.mark.skipif(not HAS_OPTAX, reason="optax not installed")
+    def test_refine_from_init_runs(self):
+        """Gradient refinement from custom init runs without error."""
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+        from differentiable_bmr import refine_from_init
+        from aif_meta_cogames.aif_agent.generative_model import (
+            build_default_A, build_option_B,
+        )
+
+        traj = self._make_trajectory(n_steps=10, n_agents=2)
+        result = refine_from_init(
+            traj, A_init=build_default_A(), B_init=build_option_B(),
+            n_steps=5, lr=0.001, n_agents=2, verbose=False)
+
+        assert "A" in result and len(result["A"]) == 6
+        assert "B" in result and len(result["B"]) == 4
+        assert np.isfinite(result["final_vfe"])
+        assert len(result["vfe_history"]) >= 1

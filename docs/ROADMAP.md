@@ -251,9 +251,9 @@ The A/B matrices at 288 states are the meta-learning target:
 
 ---
 
-## Phase 3c: Parameter Learning + Social Coordination (Current Focus)
+## Phase 3c: Parameter Learning + Social Coordination
 
-**Lead**: Mahault | **Started**: 2026-03-31
+**Lead**: Mahault | **Started**: 2026-03-31 | **Parameter Learning (B-I through B-VI): COMPLETE** (2026-04-01)
 
 ### Motivation
 
@@ -266,16 +266,24 @@ comes from two sources:
 
 ### Phased Approach
 
-The plan is six phases (A-F), each building on the previous:
+Parameter learning (B-I through B-VI) builds incrementally, then social coordination (C-F):
 
 | Phase | Goal | Key Mechanism | Status |
 |-------|------|--------------|--------|
 | A | Stabilize baseline | Revert nav regression, confirm 1.50j (4-agent) | **COMPLETE** |
-| B | Learn optimal parameters | JAX gradient descent on VFE over trajectories | **COMPLETE** |
+| B-I | Learn A matrices | JAX gradient descent on VFE over trajectories | **COMPLETE** |
+| B-II | Learn B matrices | Transition prediction loss (VFE complexity term) | **COMPLETE** |
+| B-III | Learn C vectors | Inverse EFE / behavioral cloning (Shin et al. 2022) | **COMPLETE** |
+| B-IV | Joint A+B+C optimization | Two-timescale loss with separate Adam optimizers | **COMPLETE** |
+| B-V | De novo learning (literal) | Friston (2025): Dirichlet accumulation + BMR | **COMPLETE** |
+| B-VI | De novo-inspired gradient | Differentiable BMR + model comparison | **COMPLETE** |
 | C | Plan broadcasting | Agents share intended targets to avoid overlap | Pending |
 | D | Bayesian model comparison | Compare learned vs hand-tuned via VFE evidence | Pending |
 | E | Factorised social AIF | Joint preferences, factored multi-agent beliefs | Pending |
 | F | Full theory of mind | Recursive agent models via sophisticated inference | Pending |
+
+**See also**: [docs/LITERATURE_REVIEW.md](LITERATURE_REVIEW.md) for the full academic survey
+(45 papers) informing these phases.
 
 ---
 
@@ -298,7 +306,7 @@ detection) caused regression from 2.00 to 0.50 junctions. Also discovered critic
 
 ---
 
-### Phase B: Differentiable Parameter Learning
+### Phase B-I: A Matrix Learning (Differentiable VFE)
 
 **Why**: Hand-tuned A/B/C/D matrices are the #1 bottleneck. pymdp 1.0 is fully
 JAX-differentiable, enabling `jax.grad(VFE)` through the inference pipeline.
@@ -433,6 +441,307 @@ because aligners observe all inventory states (HAS_RES=45%, HAS_BOTH=54%).
 - Da Costa et al. (2020): Active Inference on Discrete State-Spaces — Dirichlet parameter learning
 - Fountas et al. (2020): Deep Active Inference — end-to-end differentiable AIF
 - Sajid et al. (2021): Active Inference: Demystified and Compared — parameter learning review
+
+---
+
+### Phase B-II: B Matrix Learning (Transition Prediction Loss) — COMPLETE
+
+**Why**: Phase B-I only learned A matrices. B matrices received **zero gradient**
+because `trajectory_vfe()` line 173 explicitly discards B_logits (`_ = B_logits`).
+All saved B matrices from B3-B7 are identical to defaults.
+
+**Theoretical basis**: B learning from VFE is well-established (Friston et al. 2016,
+Da Costa et al. 2020). The proper objective is the transition prediction cross-entropy:
+
+```
+L_B = -sum_t E_q(s_t) E_q(s_{t+1}) [ln B(s'|s, a)]
+```
+
+This is the VFE complexity term — it penalizes the KL between inferred posterior
+over next state and the B-predicted prior. Equivalent to the Bayesian Dirichlet
+update `alpha' = alpha + q(s') outer q(s) * 1(a)` but in gradient form.
+
+**Implementation plan**:
+
+1. **Add `_compute_transition_loss_factored()`** to `learn_parameters.py`:
+   - For each factor f: predict P(s'_f | s_deps, a) via B contraction with q(s_deps)
+   - Loss = -sum_f sum_{s'} q(s'_f, t+1) * ln P_predicted(s'_f)
+   - Uses consecutive (qs_t, qs_{t+1}, action_t) from existing trajectory data
+
+2. **Replace `_ = B_logits`** with actual B usage in `trajectory_vfe()`:
+   - B enters through the transition prediction loss
+   - Use **option-level B** (5 macro-options from `build_option_B()`), not task-level (13)
+   - Freeze B_role (identity — roles never change)
+
+3. **Factor-aware learning**:
+   - B_phase (6,6,4,5) and B_hand (4,6,4,5) have joint dependencies on [phase, hand]
+   - B_target (3,3,5) depends only on target_mode
+   - B_role (4,4,5) is identity — freeze (zero gradient mask)
+
+**Key insight from literature**: Tschantz et al. (2020) show learned B matrices need
+not match true dynamics — only task-relevant transitions matter. Our factored B
+naturally captures this: B_role stays identity, B_phase/B_hand learn economy chain.
+
+**Validation**:
+- `test_transition_loss_gradient_exists` — verify dL/dB non-zero for phase, hand, target
+- `test_B_converges_toward_correct_transitions` — synthetic known-B recovery
+- Live eval with learned B vs default: compare junctions and move failures
+
+---
+
+### Phase B-III: C Vector Learning (Inverse EFE) — COMPLETE
+
+**Why**: C vectors (prior preferences over observations) drive policy selection
+through EFE but **do not appear in VFE**. Therefore C cannot be learned from VFE —
+it requires an EFE-based objective.
+
+**Theoretical basis**: Shin, Kim & Hwang (2022) "Prior Preference Learning from
+Experts" treat EFE as a negative value function and recover C from demonstrations
+via MaxEnt IRL. The formal equivalence: `ln P(o|C)` in AIF = `r(s,a)` in MaxEnt RL
+(Levine 2018, Millidge et al. 2020).
+
+**Key principle**: Find C such that the EFE-optimal policy reproduces observed
+(successful) behavior:
+
+```
+Loss_C = -ln q_pi(a_observed)
+where q_pi = softmax(gamma * neg_G + ln E)
+and G depends on C through compute_expected_utility(qo, C)
+```
+
+This is cross-entropy between the observed policy and the EFE-derived policy
+distribution. The full pymdp EFE computation is differentiable in JAX — no
+`stop_gradient` anywhere. C enters via `compute_expected_utility(qo, C) = sum_m qo[m] * C[m]`.
+
+**Implementation plan**:
+
+1. **Add `_efe_policy_loss()`** to `learn_parameters.py`:
+   - At each replan step (when macro-option changes): extract qs and observed_option
+   - Reconstruct a pymdp Agent with current A, B, C, E
+   - Call `infer_policies(qs)` → get q_pi over 25 two-step policies
+   - Loss = -ln q_pi[observed_option_policy_index]
+   - Per-role C: use agent role to select miner/aligner/scout C for each agent
+
+2. **Trajectory augmentation** (prerequisite):
+   - Modify `_select_option` in `cogames_policy.py` to store neg_efe and q_pi
+   - Record when replanning occurs (option termination events)
+   - Needed: which option was chosen, the beliefs at decision time
+
+3. **C parameterization**:
+   - 6 C vectors (one per obs modality) × 3 roles = 18 learnable vectors
+   - Unconstrained parameterization (C can be any real number — log-preferences)
+   - Lower learning rate: 0.1× base LR (C is sensitive through softmax)
+
+4. **Circular dependency mitigation**:
+   - Learning C from trajectories collected with hand-tuned C would recover
+     the hand-tuned values (tautological)
+   - **Solution**: First learn A+B (B-I + B-II), collect NEW trajectories with
+     learned A+B (different behavior), then learn C from improved trajectories
+   - Alternative: Learn C from RL agent trajectories (PPO-trained), which use
+     a different policy mechanism (reward-based) — breaks the circularity
+
+**EFE degeneracy warning** (Champion et al. 2023): Monitor for entropy collapse
+in q_pi during training. If the agent "becomes an expert at predicting outcomes
+for a single action," the epistemic term degenerates. Use entropy regularization
+on q_pi as a safeguard.
+
+**Validation**:
+- `test_efe_policy_loss_gradient_exists` — verify dL/dC non-zero
+- `test_C_gradient_increases_observed_option_preference` — direction check
+- Live eval with learned C: compare junctions vs B5 baseline (2.20 j/agent)
+
+---
+
+### Phase B-IV: Joint A+B+C Optimization — COMPLETE
+
+**Why**: Learning A, B, C separately may miss interactions. Joint optimization
+lets the model find parameter configurations that work together.
+
+**Theoretical basis**: The two-timescale approach recommended by the deep AIF
+literature (Millidge 2020, Fountas et al. 2020): fast VFE updates for world model
+(A, B), slow EFE updates for preferences (C).
+
+**Combined loss**:
+
+```
+L_total = w_A * L_vfe(A)           # Perception: VFE accuracy term
+        + w_B * L_transition(B)    # Dynamics: VFE complexity term
+        + w_C * L_policy(A,B,C)    # Preferences: inverse EFE cross-entropy
+        + w_kl * L_regularization  # Prevent drift from priors
+```
+
+**Implementation plan**:
+
+1. **New `learn_full_parameters()`** in `learn_parameters.py`:
+   - Separate Adam optimizers per parameter group: A, B, C
+   - A and B: base learning rate (0.001)
+   - C: 0.1× learning rate (scale sensitivity)
+   - Multi-agent averaging across all roles (prevents role bias)
+   - Per-role C: miner/aligner/scout learned independently
+
+2. **Training schedule**:
+   - Phase 1 (steps 0-100): A+B only (w_C=0) — establish world model
+   - Phase 2 (steps 100-300): A+B+C jointly — add preference learning
+   - Phase 3 (steps 300-500): All with reduced LR — fine-tuning
+
+3. **New CLI**: `python learn_parameters.py learn-full --trajectory X --output Y`
+   - Flags: `--a-weight`, `--b-weight`, `--c-weight`, `--kl-weight`
+   - `--schedule staged` (default) or `--schedule joint` (all from start)
+   - `--c-source {same,rl}` — use same trajectory or RL agent trajectory for C
+
+**Validation**:
+- `test_joint_loss_all_params_update` — A, B, C all receive gradients
+- Compare staged vs joint schedule on junction captures
+- Compare with B5 (A-only, 2.20j) — target: exceed B5
+
+---
+
+### Phase B-V: De Novo Learning — Literal (Friston 2025) — COMPLETE
+
+**Why**: Gradient-based learning requires differentiable objectives and may get
+stuck in local optima. Friston et al. (2025) "Gradient-Free De Novo Learning"
+offers a complementary approach that learns **all parameters (A, B, C, D)** from
+scratch without gradients, using structure discovery + Bayesian model reduction.
+
+**Reference**: Friston, K. et al. (2025). "Gradient-Free De Novo Learning."
+*Entropy*, 27(9), 992. [PMC12468873]
+
+**The three-phase pipeline**:
+
+#### Phase 1: Structure Discovery (Spectral Clustering)
+
+Discover hidden state structure from raw observation trajectories:
+
+1. Collect observation sequences from CogsGuard episodes
+2. Compute similarity matrix over observation windows (e.g., cosine similarity
+   of 10-step observation subsequences)
+3. Spectral decomposition: eigenvalue gap determines number of hidden states
+4. Assign observation windows to discovered clusters
+5. Compare discovered structure with our hand-designed 4-factor decomposition
+
+**Key question**: Does spectral clustering recover something like phase × hand ×
+target_mode × role? Or a different factorization? This would validate (or challenge)
+our hand-designed state space.
+
+**Implementation**:
+- `scripts/denovo_structure.py`: spectral clustering on trajectory observations
+- Input: raw `.npz` trajectory data (3,600 episodes)
+- Output: discovered state assignments, eigenvalue spectrum, cluster statistics
+- Comparison: mutual information between discovered clusters and our hand-designed states
+
+#### Phase 2: Parameter Learning (Dirichlet + BMR)
+
+Given discovered (or hand-designed) structure, learn A, B, C, D via:
+
+1. **A learning**: Count observation-state co-occurrences → Dirichlet concentration
+   parameters. `alpha_A[i,j] += sum_t 1{o=i} * q(s=j)`
+2. **B learning**: Count state transition co-occurrences → Dirichlet concentration.
+   `alpha_B[j,k,l] += sum_t q(s'=j) * q(s=k) * 1{a=l}`
+3. **D learning**: Count initial state beliefs → Dirichlet. `alpha_D[j] += q(s_1=j)`
+4. **C learning via goal-state identification**:
+   - Identify observation patterns associated with reward (junction captures)
+   - Set C to prefer observations that precede successful capture events
+   - This is NOT gradient-based — it's reward-conditioned counting
+
+5. **Bayesian Model Reduction (BMR)**:
+   - After accumulating parameters, prune A/B connections that don't contribute
+   - Test: does removing A[m][i,j] increase VFE? If not, set to zero
+   - Bidirectional: also test adding connections not in the current model
+   - **Reachability analysis**: identify states that connect to goal states
+
+**Implementation**:
+- `scripts/denovo_learn.py`: Dirichlet accumulation + BMR pipeline
+- Input: trajectory data + state assignments (from Phase 1 or hand-designed)
+- Output: learned A, B, C, D + pruned model structure
+- Uses pymdp's `dirichlet_expected_value()` for expected parameters
+
+#### Phase 3: Refinement (Online + Inductive Inference)
+
+Deploy the de novo-learned model and refine during live play:
+
+1. Agent uses learned model for planning (EFE-based policy selection)
+2. Online Dirichlet updates continue accumulating evidence
+3. BMR periodically simplifies the model (every N episodes)
+4. **Inductive inference**: successful actions generate positive evidence
+   for the transitions/observations that led to them
+
+**Implementation**:
+- Extend `BatchedAIFEngine` with periodic BMR sweeps
+- Monitor VFE trajectory: if VFE increases after simplification, revert
+- Compare: de novo model vs gradient-learned model (B5) vs default
+
+**Expected outcomes**:
+- Structure discovery reveals whether 288 states is the right granularity
+- Dirichlet-learned A/B should match gradient-learned A (B5) if both are correct
+- C from goal-state identification provides an independent C estimate
+  (compare with inverse-EFE C from Phase B-III)
+- BMR may discover that some state factors/modalities are redundant
+
+---
+
+### Phase B-VI: De Novo-Inspired Gradient Approach — COMPLETE
+
+**Why**: The de novo pipeline (B-V) uses Bayesian counting — slow convergence,
+no gradient information. This phase adapts the de novo **ideas** into our JAX
+differentiable framework, combining the best of both worlds.
+
+**What we borrow from de novo**:
+
+1. **Growth-reduction cycle** → Differentiable model selection:
+   - Start with a simpler model (fewer states/factors)
+   - Learn parameters via gradient descent (B-I through B-IV)
+   - Evaluate via VFE: does adding a state factor improve VFE?
+   - Differentiable BMR: use `jax.grad` through the VFE to identify
+     which A/B connections have near-zero gradient (candidates for pruning)
+
+2. **Spectral structure as initialization** → Better starting point:
+   - Use spectral clustering (B-V Phase 1) to initialize A/B/D
+   - Then refine with gradient descent (B-I through B-IV)
+   - Hypothesis: spectral init + gradient refinement > random init + gradient
+
+3. **Goal-conditioned C initialization** → Better C starting point:
+   - Use reward-conditioned observation counting (B-V Phase 2) to initialize C
+   - Then refine C with inverse EFE gradients (B-III)
+   - Breaks the circular dependency: C starts from environment structure,
+     not from hand-tuned values
+
+4. **Automatic model complexity selection**:
+   - Define a family of models: 72-state (3-factor), 288-state (4-factor),
+     576-state (5-factor), etc.
+   - Learn parameters for each via gradient descent
+   - Compare via VFE evidence (Bayesian model comparison from Phase D)
+   - Select the model with best VFE-performance trade-off
+
+**Implementation plan**:
+
+1. **Differentiable BMR** (`scripts/differentiable_bmr.py`):
+   - Compute gradient norm ||dL/dA[m][i,j]|| for all A/B entries
+   - Entries with ||grad|| < epsilon are candidates for pruning
+   - Prune by setting to uniform + re-optimizing remaining parameters
+   - Iterate until VFE stabilizes
+
+2. **Spectral-initialized gradient learning** (`scripts/learn_parameters.py`):
+   - New flag: `--init spectral` (vs `--init default` or `--init random`)
+   - Load spectral structure from B-V Phase 1 output
+   - Convert cluster assignments to initial A/B matrices
+   - Run gradient optimization from spectral initialization
+
+3. **Model family comparison** (`scripts/model_comparison.py`):
+   - Define model specifications: {3-factor, 4-factor, 5-factor} × {gradient, denovo}
+   - For each: learn parameters, evaluate VFE on held-out trajectory
+   - Bayes factor comparison: exp(VFE_1 - VFE_2)
+   - Paired with junction capture performance
+
+**Expected outcomes**:
+- Differentiable BMR identifies which A/B entries are truly informative
+- Spectral init may accelerate convergence over default init
+- Model comparison reveals optimal state space granularity
+- Combined approach (de novo structure + gradient parameters) should
+  outperform either alone
+
+**This phase connects to Phase 4 (Neural AIF)**: If model comparison reveals
+that discrete state spaces are too coarse, this motivates moving to neural
+generative models where the state space is learned end-to-end.
 
 ---
 

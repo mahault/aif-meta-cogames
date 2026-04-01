@@ -4,7 +4,7 @@
 **For**: Subhojeet (Softmax PI)
 
 > **Related docs**:
-> - [AIF_COGSGUARD_DESIGN.md](AIF_COGSGUARD_DESIGN.md) — Full 216-state architecture & references
+> - [docs/DESIGN.md](docs/DESIGN.md) — Full 288-state architecture & references
 > - [ROADMAP.md](ROADMAP.md) — Active execution plan
 > - [LITERATURE.md](LITERATURE.md) — Papers & methods
 

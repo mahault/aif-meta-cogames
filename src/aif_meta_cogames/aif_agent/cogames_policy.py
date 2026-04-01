@@ -406,10 +406,11 @@ def _select_option(agent, qs):
     """JIT-compilable option selection -- runs at option termination (~42ms).
 
     Evaluates EFE over 25 two-step option policies and samples.
+    Returns (selected_options, q_pi, neg_efe) for trajectory logging.
     """
-    q_pi, _efe = agent.infer_policies(qs)
+    q_pi, neg_efe = agent.infer_policies(qs)
     sampled = agent.sample_action(q_pi)
-    return sampled[:, 0], q_pi
+    return sampled[:, 0], q_pi, neg_efe
 
 
 # ---------------------------------------------------------------------------
@@ -720,6 +721,10 @@ class BatchedAIFEngine:
         self._prev_obs = None
         self._prev_actions = None
 
+        # EFE logging buffers (for trajectory augmentation, Phase B-II)
+        self._last_q_pi = None
+        self._last_neg_efe = None
+
         # Level 0: Navigation POMDP (with B-learning by default)
         self.nav_agent = create_nav_agent(n_agents, policy_len=2,
                                           learn_B=True)
@@ -869,7 +874,9 @@ class BatchedAIFEngine:
             if replan_needed:
                 # Context-dependent E: update habit prior based on inventory
                 agent = self._apply_context_E() if self.context_E else self.agent
-                options, _q_pi = self._jit_select_option(agent, qs)
+                options, q_pi, neg_efe = self._jit_select_option(agent, qs)
+                self._last_q_pi = q_pi
+                self._last_neg_efe = neg_efe
                 for i in replan_needed:
                     new_option = int(options[i])
                     self.option_executor.set_option(i, new_option)
@@ -924,14 +931,19 @@ class BatchedAIFEngine:
 
         # Trajectory logging for offline parameter learning
         if self.log_trajectory:
-            self._trajectory.append({
+            record = {
                 "step": self._step_count,
                 "obs": [np.asarray(o) for o in batched_obs],      # 6 × (N, T)
                 "qs": [np.asarray(q) for q in qs],                # 4 × (N, S_f)
                 "prior": [np.asarray(p) for p in self.empirical_prior],
                 "actions": np.asarray(self._option_actions),       # (N, 4)
                 "options": self._current_options.copy(),           # (N,)
-            })
+            }
+            # Augment with EFE data when available (Phase B-II)
+            if self._last_q_pi is not None:
+                record["q_pi"] = np.asarray(self._last_q_pi)      # (N, n_policies)
+                record["neg_efe"] = np.asarray(self._last_neg_efe) # (N, n_policies)
+            self._trajectory.append(record)
 
         # Store for next B-learning step
         self._prev_qs = qs
