@@ -673,18 +673,40 @@ class BatchedAIFEngine:
         self.log_trajectory = log_trajectory
         self._trajectory: list[dict] = []  # list of per-step records
 
-        # Load learned A matrices if provided (Phase B offline learning)
+        # Load learned parameters if provided (Phase B offline learning)
         custom_A = None
+        custom_B = None
+        custom_C = None
         if learned_params_path:
             params_data = np.load(learned_params_path)
+            # A matrices (existing)
             n_A = len(NUM_OBS)
             custom_A = [params_data[f"A_{i}"] for i in range(n_A)]
             print(f"[AIF] Loaded learned A matrices from {learned_params_path}")
+            # B matrices (Phase B-II+)
+            if "B_0" in params_data:
+                custom_B = [params_data[f"B_{i}"] for i in range(4)]
+                print(f"[AIF] Loaded learned B matrices ({len(custom_B)} factors)")
+            # Per-role C vectors (Phase B-IV+)
+            roles_path = learned_params_path.replace(".npz", "_roles.npz")
+            if os.path.exists(roles_path):
+                roles_data = np.load(roles_path)
+                custom_C = {}
+                for role in ["miner", "aligner", "scout"]:
+                    if f"C_{role}_0" in roles_data:
+                        custom_C[role] = [
+                            roles_data[f"C_{role}_{i}"] for i in range(n_A)
+                        ]
+                if custom_C:
+                    print(f"[AIF] Loaded learned per-role C from {roles_path}")
+                else:
+                    custom_C = None
 
         # Level 2: Strategic agent with 5 macro-options
         self.agent = CogsGuardPOMDP.create_strategic_agent(
             n_agents, learn_B=learn_B, learn_A=learn_A,
-            custom_A=custom_A, policy_len=policy_len,
+            custom_A=custom_A, custom_B=custom_B, custom_C=custom_C,
+            policy_len=policy_len,
         )
 
         # Level 1: Option executor

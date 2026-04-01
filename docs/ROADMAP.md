@@ -774,6 +774,17 @@ generative models where the state space is learned end-to-end.
 - [ ] Fix `cogames ship` bundle to include all dependencies
 - [ ] Consider option discovery from data (spectral clustering on action sequences)
 
+#### Available Maps for Validation
+
+| Map | Size | Agents | Full mechanics? | Notes |
+|-----|------|--------|-----------------|-------|
+| `easy_hearts_training` | 13×13 | 1–4 | Partial | Hearts + energy only, no clips |
+| `tutorial` / `tutorial.aligner` | 35×35 | 1–4 | Yes (minus clips) | Best for fast AIF validation |
+| `arena` | 50×50 | 1–20 | Yes | Current main map |
+| `machina_1` | 88×88 | 10 | Yes | Tournament standard |
+
+Custom sizes: `cogames make-mission --width W --height H`. Variant `-v small_50` shrinks machina_1 to 50×50.
+
 ---
 
 ### Phase C: Plan Broadcasting for 8-Agent Coordination

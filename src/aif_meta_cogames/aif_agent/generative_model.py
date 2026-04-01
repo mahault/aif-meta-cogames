@@ -961,7 +961,18 @@ class CogsGuardPOMDP:
         base = CogsGuardPOMDP(A=custom_A) if custom_A is not None else CogsGuardPOMDP()
 
         A = [jnp.array(a) for a in base.A]
-        B_option = [jnp.array(b) for b in build_option_B()]
+
+        # Optional: use custom (learned) B matrices instead of build_option_B()
+        custom_B = kwargs.pop("custom_B", None)
+        if custom_B is not None:
+            B_option = [jnp.array(b) for b in custom_B]
+        else:
+            B_option = [jnp.array(b) for b in build_option_B()]
+
+        # Optional: custom per-role C vectors (learned).
+        # Dict with keys "miner", "aligner", "scout", each a list of 6 C arrays.
+        custom_C = kwargs.pop("custom_C", None)
+
         C = [jnp.array(c) for c in base.C]
         D = [jnp.array(d) for d in base.D]
 
@@ -1013,13 +1024,23 @@ class CogsGuardPOMDP:
                       batch_size=n_agents, **defaults)
 
         # Per-batch C/D (miner / aligner / scout)
-        C_batched = []
-        for m in range(len(NUM_OBS)):
-            per_agent = []
-            for i in range(n_agents):
-                role = _agent_role(i, n_agents)
-                per_agent.append(role_pomdps[role].C[m])
-            C_batched.append(jnp.array(np.stack(per_agent)))
+        # Use custom_C if provided, otherwise fall back to role_pomdps
+        if custom_C is not None:
+            C_batched = []
+            for m in range(len(NUM_OBS)):
+                per_agent = []
+                for i in range(n_agents):
+                    role = _agent_role(i, n_agents)
+                    per_agent.append(custom_C[role][m])
+                C_batched.append(jnp.array(np.stack(per_agent)))
+        else:
+            C_batched = []
+            for m in range(len(NUM_OBS)):
+                per_agent = []
+                for i in range(n_agents):
+                    role = _agent_role(i, n_agents)
+                    per_agent.append(role_pomdps[role].C[m])
+                C_batched.append(jnp.array(np.stack(per_agent)))
 
         D_batched = []
         for f in range(len(NUM_STATE_FACTORS)):

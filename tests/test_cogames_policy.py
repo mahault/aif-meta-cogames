@@ -2057,3 +2057,115 @@ class TestDifferentiableBMR:
         assert "B" in result and len(result["B"]) == 4
         assert np.isfinite(result["final_vfe"])
         assert len(result["vfe_history"]) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Tests for custom B / C parameter injection (Phase B eval pipeline)
+# ---------------------------------------------------------------------------
+
+class TestCustomBCParameters:
+    """Verify that create_strategic_agent accepts custom B and C matrices."""
+
+    @pytest.mark.skipif(not HAS_PYMDP, reason="pymdp not installed")
+    def test_create_strategic_agent_custom_B(self):
+        """Custom B matrices replace default build_option_B()."""
+        from aif_meta_cogames.aif_agent.generative_model import (
+            build_option_B,
+        )
+
+        # Build default B, perturb and renormalize to create "learned" version
+        # pymdp validates normalization along axis=1 for B matrices
+        default_B = build_option_B()
+        rng = np.random.default_rng(42)
+        custom_B = []
+        for b in default_B:
+            noise = rng.uniform(0.01, 0.05, b.shape)
+            perturbed = b + noise
+            sums = perturbed.sum(axis=0, keepdims=True)
+            sums = np.where(sums == 0, 1.0, sums)
+            custom_B.append(perturbed / sums)
+
+        agent = CogsGuardPOMDP.create_strategic_agent(
+            n_agents=4, custom_B=custom_B, policy_len=2,
+        )
+
+        # Agent should have 4 B factors and be functional
+        assert len(agent.B) == 4
+        assert agent.batch_size == 4
+        # Verify the custom B was actually used (not identical to default)
+        for i, (ab, db) in enumerate(zip(agent.B, default_B)):
+            ab_np = np.array(ab)
+            # Custom B should differ from default
+            assert not np.allclose(ab_np, db, atol=1e-6), (
+                f"B[{i}] should differ from default when custom_B provided"
+            )
+
+    @pytest.mark.skipif(not HAS_PYMDP, reason="pymdp not installed")
+    def test_create_strategic_agent_custom_C(self):
+        """Custom per-role C vectors replace default role_pomdps C."""
+        from aif_meta_cogames.aif_agent.generative_model import (
+            build_C_miner, build_C_aligner, build_C_scout,
+        )
+
+        # Build "learned" C: shift all preferences by +0.5
+        custom_C = {
+            "miner": [c + 0.5 for c in build_C_miner()],
+            "aligner": [c + 0.5 for c in build_C_aligner()],
+            "scout": [c + 0.5 for c in build_C_scout()],
+        }
+
+        agent = CogsGuardPOMDP.create_strategic_agent(
+            n_agents=4, custom_C=custom_C, policy_len=2,
+        )
+
+        # Agent should be functional with 6 C modalities
+        assert len(agent.C) == 6
+        assert agent.batch_size == 4
+
+        # Verify custom C was used: miner C (agent 0) should be shifted
+        default_miner_C = build_C_miner()
+        for m in range(6):
+            agent_0_c = np.array(agent.C[m][0])  # agent 0 = miner
+            np.testing.assert_allclose(
+                agent_0_c, default_miner_C[m] + 0.5, atol=1e-5,
+                err_msg=f"C[{m}] for miner should be shifted by +0.5",
+            )
+
+    @pytest.mark.skipif(not HAS_PYMDP, reason="pymdp not installed")
+    def test_load_learned_params_full(self, tmp_path):
+        """NPZ with A+B keys loads both into create_strategic_agent."""
+        from aif_meta_cogames.aif_agent.generative_model import (
+            build_default_A, build_option_B,
+        )
+
+        # Create a .npz with both A and B matrices
+        default_A = build_default_A()
+        default_B = build_option_B()
+        save_dict = {}
+        for i, a in enumerate(default_A):
+            save_dict[f"A_{i}"] = a
+        for i, b in enumerate(default_B):
+            save_dict[f"B_{i}"] = b
+
+        params_path = str(tmp_path / "learned_full.npz")
+        np.savez(params_path, **save_dict)
+
+        # Simulate the loading logic from BatchedAIFEngine.__init__
+        params_data = np.load(params_path)
+        n_A = len(default_A)
+        custom_A = [params_data[f"A_{i}"] for i in range(n_A)]
+        custom_B = None
+        if "B_0" in params_data:
+            custom_B = [params_data[f"B_{i}"] for i in range(4)]
+
+        assert custom_A is not None and len(custom_A) == 6
+        assert custom_B is not None and len(custom_B) == 4
+
+        # Verify agent creation succeeds with both custom A and B
+        agent = CogsGuardPOMDP.create_strategic_agent(
+            n_agents=4, custom_A=custom_A, custom_B=custom_B,
+            policy_len=2,
+        )
+        assert agent.batch_size == 4
+        assert len(agent.A) == 6
+        assert len(agent.B) == 4
