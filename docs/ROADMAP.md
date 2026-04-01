@@ -1,6 +1,6 @@
 # Roadmap: AIF Meta-Learning on CoGames
 
-**Mahault Albarracin, Luca, Alejandro** | March 2026
+**Mahault Albarracin, Luca, Alejandro, Daniel Friedman** | April 2026
 
 ---
 
@@ -742,6 +742,37 @@ differentiable framework, combining the best of both worlds.
 **This phase connects to Phase 4 (Neural AIF)**: If model comparison reveals
 that discrete state spaces are too coarse, this motivates moving to neural
 generative models where the state space is learned end-to-end.
+
+---
+
+### PI Meeting Notes (2026-04-01) — Implications for AIF
+
+**Context**: Call with Subhojeet. Presented AIF option-selection results and deep AIF architecture.
+
+**Key takeaways for AIF direction**:
+
+1. **Map size is a major bottleneck**: "Because the map is so large, it takes them a lot of time to go to different parts of the map." **Action**: Try shrinking the map to validate AIF agents align junctions normally, then scale up. If smaller map works well → confirms bottleneck is navigation, not planning.
+
+2. **100M steps is too short**: Softmax trains for **billions** of steps internally. Kickstarting schedule: KL=1.0 for 4B steps, anneal 4B-8B, pure PPO after 10B. Our 50M training budget (for trajectory collection) may produce suboptimal teacher trajectories. **Implication**: Parameter learning from longer-trained agent trajectories may yield better A/B/C.
+
+3. **Option discovery vs option selection**: PI explicitly distinguished these — "there is an option discovery problem, and then there is the option selection problem. Right now, you're fixing on the set of options and focusing on the option selection problem." Our 5 macro-options (MINE_CYCLE, CRAFT_CYCLE, CAPTURE_CYCLE, EXPLORE, WAIT) are hand-designed. **Future**: Could spectral clustering (B-V Phase 1) discover better options from data?
+
+4. **Options are scripted, not learned**: "The individual options are scripted policies, they are not really learned." PI confirmed this is a limitation — the low-level execution within each option is rule-based. **Implication**: Learning option-internal policies (e.g., via RL sub-policies or learned nav POMDP) could improve upon scripted execution.
+
+5. **Test on CLIPs variant**: "Apply the same framework in the CLIPs variant as well. We have successful policies on the leaderboard. Find the candidate options and learn the active inference approach over that." **Action**: After validating on no_clips, test AIF option selection on the adversarial CLIPs variant where coordination under enemy pressure matters more.
+
+6. **Positive on AIF for exploration**: "This approach definitely has a lot more chance because it directly attacks the exploration problem... if we have a learned policy over [options] then we are actually seeing new results." Validates our approach direction.
+
+7. **Submission issue**: Missing dependency in uploaded policies — need to check `cogames ship` bundle includes all AIF code.
+
+8. **Game may be changing**: "I think the game is broken, to be honest... people are working on fixing the game." Results may shift as game mechanics evolve.
+
+**Actionable items**:
+- [ ] Shrink map experiment: eval AIF on smaller arena variant to isolate navigation vs planning bottleneck
+- [ ] Collect trajectories from longer-trained agents (or use Softmax's trained checkpoints) for better parameter learning
+- [ ] Test AIF on CLIPs variant (adversarial)
+- [ ] Fix `cogames ship` bundle to include all dependencies
+- [ ] Consider option discovery from data (spectral clustering on action sequences)
 
 ---
 
