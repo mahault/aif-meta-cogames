@@ -395,8 +395,8 @@ def learn_from_trajectory(
     if verbose:
         print(f"[learn] Initial VFE: {initial_vfe:.4f}")
 
-    # Gradient function (no JIT — trajectory data must stay concrete)
-    grad_fn = jax.grad(loss_fn, argnums=(0, 1))
+    # JIT-compiled gradient function (trajectory data in closure = static)
+    grad_fn = jax.jit(jax.grad(loss_fn, argnums=(0, 1)))
 
     # Adam optimizer
     optimizer = optax.adam(lr)
@@ -752,8 +752,8 @@ def learn_C_from_trajectory(
     if verbose:
         print(f"[learn-c] Initial policy loss: {initial_loss:.4f}")
 
-    # Gradient descent with Adam
-    grad_fn = jax.grad(loss_fn)
+    # JIT-compiled gradient descent with Adam
+    grad_fn = jax.jit(jax.grad(loss_fn))
     optimizer = optax.adam(lr)
     opt_state = optimizer.init(C_flat)
 
@@ -957,9 +957,9 @@ def learn_full_parameters(
     opt_state_B = opt_ab.init(B_logits)
     opt_state_C = opt_c.init(C_flat)
 
-    # Gradient functions
-    grad_ab = jax.grad(vfe_loss_fn, argnums=(0, 1))
-    grad_c = jax.grad(c_loss_fn, argnums=0)
+    # JIT-compiled gradient functions
+    grad_ab = jax.jit(jax.grad(vfe_loss_fn, argnums=(0, 1)))
+    grad_c = jax.jit(jax.grad(c_loss_fn, argnums=0))
 
     # Initial losses
     initial_vfe = float(vfe_loss_fn(A_logits, B_logits))

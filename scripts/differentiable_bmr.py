@@ -88,8 +88,11 @@ def compute_gradient_norms(
     A_norms : list of np.ndarray — gradient magnitude per A entry
     B_norms : list of np.ndarray — gradient magnitude per B entry
     """
-    grad_fn = jax.grad(trajectory_vfe_multi_agent, argnums=(0, 1))
-    grads_A, grads_B = grad_fn(A_logits, B_logits, trajectory, agent_indices)
+    # Wrap in closure so trajectory/agent_indices are captured (not traced)
+    def _vfe(A_l, B_l):
+        return trajectory_vfe_multi_agent(A_l, B_l, trajectory, agent_indices)
+    grad_fn = jax.jit(jax.grad(_vfe, argnums=(0, 1)))
+    grads_A, grads_B = grad_fn(A_logits, B_logits)
 
     A_norms = [np.abs(np.asarray(g)) for g in grads_A]
     B_norms = [np.abs(np.asarray(g)) for g in grads_B]
@@ -232,7 +235,7 @@ def differentiable_bmr(
                     + _kl_divergence_logits(B_l, B_ref))
             return vfe
 
-        grad_fn = jax.grad(loss_fn, argnums=(0, 1))
+        grad_fn = jax.jit(jax.grad(loss_fn, argnums=(0, 1)))
 
         for step in range(refine_steps):
             gA, gB = grad_fn(A_logits, B_logits)
@@ -367,7 +370,7 @@ def refine_from_init(
     if verbose:
         print(f"[refine] Initial VFE: {initial_vfe:.4f}")
 
-    grad_fn = jax.grad(loss_fn, argnums=(0, 1))
+    grad_fn = jax.jit(jax.grad(loss_fn, argnums=(0, 1)))
     optimizer = optax.adam(lr)
     opt_A = optimizer.init(A_logits)
     opt_B = optimizer.init(B_logits)
