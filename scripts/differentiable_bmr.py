@@ -428,13 +428,21 @@ def compare_multiple(
     dict mapping name -> VFE, plus pairwise Bayes factors.
     """
     agent_indices = list(range(n_agents))
+
+    # Subsample trajectory for tractable comparison (same as learning funcs)
+    stride = max(1, len(trajectory) // 50)
+    traj_sub = trajectory[::stride]
+    if verbose:
+        print(f"[compare] Using {len(traj_sub)}/{len(trajectory)} steps "
+              f"(stride={stride})")
+
     results = {}
 
     for name, params in param_sets.items():
         A_logits = params_to_logits(params["A"])
         B_logits = params_to_logits(params["B"])
         vfe = float(trajectory_vfe_multi_agent(
-            A_logits, B_logits, trajectory, agent_indices))
+            A_logits, B_logits, traj_sub, agent_indices))
         results[name] = vfe
         if verbose:
             print(f"[compare] {name}: VFE = {vfe:.4f}")
