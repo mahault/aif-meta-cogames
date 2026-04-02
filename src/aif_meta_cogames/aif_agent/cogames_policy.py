@@ -1899,9 +1899,10 @@ class AIFPolicy(_MultiAgentPolicy):
             print(f"[AIFPolicy] Loading learned params from {learned_params_path}")
 
         # Hierarchical engine: strategic POMDP + option state machines
+        policy_len = int(os.environ.get("AIF_POLICY_LEN", "2"))
         self._engine = BatchedAIFEngine(
             n_agents=n_agents, learn_B=True, learn_A=learn_A,
-            policy_len=2, learn_interval=50,
+            policy_len=policy_len, learn_interval=50,
             log_trajectory=log_traj,
             learned_params_path=learned_params_path or None,
         )
