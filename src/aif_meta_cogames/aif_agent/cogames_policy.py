@@ -1952,7 +1952,11 @@ class AIFPolicy(_MultiAgentPolicy):
         return True
 
     def __del__(self):
-        """Save trajectory data on cleanup if logging was enabled."""
+        """Save trajectory data on cleanup if logging was enabled.
+
+        Accumulates across episodes: if the output file already exists,
+        loads it and appends the new trajectory before saving.
+        """
         if hasattr(self, "_engine") and self._engine.log_trajectory:
             traj = self._engine.get_trajectory()
             if traj:
@@ -1961,8 +1965,15 @@ class AIFPolicy(_MultiAgentPolicy):
                     Path(__file__).resolve().parent.parent.parent.parent / "scripts"
                 ))
                 try:
-                    from learn_parameters import save_trajectory
+                    from learn_parameters import save_trajectory, load_trajectory
                     out = os.environ.get("AIF_TRAJECTORY_PATH", "/tmp/aif_trajectory.npz")
+                    # Accumulate: load existing + append new
+                    if os.path.exists(out):
+                        try:
+                            existing = load_trajectory(out)
+                            traj = existing + traj
+                        except Exception:
+                            pass  # corrupt file, overwrite
                     save_trajectory(out, traj)
                 except Exception as e:
                     print(f"[AIFPolicy] Failed to save trajectory: {e}")
