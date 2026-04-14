@@ -23,7 +23,7 @@ AGENTS=4
 STEPS_PER_EP=10000
 TIMEOUT=1000
 POLICY_LEN=2
-GRAD_STEPS=3000
+GRAD_STEPS=5000
 C_LR_SCALE=0.5
 
 # Start from best existing model
@@ -57,6 +57,13 @@ for ROUND in 1 2 3 4 5; do
     echo ""
     echo "=== Round ${ROUND} Step 1: Collecting trajectory ==="
 
+    # Exploration schedule: rounds 1-3 use exploration E, rounds 4-5 deploy-mode E
+    if [ ${ROUND} -le 3 ]; then
+        EXPLORE_E=1      # Flat E for data coverage
+    else
+        EXPLORE_E=0      # Strong E for role-optimal behavior
+    fi
+
     # 10 batches x 5 episodes x 10000 steps = 500k steps per round
     for batch in $(seq 1 10); do
         echo "--- Batch ${batch}/10 ---"
@@ -64,6 +71,9 @@ for ROUND in 1 2 3 4 5; do
           AIF_LOG_TRAJECTORY=1 \
           AIF_TRAJECTORY_PATH="$TRAJ" \
           AIF_LEARNED_PARAMS="${CURRENT_PARAMS}" \
+          AIF_EXPLORE_E=${EXPLORE_E} \
+          AIF_ADAPTIVE_GAMMA=1 \
+          AIF_NOVELTY_WEIGHT=1.0 \
           cogames eval -m ${MAP} -v no_clips \
           -p class=aif_meta_cogames.aif_agent.cogames_policy.AIFPolicy \
           -c ${AGENTS} -e 5 -s ${STEPS_PER_EP} \

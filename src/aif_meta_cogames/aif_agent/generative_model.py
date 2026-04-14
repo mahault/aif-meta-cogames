@@ -53,6 +53,45 @@ from .discretizer import (
 )
 
 NUM_ACTIONS = NUM_TASK_POLICIES  # 13
+
+
+def _build_exploration_E(n_policies: int) -> dict[str, np.ndarray]:
+    """Weakly informative E vectors for learning — allows cross-role exploration.
+
+    During learning (trajectory collection), we use a 4:1 ratio between
+    preferred and non-preferred options instead of the 4000:1 ratio used
+    in deployment.  This allows EFE-driven exploration of under-tried
+    options (e.g. CRAFT/CAPTURE for miners) so that B matrices get
+    training data for all 5 macro-options.
+
+    25 policies: [0-4]=MINE first, [5-9]=CRAFT first,
+    [10-14]=CAPTURE first, [15-19]=EXPLORE first, [20-24]=DEFEND first.
+    """
+    E_miner = np.ones(n_policies)
+    E_miner[0:5] = 2.0       # MINE — still preferred
+    E_miner[15:20] = 1.5     # EXPLORE
+    E_miner[20:25] = 1.0     # DEFEND
+    E_miner[5:10] = 0.5      # CRAFT — explorable (was 0.001)
+    E_miner[10:15] = 0.5     # CAPTURE — explorable (was 0.001)
+
+    E_aligner = np.ones(n_policies)
+    E_aligner[5:10] = 2.0    # CRAFT
+    E_aligner[10:15] = 2.0   # CAPTURE
+    E_aligner[20:25] = 1.5   # DEFEND
+    E_aligner[15:20] = 1.0   # EXPLORE
+    E_aligner[0:5] = 0.5     # MINE — explorable (was 0.001)
+
+    E_scout = np.ones(n_policies)
+    E_scout[15:20] = 2.0     # EXPLORE
+    E_scout[20:25] = 1.5     # DEFEND
+    E_scout[0:5] = 0.5       # MINE — explorable (was 0.001)
+    E_scout[5:10] = 0.5      # CRAFT — explorable (was 0.001)
+    E_scout[10:15] = 0.5     # CAPTURE — explorable (was 0.001)
+
+    # Normalize
+    for E in (E_miner, E_aligner, E_scout):
+        E /= E.sum()
+    return {"miner": E_miner, "aligner": E_aligner, "scout": E_scout}
 ACTION_NAMES = TASK_POLICY_NAMES
 
 # Factor counts
@@ -881,7 +920,7 @@ class CogsGuardPOMDP:
             "use_param_info_gain": learn_B,
             "learn_B": learn_B,
             "action_selection": "deterministic",
-            "gamma": 8.0,
+            "gamma": kwargs.pop("gamma", 16.0),
         }
         if pB is not None:
             defaults["pB"] = pB
@@ -973,6 +1012,9 @@ class CogsGuardPOMDP:
         # Dict with keys "miner", "aligner", "scout", each a list of 6 C arrays.
         custom_C = kwargs.pop("custom_C", None)
 
+        # Exploration E: weakly informative habit prior for learning
+        explore_E = kwargs.pop("explore_E", False)
+
         C = [jnp.array(c) for c in base.C]
         D = [jnp.array(d) for d in base.D]
 
@@ -1013,7 +1055,7 @@ class CogsGuardPOMDP:
             "learn_B": learn_B,
             "learn_A": learn_A,
             "action_selection": "deterministic",
-            "gamma": 8.0,
+            "gamma": kwargs.pop("gamma", 16.0),
         }
         if pB is not None:
             defaults["pB"] = pB
@@ -1059,36 +1101,41 @@ class CogsGuardPOMDP:
         # 25 policies: [0-4]=MINE first, [5-9]=CRAFT first,
         # [10-14]=CAPTURE first, [15-19]=EXPLORE first, [20-24]=DEFEND first.
         n_policies = policies.shape[0]
-        E_miner = np.ones(n_policies)
-        E_aligner = np.ones(n_policies)
-        E_scout = np.ones(n_policies)
 
-        E_miner[0:5] = 4.0     # MINE first — core role
-        E_miner[15:20] = 2.0   # EXPLORE first (find resources)
-        E_miner[20:25] = 1.5   # DEFEND — acceptable fallback
-        E_miner[5:10] = 0.001  # CRAFT first — blocked (not miner's job)
-        E_miner[10:15] = 0.001 # CAPTURE first — blocked (not miner's job)
+        if explore_E:
+            # Weakly informative E for learning — 4:1 ratio instead of 4000:1
+            E_map = _build_exploration_E(n_policies)
+        else:
+            E_miner = np.ones(n_policies)
+            E_aligner = np.ones(n_policies)
+            E_scout = np.ones(n_policies)
 
-        E_aligner[5:10] = 4.0    # CRAFT first — core role
-        E_aligner[10:15] = 4.0   # CAPTURE first — core role
-        E_aligner[20:25] = 2.0   # DEFEND — hold junctions
-        E_aligner[15:20] = 1.5   # EXPLORE — find stations
-        E_aligner[0:5] = 0.001   # MINE first — blocked (not aligner's job)
+            E_miner[0:5] = 4.0     # MINE first — core role
+            E_miner[15:20] = 2.0   # EXPLORE first (find resources)
+            E_miner[20:25] = 1.5   # DEFEND — acceptable fallback
+            E_miner[5:10] = 0.001  # CRAFT first — blocked (not miner's job)
+            E_miner[10:15] = 0.001 # CAPTURE first — blocked (not miner's job)
 
-        # Scout: epistemic agent — EXPLORE and DEFEND only.
-        # Flat C makes epistemic term dominate EFE; E biases toward
-        # exploration policies as a precision gate.
-        E_scout[15:20] = 4.0     # EXPLORE first — core scout role
-        E_scout[20:25] = 2.0     # DEFEND — secondary (hold territory)
-        E_scout[0:5] = 0.001     # MINE first — blocked
-        E_scout[5:10] = 0.001    # CRAFT first — blocked
-        E_scout[10:15] = 0.001   # CAPTURE first — blocked
+            E_aligner[5:10] = 4.0    # CRAFT first — core role
+            E_aligner[10:15] = 4.0   # CAPTURE first — core role
+            E_aligner[20:25] = 2.0   # DEFEND — hold junctions
+            E_aligner[15:20] = 1.5   # EXPLORE — find stations
+            E_aligner[0:5] = 0.001   # MINE first — blocked (not aligner's job)
 
-        E_miner /= E_miner.sum()
-        E_aligner /= E_aligner.sum()
-        E_scout /= E_scout.sum()
+            # Scout: epistemic agent — EXPLORE and DEFEND only.
+            # Flat C makes epistemic term dominate EFE; E biases toward
+            # exploration policies as a precision gate.
+            E_scout[15:20] = 4.0     # EXPLORE first — core scout role
+            E_scout[20:25] = 2.0     # DEFEND — secondary (hold territory)
+            E_scout[0:5] = 0.001     # MINE first — blocked
+            E_scout[5:10] = 0.001    # CRAFT first — blocked
+            E_scout[10:15] = 0.001   # CAPTURE first — blocked
 
-        E_map = {"miner": E_miner, "aligner": E_aligner, "scout": E_scout}
+            E_miner /= E_miner.sum()
+            E_aligner /= E_aligner.sum()
+            E_scout /= E_scout.sum()
+
+            E_map = {"miner": E_miner, "aligner": E_aligner, "scout": E_scout}
         E_batched = []
         for i in range(n_agents):
             role = _agent_role(i, n_agents)
@@ -1391,7 +1438,7 @@ def create_nav_agent(n_agents: int = 8, policy_len: int = 2,
         use_utility=True,
         use_states_info_gain=True,
         action_selection="deterministic",
-        gamma=8.0,
+        gamma=16.0,
     )
 
     return agent

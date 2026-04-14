@@ -247,6 +247,51 @@ For meta-learning (Luca's Phase 2):
 - Outer loop: learn initialization θ* that minimizes post-adaptation loss across variants
 - B matrices are factored (phase/hand coupled, target_mode/role independent) — sparse and structured
 
+### Phase 3c: Parameter Learning (A, B, C, D)
+
+**See**: [LITERATURE_REVIEW.md](LITERATURE_REVIEW.md) for the full academic survey (45 papers).
+**See**: [ROADMAP.md](ROADMAP.md) Phases B-I through B-VI for implementation details.
+
+**Key theoretical results informing the design**:
+
+1. **VFE learns A and B, but NOT C**: The variational free energy depends on A
+   (likelihood term) and B (complexity/transition term) but C (preferences) does
+   not appear. This is proven in Parr & Friston (2019) and Da Costa et al. (2020).
+   Therefore A and B use VFE-based objectives; C requires EFE.
+
+2. **Inverse EFE for C learning**: Shin et al. (2022) treat EFE as a negative value
+   function and apply MaxEnt IRL to recover C from demonstrations. The loss is
+   `-log q_pi(a_observed)` where `q_pi = softmax(gamma * G + ln E)`. pymdp 1.0's
+   entire EFE computation is differentiable in JAX (no `stop_gradient` anywhere),
+   enabling exact gradients through the planning computation back to C.
+
+3. **Factored B learning**: Our B matrices are factored (4 factors with
+   B_DEPENDENCIES). The transition prediction loss decomposes per factor:
+   `L_B = -sum_f sum_t q(s'_f) * ln [B_f * q(s_deps)]_a`. B_role is identity
+   (roles never change) and should be frozen.
+
+4. **De novo learning** (Friston 2025): Gradient-free approach using spectral
+   clustering (structure discovery), Dirichlet accumulation (parameter learning),
+   and Bayesian Model Reduction (model simplification). Learns A, B, C, D from
+   scratch. We implement both literally and as a gradient-inspired variant.
+
+5. **Two-timescale joint optimization**: Fast VFE for A/B (world model), slow
+   inverse-EFE for C (preferences). Separate Adam optimizers with 0.1x LR for C.
+
+6. **Multi-agent role bias**: Single-agent learning corrupts A columns for
+   unobserved states. Multi-agent averaging across all roles prevents this (our
+   Phase B-I finding, validated by B5 +47% junctions).
+
+**Parameter-objective mapping**:
+
+| Parameter | Objective | Formula | Speed |
+|-----------|-----------|---------|-------|
+| A (likelihood) | VFE accuracy | -E_q[ln P(o\|s)] | Fast |
+| B (transition) | VFE complexity | -E_q[ln P(s'\|s,a)] | Fast |
+| C (preferences) | Inverse EFE | -ln q_pi(a_observed) | Slow (0.1x LR) |
+| D (initial state) | VFE prior | -E_q[ln P(s_1)] | Fast |
+| E (habits) | Accumulated policy counts | e += pi | Between-trial |
+
 ### Phase 4 (NEXT): Neural AIF + Meta-Learned World Model
 
 Replace hand-crafted A/B with learned world model:

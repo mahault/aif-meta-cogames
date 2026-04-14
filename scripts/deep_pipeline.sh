@@ -8,7 +8,7 @@ source ~/projects/cogames-env/bin/activate
 cd ~/projects/aif-meta-cogames
 
 TRAJ=/tmp/aif_traj_deep.npz
-STEPS=2000
+STEPS=5000
 TIMEOUT=5000
 
 echo "============================================"
@@ -43,7 +43,7 @@ echo ""
 echo "=== Step 2a: Joint A+B+C (2000 steps) ==="
 python3 scripts/learn_parameters.py learn-full \
   --trajectory "$TRAJ" --steps "$STEPS" --lr 0.001 \
-  --c-lr-scale 0.1 --a-weight 1.0 --b-weight 1.0 --c-weight 0.5 \
+  --c-lr-scale 0.5 --a-weight 1.0 --b-weight 1.0 --c-weight 1.0 \
   --output /tmp/learned_joint_deep.npz
 
 echo ""

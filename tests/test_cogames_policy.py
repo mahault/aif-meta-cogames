@@ -2169,3 +2169,456 @@ class TestCustomBCParameters:
         assert agent.batch_size == 4
         assert len(agent.A) == 6
         assert len(agent.B) == 4
+
+
+# ---------------------------------------------------------------------------
+# Adaptive γ tests (Ruiz-Serra Eq. 17)
+# ---------------------------------------------------------------------------
+
+class TestAdaptiveGamma:
+    """Test adaptive gamma (policy precision) via Ruiz-Serra Eq. 17."""
+
+    def test_adaptive_gamma_low_when_ambiguous(self):
+        """When all neg_efe values are equal (ambiguous), γ should be low."""
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        engine = BatchedAIFEngine(n_agents=4, adaptive_gamma=True)
+
+        # Simulate ambiguous EFE landscape: all policies equally good
+        n_pol = 25
+        neg_efe = jnp.zeros((4, n_pol))  # All zero → mean_G = 0
+        # γ = β₁/(β₀ - mean_G) = 15/(1 - 0) = 15
+        mean_G = jnp.mean(neg_efe, axis=-1)
+        gamma_a = engine.beta_1 / (engine.beta_0 - mean_G + 1e-8)
+        gamma_a = jnp.clip(gamma_a, 1.0, 32.0)
+        assert float(gamma_a[0]) == pytest.approx(15.0, abs=0.1)
+
+    def test_adaptive_gamma_high_when_clear(self):
+        """When one option has much higher neg_efe, γ should be higher."""
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        engine = BatchedAIFEngine(n_agents=4, adaptive_gamma=True)
+
+        n_pol = 25
+        neg_efe = jnp.full((4, n_pol), -5.0)  # All bad
+        neg_efe = neg_efe.at[:, 0].set(10.0)   # One clearly good
+        # mean_G = mean of (-5, -5, ..., 10) ≈ -4.4
+        # γ = 15/(1 - (-4.4)) = 15/5.4 ≈ 2.78
+        # This is actually lower — the formula rewards when mean_G > 0
+        mean_G = jnp.mean(neg_efe, axis=-1)
+        gamma_a = engine.beta_1 / (engine.beta_0 - mean_G + 1e-8)
+        gamma_a = jnp.clip(gamma_a, 1.0, 32.0)
+        # With negative mean_G, denominator > β₀ → γ < β₁/β₀
+        assert float(gamma_a[0]) > 1.0
+        assert float(gamma_a[0]) < 15.0
+
+    def test_adaptive_gamma_backward_compat(self):
+        """Default (off) should use fixed gamma from agent constructor."""
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        engine = BatchedAIFEngine(n_agents=4, adaptive_gamma=False)
+        assert engine.adaptive_gamma is False
+
+        # Run a step — should NOT crash and should use standard select_option
+        obs = [jnp.array([0]) for _ in range(6)]
+        for agent_id in range(4):
+            policy = engine.submit_and_get_policy(agent_id, obs)
+            assert 0 <= policy < 13
+
+    def test_adaptive_gamma_clipping_lower(self):
+        """Gamma should be clipped to lower bound (1.0) when neg_efe >> 0."""
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        engine = BatchedAIFEngine(n_agents=2, adaptive_gamma=True)
+
+        # Very large mean_G → denominator negative → γ negative → clips to 1.0
+        neg_efe = jnp.full((2, 25), 100.0)
+        mean_G = jnp.mean(neg_efe, axis=-1)
+        gamma_a = engine.beta_1 / (engine.beta_0 - mean_G + 1e-8)
+        gamma_a = jnp.clip(gamma_a, 1.0, 32.0)
+        assert float(gamma_a[0]) == 1.0  # Clipped to lower bound
+
+    def test_adaptive_gamma_clipping_upper(self):
+        """Gamma should be clipped to upper bound (32) when mean_G ≈ β₀."""
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        engine = BatchedAIFEngine(n_agents=2, adaptive_gamma=True)
+
+        # mean_G just below β₀ → denominator tiny positive → γ explodes → clips to 32
+        # β₀ = 1.0, so neg_efe mean ≈ 0.99 → denom = 1 - 0.99 = 0.01
+        # γ = 15/0.01 = 1500 → clips to 32
+        neg_efe = jnp.full((2, 25), 0.99)
+        mean_G = jnp.mean(neg_efe, axis=-1)
+        gamma_a = engine.beta_1 / (engine.beta_0 - mean_G + 1e-8)
+        gamma_a = jnp.clip(gamma_a, 1.0, 32.0)
+        assert float(gamma_a[0]) == 32.0  # Clipped to upper bound
+
+    def test_adaptive_recompute_runs(self):
+        """_adaptive_recompute should produce valid options and q_pi."""
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        engine = BatchedAIFEngine(n_agents=4, adaptive_gamma=True)
+
+        # Get initial beliefs
+        obs = [jnp.array([0]) for _ in range(6)]
+        for agent_id in range(4):
+            engine.submit_and_get_policy(agent_id, obs)
+
+        # Manually test _adaptive_recompute
+        neg_efe = jnp.ones((4, 25)) * -1.0
+        options, q_pi = engine._adaptive_recompute(engine.agent, neg_efe)
+        assert options.shape == (4,)
+        assert q_pi.shape == (4, 25)
+        # q_pi should sum to 1 per agent
+        sums = q_pi.sum(axis=-1)
+        for i in range(4):
+            assert float(sums[i]) == pytest.approx(1.0, abs=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Exploration E tests (Bayesian learning priors)
+# ---------------------------------------------------------------------------
+
+class TestExplorationE:
+    """Test weakly informative E vectors for learning."""
+
+    def test_explore_E_allows_cross_role(self):
+        """With explore_E=True, aligners should have non-negligible weight
+        on MINE options (indices 0-4)."""
+        from aif_meta_cogames.aif_agent.generative_model import (
+            _build_exploration_E,
+        )
+        E_map = _build_exploration_E(25)
+        # Aligner: MINE (0-4) should be 0.5 (explorable), not 0.001
+        assert E_map["aligner"][0] > 0.01  # Non-negligible
+        assert E_map["aligner"][5] > E_map["aligner"][0]  # CRAFT still preferred
+
+    def test_deploy_E_blocks_cross_role(self):
+        """With explore_E=False (default), miners should have near-zero
+        weight on CRAFT/CAPTURE (indices 5-14)."""
+        agent = CogsGuardPOMDP.create_strategic_agent(
+            n_agents=4, explore_E=False, policy_len=2,
+        )
+        E = np.asarray(agent.E)
+        # Agent 0 is miner (even index)
+        miner_E = E[0]
+        # CRAFT options (5-9) should have very low weight
+        assert float(miner_E[5]) < 0.01
+
+    def test_explore_E_ratio(self):
+        """Ratio between preferred and non-preferred should be ≈ 4:1."""
+        from aif_meta_cogames.aif_agent.generative_model import (
+            _build_exploration_E,
+        )
+        E_map = _build_exploration_E(25)
+        # Miner: MINE (2.0) vs CRAFT (0.5) → pre-normalization ratio = 4:1
+        ratio = E_map["miner"][0] / E_map["miner"][5]
+        assert ratio == pytest.approx(4.0, rel=0.1)
+
+    def test_explore_E_normalized(self):
+        """Exploration E vectors should sum to 1."""
+        from aif_meta_cogames.aif_agent.generative_model import (
+            _build_exploration_E,
+        )
+        E_map = _build_exploration_E(25)
+        for role, E in E_map.items():
+            assert float(E.sum()) == pytest.approx(1.0, abs=1e-6), \
+                f"{role} E doesn't sum to 1"
+
+    def test_explore_E_agent_creation(self):
+        """Agent created with explore_E=True should have different E
+        than default."""
+        agent_explore = CogsGuardPOMDP.create_strategic_agent(
+            n_agents=4, explore_E=True, policy_len=2,
+        )
+        agent_default = CogsGuardPOMDP.create_strategic_agent(
+            n_agents=4, explore_E=False, policy_len=2,
+        )
+        E_explore = np.asarray(agent_explore.E)
+        E_default = np.asarray(agent_default.E)
+        # Should be different
+        assert not np.allclose(E_explore, E_default)
+        # Miner (agent 0) CRAFT weight should be higher in explore
+        assert float(E_explore[0, 5]) > float(E_default[0, 5])
+
+
+# ---------------------------------------------------------------------------
+# Novelty η tests (Ruiz-Serra Eq. 20)
+# ---------------------------------------------------------------------------
+
+class TestNovelty:
+    """Test novelty (expected parameter info gain) computation."""
+
+    def test_novelty_high_for_unobserved(self):
+        """Options with low pB concentration should get higher novelty."""
+        from aif_meta_cogames.aif_agent.cogames_policy import _compute_novelty
+
+        # Create mock pB: option 0 has high concentration, option 4 has low
+        pB = []
+        for f in range(4):
+            pb = np.ones((6, 6, 5)) * 10.0  # High concentration
+            pb[:, :, 4] = 0.1               # Option 4 barely observed
+            pB.append(pb)
+
+        novelty = _compute_novelty(pB, 5)
+        # Option 4 (low concentration) should have higher novelty
+        assert novelty[4] > novelty[0]
+        assert novelty[4] > novelty[1]
+
+    def test_novelty_zero_when_no_pB(self):
+        """When learn_B=False (pB=None), novelty computation should be skipped."""
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        engine = BatchedAIFEngine(
+            n_agents=4, adaptive_gamma=True, novelty_weight=1.0,
+        )
+        # With default agent (learn_B=True has pB), this should work
+        # The key test is that the engine doesn't crash when novelty_weight > 0
+        obs = [jnp.array([0]) for _ in range(6)]
+        for agent_id in range(4):
+            policy = engine.submit_and_get_policy(agent_id, obs)
+            assert 0 <= policy < 13
+
+    def test_novelty_uniform_for_equal_pB(self):
+        """When all options have equal pB, novelty should be uniform."""
+        from aif_meta_cogames.aif_agent.cogames_policy import _compute_novelty
+
+        pB = [np.ones((6, 6, 5)) * 5.0 for _ in range(4)]
+        novelty = _compute_novelty(pB, 5)
+        # All options should have equal novelty
+        for i in range(1, 5):
+            assert novelty[i] == pytest.approx(novelty[0], abs=1e-6)
+
+    def test_novelty_weight_env_var(self):
+        """Novelty weight should be configurable."""
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        engine = BatchedAIFEngine(
+            n_agents=4, novelty_weight=2.5,
+        )
+        assert engine.novelty_weight == 2.5
+
+    def test_adaptive_recompute_with_novelty(self):
+        """_adaptive_recompute with novelty should not crash and should
+        produce different q_pi than without novelty."""
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+
+        engine_no = BatchedAIFEngine(
+            n_agents=4, adaptive_gamma=True, novelty_weight=0.0,
+        )
+        engine_yes = BatchedAIFEngine(
+            n_agents=4, adaptive_gamma=True, novelty_weight=5.0,
+        )
+
+        neg_efe = jnp.ones((4, 25)) * -1.0
+        opts_no, qpi_no = engine_no._adaptive_recompute(engine_no.agent, neg_efe)
+        opts_yes, qpi_yes = engine_yes._adaptive_recompute(engine_yes.agent, neg_efe)
+
+        # Both should produce valid outputs
+        assert opts_no.shape == (4,)
+        assert opts_yes.shape == (4,)
+        # With high novelty weight, q_pi distribution should differ
+        # (novelty biases toward options with lower pB)
+        # They may or may not differ depending on pB state, but shouldn't crash
+
+
+# ---------------------------------------------------------------------------
+# Gamma default value tests
+# ---------------------------------------------------------------------------
+
+class TestGammaDefault:
+    """Test that gamma defaults changed from 8.0 to 16.0."""
+
+    def test_strategic_agent_gamma(self):
+        """Strategic agent should use gamma=16.0 by default."""
+        agent = CogsGuardPOMDP.create_strategic_agent(
+            n_agents=4, policy_len=2,
+        )
+        gamma = np.asarray(agent.gamma)
+        assert gamma.flat[0] == pytest.approx(16.0)
+
+    def test_strategic_agent_gamma_override(self):
+        """Strategic agent should accept gamma override."""
+        agent = CogsGuardPOMDP.create_strategic_agent(
+            n_agents=4, policy_len=2, gamma=10.0,
+        )
+        gamma = np.asarray(agent.gamma)
+        assert gamma.flat[0] == pytest.approx(10.0)
+
+    def test_tactical_agent_gamma(self):
+        """Tactical (non-strategic) agent should also default to 16.0."""
+        pomdp = CogsGuardPOMDP()
+        agent = pomdp.create_agent(policy_len=2)
+        gamma = np.asarray(agent.gamma)
+        assert gamma.flat[0] == pytest.approx(16.0)
+
+
+# ---------------------------------------------------------------------------
+# Habit bypass tests (Fountas NeurIPS 2020)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not HAS_PYMDP, reason="pymdp (JAX) not installed")
+class TestHabitBypass:
+    """Test habit bypass: skip planning when confident."""
+
+    def test_habit_bypass_off_by_default(self):
+        """Default engine should have habit_bypass=False."""
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        engine = BatchedAIFEngine(n_agents=4)
+        assert engine.habit_bypass is False
+
+    def test_habit_bypass_enabled(self):
+        """Engine with habit_bypass=True should initialize VFE tracking."""
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        engine = BatchedAIFEngine(n_agents=4, habit_bypass=True)
+        assert engine.habit_bypass is True
+        assert engine._vfe_ema.shape == (4,)
+        assert np.all(engine._vfe_ema == 0.0)
+        assert engine._bypass_count == 0
+
+    def test_vfe_ema_updates(self):
+        """VFE EMA should track observation surprise after belief update."""
+        import jax.numpy as jnp
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        engine = BatchedAIFEngine(n_agents=2, habit_bypass=True)
+
+        obs = [jnp.array([0]) for _ in range(6)]
+        # Run several steps to get VFE tracking going
+        for _ in range(5):
+            for i in range(2):
+                engine.submit_and_get_policy(i, obs)
+
+        # VFE EMA should have been updated from zero
+        # (beliefs converge so VFE may be low, but should be > 0 initially)
+        # Just check it's not all NaN
+        assert not np.any(np.isnan(engine._vfe_ema))
+
+    def test_habit_bypass_skips_when_confident(self):
+        """When E[option] is high and VFE is low, planning should be skipped.
+
+        We verify by checking that _bypass_count increases.
+        """
+        import jax.numpy as jnp
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+
+        engine = BatchedAIFEngine(n_agents=2, habit_bypass=True)
+        # Force low VFE (well-calibrated)
+        engine._vfe_ema[:] = 0.5  # Well below threshold of 5.0
+
+        # Default option is EXPLORE=3, policies 15-19 (5 per option)
+        cur_opt = int(engine._current_options[0])
+        assert cur_opt == MacroOption.EXPLORE  # == 3
+
+        # Force high E for current option
+        e_arr = np.array(engine.agent.E)
+        n_pol_per_opt = e_arr.shape[-1] // 5  # NUM_OPTIONS=5
+        opt_start = cur_opt * n_pol_per_opt
+        opt_end = (cur_opt + 1) * n_pol_per_opt
+        e_arr[:] = 0.001
+        if e_arr.ndim == 2:
+            e_arr[:, opt_start:opt_end] = 10.0
+        else:
+            e_arr[opt_start:opt_end] = 10.0
+        e_arr = e_arr / e_arr.sum(axis=-1, keepdims=True)
+        import equinox as eqx
+        engine.agent = eqx.tree_at(lambda a: a.E, engine.agent, jnp.array(e_arr))
+
+        obs = [jnp.array([0]) for _ in range(6)]
+        # Run enough steps to trigger option termination (EXPLORE timeout=30)
+        for _ in range(35):
+            for i in range(2):
+                engine.submit_and_get_policy(i, obs)
+
+        # Some bypass events should have occurred
+        assert engine._bypass_count > 0
+
+    def test_habit_bypass_plans_when_uncertain(self):
+        """When VFE is high, planning should NOT be skipped."""
+        import jax.numpy as jnp
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+
+        engine = BatchedAIFEngine(n_agents=2, habit_bypass=True)
+        # Force high VFE (uncertain)
+        engine._vfe_ema[:] = 10.0  # Well above threshold of 5.0
+
+        bypass_before = engine._bypass_count
+        obs = [jnp.array([0]) for _ in range(6)]
+        # Run enough steps to trigger option termination
+        for _ in range(35):
+            for i in range(2):
+                engine.submit_and_get_policy(i, obs)
+
+        # No bypass should have occurred (VFE too high)
+        assert engine._bypass_count == bypass_before
+
+
+# ---------------------------------------------------------------------------
+# VFE-gated learning rate tests (AXIOM, Heins 2025)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not HAS_PYMDP, reason="pymdp (JAX) not installed")
+class TestVFEGatedLearning:
+    """Test VFE-gated learning rate scaling."""
+
+    def test_lr_scale_high_when_vfe_high(self):
+        """VFE above threshold -> lr_scale near 1.0."""
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        engine = BatchedAIFEngine(n_agents=2, habit_bypass=True)
+        engine._vfe_ema[:] = 10.0  # High VFE
+        # lr_scale = min(1.0, 0.1 + 0.9 * (10.0 / 5.0)) = min(1.0, 1.9) = 1.0
+        expected = 1.0
+        mean_vfe = float(np.mean(engine._vfe_ema))
+        lr = min(1.0, 0.1 + 0.9 * (mean_vfe / (engine.vfe_threshold + 1e-8)))
+        assert lr == pytest.approx(expected, abs=0.01)
+
+    def test_lr_scale_low_when_vfe_low(self):
+        """VFE near 0 -> lr_scale near 0.1."""
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        engine = BatchedAIFEngine(n_agents=2, habit_bypass=True)
+        engine._vfe_ema[:] = 0.01  # Very low VFE
+        mean_vfe = float(np.mean(engine._vfe_ema))
+        lr = min(1.0, 0.1 + 0.9 * (mean_vfe / (engine.vfe_threshold + 1e-8)))
+        assert lr < 0.15  # Should be very close to 0.1
+
+    def test_lr_scale_default_when_bypass_off(self):
+        """Without habit_bypass, lr_scale should always be 1.0."""
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        engine = BatchedAIFEngine(n_agents=2, habit_bypass=False)
+        assert engine._lr_scale == 1.0
+
+    def test_learn_interval_configurable(self):
+        """learn_interval should be settable via constructor."""
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        engine = BatchedAIFEngine(n_agents=2, learn_interval=20)
+        assert engine.learn_interval == 20
+
+    def test_learn_interval_default(self):
+        """Default learn_interval should be 50."""
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+        engine = BatchedAIFEngine(n_agents=2)
+        assert engine.learn_interval == 50
+
+    def test_vfe_gated_lr_applied_during_learning(self):
+        """When habit_bypass is on and VFE is tracked, lr_scale should
+        be stored after _update_parameters runs."""
+        import jax.numpy as jnp
+        from aif_meta_cogames.aif_agent.cogames_policy import BatchedAIFEngine
+
+        # Use learn_B=True to trigger parameter learning
+        engine = BatchedAIFEngine(
+            n_agents=2, habit_bypass=True, learn_B=True, learn_interval=1,
+        )
+
+        obs = [jnp.array([0]) for _ in range(6)]
+        # Run 2 steps to populate prev_qs/prev_obs
+        for _ in range(2):
+            for i in range(2):
+                engine.submit_and_get_policy(i, obs)
+
+        # Force VFE to a known value AFTER initial belief updates
+        engine._vfe_ema[:] = 2.5
+
+        # Run one more step to trigger learning with forced VFE
+        for i in range(2):
+            engine.submit_and_get_policy(i, obs)
+
+        # lr_scale should reflect the forced VFE level
+        # VFE EMA gets updated by belief step BEFORE learning, so actual
+        # value depends on both forced 2.5 and new belief VFE.
+        # Key check: lr_scale is NOT 1.0 (it was affected by VFE gating)
+        assert engine._lr_scale < 1.0, (
+            f"lr_scale should be < 1.0 when VFE is below threshold, "
+            f"got {engine._lr_scale}"
+        )

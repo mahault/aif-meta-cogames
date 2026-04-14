@@ -745,6 +745,410 @@ generative models where the state space is learned end-to-end.
 
 ---
 
+### Deep Pipeline Results (2026-04-02)
+
+**Setup**: 50,000 trajectory steps (50 episodes × 1000 steps), 2,000 gradient steps,
+`policy_len=4` (625 policies), arena map, 4-agent.
+
+| Method | VFE | Reduction | Notes |
+|--------|-----|-----------|-------|
+| **Joint A+B+C** | **59.5** | **74.1%** | Best ever. All parameters jointly optimized |
+| A-only | 122.0 | 46.8% | Likelihood learning alone is strong |
+| BMR | 144.1 | 37.2% | Bayesian model reduction baseline |
+| Default | 229.5 | — | Hand-designed parameters |
+| De novo | worse | — | Structure discovery alone insufficient |
+| Refined | worse | — | Spectral init + gradient didn't help |
+
+**Live arena evaluation** (joint, policy_len=4): mean reward **0.70 j/agent**
+(episodes: 0.00, 0.88, 1.20, 1.43, 0.00).
+
+**Analysis findings**:
+- **A matrices changed significantly**: Learned A diverges from hand-designed defaults,
+  especially for inventory and station modalities. Observation model was the main bottleneck.
+- **B matrices only changed for MINE/EXPLORE**: Other options (CRAFT, CAPTURE, WAIT) were
+  never exercised during 50-episode trajectory collection — B learning requires
+  exposure to all option transitions.
+- **C vectors unchanged**: Learning rate too low for preference learning at 2,000 steps.
+  C learning requires either higher LR or inverse-EFE gradient approach.
+- **Iterative pipeline needed**: Single-pass learning hits a ceiling. Need: learn → deploy →
+  collect new trajectories → re-learn cycle (see Phase 3d Step 4).
+
+---
+
+### Phase 3d — Literature-Informed AIF Upgrades
+
+**Why**: Deep pipeline results show 74% VFE reduction but live performance (0.70 j/agent)
+still below Softmax (5.0 j/agent). Literature survey identifies 7 targeted upgrades
+to close this gap, ordered by impact/effort ratio.
+
+**Key literature sources**:
+- Ruiz-Serra et al. (AAMAS 2025): "Factorised Active Inference for Strategic Multi-Agent Interactions"
+- Heins et al. (2025): "AXIOM — Active eXpanding Inference with Object-centric Models"
+- Champion et al. (Neural Computation 2024): "Multimodal and Multifactor Branching Time Active Inference"
+- Fountas et al. (NeurIPS 2020): "Deep Active Inference Agents Using Monte-Carlo Methods"
+- Hyland et al. (ICML 2024): "Free-Energy Equilibria in Multi-Agent Systems"
+
+| Step | Feature | Source | Impact | Effort | Files | Status |
+|------|---------|--------|--------|--------|-------|--------|
+| 1 | Adaptive precision γ | Ruiz-Serra AAMAS 2025 | High | Small | `cogames_policy.py` | **COMPLETE** (2026-04-03) |
+| 2 | Novelty term η + Exploration E | Ruiz-Serra AAMAS 2025 | Medium | Small | `generative_model.py`, `cogames_policy.py` | **COMPLETE** (2026-04-03) |
+| 3 | Habit bypass | Fountas NeurIPS 2020 | Medium | Small | `cogames_policy.py` | **COMPLETE** (2026-04-09) |
+| 4 | Online streaming A/B | AXIOM (Heins 2025) | High | Medium | `cogames_policy.py` | **COMPLETE** (2026-04-09) |
+| 5 | BTAI tree search | Champion Neural Comp 2024 | High | Large | new `btai_planner.py` | TODO |
+| 6 | Opponent belief factors | Ruiz-Serra AAMAS 2025 | High | Large | `generative_model.py` | TODO |
+| 7 | BMR compression | AXIOM rMM-style | Medium | Medium | `differentiable_bmr.py` | TODO |
+
+---
+
+#### Step 1: Adaptive Precision γ (Exploration-Exploitation Balance)
+
+**Source**: Ruiz-Serra Eq. 17 — `γ = β₁ / (β₀ - ⟨G⟩)`
+
+**Current state**: Fixed `gamma = 8.0` in `_select_option()`. Agent uses same
+exploration level regardless of EFE landscape.
+
+**Upgrade**: Self-tuning precision that drops when EFE values are ambiguous
+(explore more) and rises when one option clearly dominates (exploit).
+
+```python
+# In cogames_policy.py, _select_option():
+mean_G = neg_efe.mean(axis=-1)          # average EFE across options
+gamma_adaptive = beta_1 / (beta_0 - mean_G)  # Ruiz-Serra Eq. 17
+gamma_adaptive = np.clip(gamma_adaptive, 1.0, 32.0)  # stability bounds
+# Use gamma_adaptive as temperature in softmax policy selection
+```
+
+**Parameters**: β₁ ∈ [15, 30], β₀ = 1.0 (from Ruiz-Serra experiments).
+
+**Verification**:
+- Early episodes (uncertain): γ should be low (~2-4), agent tries all options
+- Late episodes (learned model): γ should be high (~16-32), agent exploits best option
+- Monitor: γ time series should correlate inversely with VFE
+
+---
+
+#### Step 2: Novelty Term η (Explore Under-Tried Options)
+
+**Source**: Ruiz-Serra Eq. 20 — `η(û) = Σₙ D_KL[B̄_{û,n} ‖ B_{û,n}]`
+
+**Current state**: EFE has risk + ambiguity but no explicit novelty drive. Options
+with low B matrix confidence (few observations) are not preferentially explored.
+
+**Upgrade**: Add expected parameter information gain — the KL divergence between
+expected posterior B and current prior B after taking each action.
+
+```python
+# In generative_model.py, compute_efe():
+for option_idx in range(n_options):
+    # Dirichlet concentration for B[option] transition counts
+    alpha_prior = B_concentrations[option_idx]  # current Dirichlet params
+    alpha_expected = alpha_prior + expected_counts  # posterior after one more obs
+    eta = dirichlet_kl(alpha_expected, alpha_prior)  # expected parameter gain
+    novelty[option_idx] = eta
+# G = risk + ambiguity + novelty_weight * novelty
+```
+
+**Key insight**: This drives agents to try CRAFT_CYCLE and CAPTURE_CYCLE (which had
+zero B learning in deep pipeline because they were never exercised).
+
+**Verification**: Options with low Dirichlet concentration should get novelty bonus →
+more uniform early exploration → all B matrices get training data.
+
+---
+
+#### Step 3: Habit Bypass (Skip Planning When Confident)
+
+**Source**: Fountas et al. NeurIPS 2020, §3.4 — bootstrap confidence threshold.
+
+**Current state**: Full EFE evaluation (625 policies at T=4) runs every decision step,
+even when the agent is mid-option with high confidence.
+
+**Upgrade**: When the E vector (habit prior) strongly favors the current option AND
+recent VFE is low, skip full EFE computation and continue executing.
+
+```python
+# In cogames_policy.py, _select_option():
+if self._current_option is not None:
+    habit_confidence = E[self._current_option_idx]
+    if habit_confidence > 0.7 and self._recent_vfe < vfe_threshold:
+        return self._current_option  # bypass planning
+# Otherwise: full EFE evaluation
+```
+
+**Benefits**: (a) Faster decision cycle (skip expensive T=4 evaluation), (b) more
+stable behavior (no mid-task option switching), (c) prerequisite for deeper planning
+(BTAI) — freed compute budget goes to tree search when planning IS needed.
+
+**Verification**: Agent should plan at decision points (empty hands, arrived at station)
+but coast during navigation and option execution.
+
+---
+
+#### Step 4: Online Streaming A/B Learning
+
+**Source**: AXIOM (Heins 2025) — per-step conjugate updates with sufficient statistics.
+
+**Current state**: Batch learning: collect 50-episode trajectory → offline gradient
+optimization → deploy. No learning during live play.
+
+**Upgrade**: Accumulate Dirichlet sufficient statistics during live play. Every
+observation updates A/B concentrations incrementally.
+
+```python
+# In cogames_policy.py, after each step:
+def _online_update(self, obs, prev_state, action, curr_state):
+    # A learning: observation-state co-occurrence
+    for modality_idx, o in enumerate(obs):
+        self.A_counts[modality_idx][o, curr_state] += learning_rate
+
+    # B learning: state transition given action
+    self.B_counts[action][curr_state, prev_state] += learning_rate
+
+    # Periodically normalize: A = Dirichlet_expected(A_counts)
+    if self.step_count % update_interval == 0:
+        self._update_parameters_from_counts()
+```
+
+**Integration with existing pipeline**:
+- Initialize A_counts/B_counts from deep pipeline learned parameters (`.npz`)
+- Online updates accumulate on top of batch-learned values
+- Periodic BMR sweep (every 500 steps, per AXIOM) prunes low-evidence connections
+
+**Files to modify**:
+- `cogames_policy.py`: Add `_online_update()` method, call after each step
+- `learn_parameters.py`: Export/import Dirichlet concentrations (not just expected values)
+
+**Verification**: VFE should decrease monotonically during live play as A/B converge.
+
+---
+
+#### Step 5: BTAI Tree Search (Extend Planning Horizon)
+
+**Source**: Champion et al. (Neural Computation 2024) — BTAI_3MF (Multimodal Multifactor).
+
+**Current state**: Exhaustive policy evaluation at T=2 (25 policies) or T=4 (625 policies).
+Cannot scale beyond T=4 without 3,125+ policy explosion.
+
+**Upgrade**: Replace exhaustive evaluation with MCTS-guided tree search on the factor
+graph. Selectively explores promising branches to effective depth 8-15 while evaluating
+only ~150-200 nodes total.
+
+**Algorithm** (BTAI_3MF adapted for our factored POMDP):
+```
+for iteration in range(max_planning_steps):  # 150-200
+    1. SELECT: Walk tree via UCT (average EFE + exploration bonus)
+    2. EXPAND: At leaf, create 5 children (one per macro-option)
+    3. EVALUATE: Compute factored EFE at each child:
+       - Forward predict: q(s_{t+1}|f) = B_f · q(s_t|f) for each factor f
+       - Predict obs: q(o_m) = A_m · ⊗_f q(s_f) for each modality m
+       - Risk: D_KL[q(o_m) ‖ C_m] per modality
+       - Ambiguity: E_q(s)[H[P(o|s)]] per modality
+    4. PROPAGATE: Best child's EFE propagates up to root
+Select: most-visited root child (robust to noise)
+```
+
+**Key advantage**: Factored inference over each state factor independently.
+Instead of 288×288 B matrix, operate on 6×6, 4×4, 3×3, 4×4 separately.
+Cost per node: O(Σ_f |S_f|²) instead of O(|S|²).
+
+**UCT formula**: `UCT(node) = -cost/visits + c_explore · √(ln(parent.visits)/visits)`
+
+**Implementation**: New `src/aif_meta_cogames/aif_agent/btai_planner.py`:
+- `TemporalSlice`: Node holding factored posteriors + factor graph
+- `MCTS`: Select/Expand/Evaluate/Propagate loop
+- Drop-in replacement for `evaluate_policies_multistep()` in variational engine
+
+**Estimated performance**: 150 iterations × 5 children = 750 nodes evaluated.
+At 2.5s per plan (from BTAI_3MF dSprites benchmarks), effective depth 8-12.
+
+**Reference implementations**:
+- Python: [ChampiB/BTAI_3MF](https://github.com/ChampiB/BTAI_3MF)
+- C++: [ChampiB/Homing-Pigeon](https://github.com/ChampiB/Homing-Pigeon)
+
+---
+
+#### Step 6: Opponent Belief Factors (Infer Teammate Options)
+
+**Source**: Ruiz-Serra AAMAS 2025 — mean-field factorisation over agents.
+
+**Current state**: Agents are blind to teammates' macro-options. SharedSpatialMemory
+provides station sharing but no ToM about what teammates are doing or planning.
+
+**Upgrade**: Add 3 state factors (one per teammate), each tracking the teammate's
+estimated current macro-option:
+
+```
+Current factors: [phase(6), hand(4), target_mode(3), role(4)] → 288 states
+New factors:     + [ally_0_option(5), ally_1_option(5), ally_2_option(5)]
+Total: 288 × 125 = 36,000 states (but factored → linear cost)
+```
+
+**Mean-field factorisation** (Ruiz-Serra): `q(s) = q(s_self) · Π_j q(s_ally_j)`
+
+**New observation modality**: `o_ally_option` — inferred from teammate's observed
+behavior (position trajectory, station visits, inventory changes).
+
+**A matrix for ally observations**: Maps observed teammate behavior → beliefs
+about their current option. E.g., teammate near mine → P(MINE_CYCLE) high.
+
+**Pragmatic value with opponent marginalization** (Ruiz-Serra Eq. 12-13):
+```python
+# EFE marginalizes over ally beliefs:
+for option in self_options:
+    G_self = risk(option)
+    # Marginalize social cost over ally beliefs
+    G_social = 0
+    for ally_opts in product(range(5), repeat=3):  # 125 combinations
+        p_allies = prod(q_ally[j][ally_opts[j]] for j in range(3))
+        G_social += p_allies * social_cost(option, ally_opts)
+    G[option] = (1-lambda) * G_self + lambda * G_social
+```
+
+**Cost**: 5³ = 125 opponent marginalization per self-option — tractable.
+
+**Verification**:
+- Agent should avoid CAPTURE when ally is already capturing same junction
+- Agent should prefer MINE when allies are crafting (supply chain coordination)
+- Free-Energy Equilibria: stable role allocation should emerge
+
+---
+
+#### Step 7: BMR Compression (Merge Equivalent States)
+
+**Source**: AXIOM rMM-style BMR — periodic pairwise merge of near-duplicate components.
+
+**Current state**: Fixed 288-state space. Some states may be observationally equivalent
+(e.g., different target_mode values that produce identical observations).
+
+**Upgrade**: Periodic Bayesian Model Reduction sweep that merges states with
+indistinguishable A/B profiles.
+
+**Algorithm** (adapted from AXIOM):
+```
+Every 500 steps:
+  1. Sample up to 2000 state pairs
+  2. For each pair (i, j):
+     a. Compute A-profile similarity: D_KL[A(·|i) ‖ A(·|j)] across all modalities
+     b. Compute B-profile similarity: D_KL[B(·|i,a) ‖ B(·|j,a)] across all actions
+     c. Propose merge: combine sufficient statistics
+     d. Compute VFE for merged vs unmerged model
+     e. Accept merge if VFE_merged ≤ VFE_unmerged + ε
+  3. Update A/B/C/D to reflect merged state space
+```
+
+**Files to modify**:
+- `differentiable_bmr.py`: Add `periodic_bmr_sweep()` function
+- `generative_model.py`: Support variable state space size
+
+**Expected outcome**: 288 states may reduce to ~100-150 effective states.
+Faster inference + better generalization (fewer parameters to learn).
+
+**Connection to Phase B-V/B-VI**: This completes the de novo pipeline —
+structure discovery (B-V) proposes states, gradient learning (B-VI) fits parameters,
+BMR compression removes redundancies.
+
+---
+
+#### Phase 3d Implementation Results
+
+##### Steps 1-2: Adaptive γ + Novelty η + Exploration E (2026-04-03)
+
+**Implementation details**:
+- `AIF_ADAPTIVE_GAMMA=1`: γ = β₁/(β₀ - ⟨G⟩), clipped to [1, 32], with β₁=15, β₀=1. Recomputes q_pi after `infer_policies`.
+- `AIF_EXPLORE_E=1`: Weakly informative E vector (4:1 ratio vs default 4000:1). `_build_exploration_E()` in `generative_model.py`.
+- `AIF_NOVELTY_WEIGHT=X`: Per-option novelty η = Σ_f 1/Σα_f (inverse Dirichlet concentration). `_compute_novelty()` in `cogames_policy.py`.
+- Default gamma bumped from 8 → 16 (better scale for adaptive formula).
+- C learning parameters: c_lr_scale 0.1 → 0.5, c_weight 0.5 → 1.0, gradient steps 2000 → 5000.
+
+**Iterative deep pipeline** (2026-04-07): 5 rounds × ~500k steps = ~2.5M total on arena no_clips, R2 learned params, policy_len=4.
+- Rounds 1-3: Exploration E enabled (learn diverse B matrices).
+- Rounds 4-5: Deploy E (standard E vector, exploit learned params).
+- Adaptive γ + novelty enabled throughout all rounds.
+
+| Round | VFE | VFE Reduction | Eval Mean (j/agent) | Best Episode | Notes |
+|-------|-----|---------------|---------------------|--------------|-------|
+| Baseline | 229.5 | — | 0.70 | 1.43 | Deep pipeline before changes |
+| R1 | 60.5 | 79.3% | 5.01 | — | Strong initial learning |
+| R2 | 64.9 | 78.4% | **16.01** | **34.08** | Best round overall |
+| R3 | 65.1 | 78.3% | 13.05 | — | Diminishing returns |
+| R4 | 65.1 | 78.3% | 11.77 | — | Explore→deploy transition |
+| R5 | 65.1 | 78.3% | 3.96 | — | Performance dropped |
+| Final (R5, 10-ep) | — | — | **10.43** | 29+ | 14.9× baseline |
+
+**Key findings**:
+- R2 model is the best performer. Explore → deploy transition at round 4 may be premature.
+- High variance persists: some episodes score 0 (stuck cycles), others 29+.
+- All B matrices now receive training data (CRAFT_CYCLE and CAPTURE_CYCLE exercised via exploration E).
+
+##### Steps 3-4: Habit Bypass + Online Streaming A/B (2026-04-09)
+
+**Implementation details**:
+- `AIF_HABIT_BYPASS=1`: Skip planning when E[option] > 0.5 AND VFE_ema < 5.0. VFE EMA (α=0.1) tracks -ln max_belief per agent. Bypass counter in logs.
+- `AIF_LEARN_INTERVAL=N`: Tunable Dirichlet update interval (default 50). Online `infer_parameters()` call frequency.
+- VFE-gated learning rate: lr_scale = min(1, 0.1 + 0.9 × VFE/threshold). High VFE → fast learning; low VFE → slow (preserve good params).
+
+**Evaluation** (2026-04-10): Arena no_clips, 5 episodes each, R2 learned params, policy_len=4.
+
+| Config | Mean j/agent | Episodes | Timeouts | Notes |
+|--------|-------------|----------|----------|-------|
+| Baseline (no features) | 0.15 | (0,0,0,0,0.76) | 1986 | Non-JIT'd, most actions timed out |
+| Habit bypass + VFE-gated + learn=20 | **1.43** | (0.94,1.69,1.74,1.85,0.92) | 3149 | VFE-gated lr is the actual win |
+
+**Key findings**:
+- Habit bypass never triggered (bypasses=0): default E splits ~50/50 between mine/craft, so no option exceeds the 0.5 threshold. Need to lower threshold to ~0.3 or always enable explore_E for bypass to trigger.
+- VFE-gated learning rate is the primary contributor: lr_scale ~0.45-0.57, with learn_interval=20 providing 2.5× more frequent parameter updates.
+- Neither eval had adaptive_gamma/explore_E/novelty enabled, explaining underperformance vs the iterative pipeline (10.43 j/agent).
+
+##### JIT Performance Optimization (2026-04-12)
+
+**Problem**: mettagrid enforces a 250ms action timeout. Non-JIT'd inference exceeds this:
+
+| Component | Non-JIT (ms) | JIT (ms) | Speedup |
+|-----------|-------------|---------|---------|
+| `infer_states` (belief update) | 141 | 0.2 | 705× |
+| `update_empirical_prior` | 71 | 21.4 | 3.3× (non-JIT, return-type incompatibility) |
+| Nav `infer_states` + `infer_policies` + `sample_action` | 424 | 0.7 | 606× |
+| `_select_option` (at termination only) | 917 | 0.5 | 1834× |
+| **Total per step** | **~636 + overhead → 1200** | **~22** | **28×** |
+
+**Strategy**: JIT-compile `_belief_update`, `_select_option`, and `_nav_infer` via `eqx.filter_jit()`. Keep `update_empirical_prior` non-JIT due to return-type mismatch between local and pip pymdp builds (same version 1.0.0, different return signatures — local returns `(pred, qs)` tuple, pip returns `pred` list directly). Handled via `isinstance` check at call sites.
+
+**Warmup**: JIT compilation on first call takes several seconds. All three JIT'd functions are warmed up with dummy inputs during `__init__` to avoid timeouts on the first evaluation step. Remaining ~102 warmup timeouts per evaluation are from initial compilation overhead.
+
+##### Systematic Ablation Study (2026-04-12)
+
+6 configs × 5 episodes each, arena no_clips, R2 learned params, policy_len=4, fully JIT'd.
+
+| Config | Mean j/agent | Per-Episode Scores | Timeouts | Notes |
+|--------|-------------|-------------------|----------|-------|
+| Baseline (no features) | 0.00 | (0, 0, 0, 0, 0) | 102 | JIT warmup only |
+| Adaptive gamma only | 0.35 | (0, 0, 0, 0.88, 0.88) | 102 | Marginal improvement |
+| Explore E only | 0.50 | (0, 0, 0, 1.27, 1.25) | 102 | Diversifies B learning |
+| **Novelty only** | **1.83** | **(0, 4.11, 1.88, 1.51, 1.63)** | **102** | **Best single feature** |
+| VFE-gated + learn=20 | 1.04 | (0, 0.94, 1.69, 1.74, 1.85) | 252 | Extra timeouts from non-JIT infer_parameters |
+| All combined | 0.00 | (0, 0, 0, 0, 0) | 252 | Feature interference destroys performance |
+
+**Key findings**:
+- **Novelty (η) is the strongest single feature** at 1.83 j/agent, driving exploration of under-tried options (CRAFT_CYCLE, CAPTURE_CYCLE).
+- **Feature interaction is destructive**: All features combined scores 0.00 — worse than any individual feature. The features are not additive; they interfere (e.g., adaptive γ amplifies noise from novelty + exploration E simultaneously).
+- **VFE-gated learning** contributes 1.04 j/agent but adds ~150 extra timeouts per evaluation from non-JIT'd `infer_parameters` calls every 20 steps.
+- **Adaptive gamma** alone is marginal (0.35) — needs novelty/exploration to provide meaningful EFE variance for the adaptive formula to exploit.
+- **The iterative pipeline's 10.43 j/agent used a different protocol**: 5 rounds of collect-learn-deploy with exploration E in rounds 1-3, rather than single-shot evaluation. The iterative refinement of B/C matrices is the main driver of performance, not the runtime features alone.
+
+##### Tournament Submission (2026-04-12)
+
+**Bundle**: `aif-r2-jit-v4:v1` — submitted to beta-cvc qualifying pool.
+
+**Docker environment**: `ghcr.io/metta-ai/episode-runner:compat-v0.24`, CPU-only, Python 3.12. `setup_bundle.py` installs `jaxlib==0.9.2`, `jax==0.9.2`, `equinox==0.13.6`, `inferactively-pymdp==1.0.0`, `mctx`.
+
+**pymdp compatibility note**: Local pymdp 1.0.0 (from source) and pip pymdp 1.0.0 have different `update_empirical_prior` return types. Local returns `(pred, qs)` tuple; pip returns `pred` (list[Array]) directly. Both call sites use `isinstance` check to handle both builds transparently.
+
+**Tournament results** (preliminary, 2 matches completed): 0.00 j/agent. Agents mine and craft but never align junctions. Root cause: R2 params were trained on arena (4 agents, 50×50) but tournament runs on machina_1 (8+ agents, 88×88). Navigation to junction stations takes much longer on the larger map, and the 4-agent B matrices don't transfer to 8-agent dynamics.
+
+**Next steps**: Phase C (plan broadcasting for 8-agent coordination) and map-specific parameter learning are needed before tournament viability.
+
+---
+
 ### PI Meeting Notes (2026-04-01) — Implications for AIF
 
 **Context**: Call with Subhojeet. Presented AIF option-selection results and deep AIF architecture.
@@ -825,6 +1229,16 @@ model evidence: lower F = better model.
 - If removing a parameter doesn't increase F, the simpler model is preferred
 - pymdp has `dirichlet_kl_divergence` for computing KL between Dirichlet posteriors
 
+**AXIOM BMR Algorithm** (Heins 2025 — adapted from rMM periodic pruning):
+- Every 500 steps, sample up to 2000 component pairs
+- For each pair: score mutual expected log-likelihoods via ancestral sampling
+- Propose merge: combine sufficient statistics of both components
+- Accept merge if EFE of merged model ≤ EFE of unmerged model (greedy)
+- Also prune components unused for >10 steps
+- Key insight: merges near-duplicate interaction clusters (e.g., "mine copper" and
+  "mine iron" merge into "mine resource"), enabling generalization
+- See Phase 3d Step 7 for concrete implementation plan
+
 ---
 
 ### Phase E: Factorised Social AIF
@@ -833,18 +1247,33 @@ model evidence: lower F = better model.
 AIF goes further: each agent maintains beliefs about other agents' states and
 preferences, enabling principled multi-agent coordination.
 
-**Key paper**: Pitliya et al. (AAMAS 2025) — "Factorised Active Inference for
-Strategic Multi-Agent Interactions". Code: github.com/RuizSerra/factorised-MA-AIF
+**Key paper**: Ruiz-Serra, Sweeney & Harre (AAMAS 2025) — "Factorised Active Inference
+for Strategic Multi-Agent Interactions". Code: github.com/RuizSerra/factorised-MA-AIF
 
-**Mechanism**:
-- State factors: `q(s_self) · q(s_ally_1) · q(s_ally_2) · ...`
-- Joint preferences: `p*(o_self, o_ally) = softmax(joint_payoff)`
-- EFE includes: G_self (own risk+info) + G_social (ally risk+info)
-- Natural extension of our existing factored POMDP (4 factors → 4+N_allies)
+**Mechanism** (from Ruiz-Serra detailed analysis):
+- **Mean-field factorisation**: `q(s) = q(s_self) · Π_j q(s_ally_j)` — each agent
+  maintains independent marginals over ally hidden states
+- **C vector from payoffs**: `p*(o_self, o_ally) = softmax(joint_payoff)` (Eq. 9)
+- **Pragmatic value with opponent marginalization** (Eq. 12-13): agent evaluates each
+  option by marginalizing over beliefs about what allies are doing
+- **Adaptive precision γ** (Eq. 17): `γ = β₁/(β₀ - ⟨G⟩)` — self-tuning explore/exploit
+- **Novelty term η** (Eq. 20): `η(û) = Σₙ D_KL[B̄_{û,n} ‖ B_{û,n}]` — drives
+  exploration of under-tried options
+- **Hebbian B learning** (Eq. 18): outer product of consecutive belief states,
+  accumulated over learning window T_L ∈ [18, 30]
+- **Free-Energy Equilibria** (Hyland et al. ICML 2024): AIF analogue of Nash Equilibrium —
+  no agent can unilaterally reduce its EFE. Ensemble EFE `𝔊 = Σᵢ ⟨G⟩ⁱ` characterizes
+  basins of attraction but is NOT necessarily minimized at equilibrium
+
+**Our adaptation** (Phase 3d Steps 1, 2, 6):
+- Add 3 ally option factors: [ally_0(5), ally_1(5), ally_2(5)] → 288 × 125 = 36,000
+  factored states (linear cost via mean-field)
+- New obs modality: `o_ally_option` inferred from teammate trajectories
+- Opponent marginalization: 5³ = 125 combinations per self-option — tractable
 
 **Challenge**: State space explosion. With 8 agents × 288 states each, full factorisation
 is intractable. Solutions: (a) group agents by role, (b) only model nearest 2 allies,
-(c) mean-field approximation.
+(c) mean-field approximation (Ruiz-Serra validates this for N=2,3 agents).
 
 ---
 
@@ -990,3 +1419,9 @@ The higher-level POMDP selects context, the lower level plans within it. Context
 - Mazzaglia et al. (2025): R-AIF — active inference for sparse reward tasks
 - Friston et al. (2017): Active Inference, Curiosity and Insight
 - Albarracin et al. (2026): Empathy Modeling in Active Inference
+- Ruiz-Serra, Sweeney & Harre (AAMAS 2025): Factorised Active Inference for Strategic Multi-Agent Interactions — mean-field factorisation, adaptive γ, novelty η, Free-Energy Equilibria
+- Heins et al. (2025): AXIOM — Active eXpanding Inference with Object-centric Models — conjugate mixture models, online BMR, MPPI planning, 10K-step mastery
+- Champion et al. (Neural Computation 2024): Multimodal and Multifactor Branching Time Active Inference — MCTS on factor graphs, factored belief propagation
+- Fountas et al. (NeurIPS 2020): Deep Active Inference Agents Using Monte-Carlo Methods — MCTS for AIF, habit bypass, bootstrap confidence
+- Hyland et al. (ICML 2024): Free-Energy Equilibria — AIF analogue of Nash Equilibrium, bounded rationality
+- Friston et al. (2025): Gradient-Free De Novo Learning — structure discovery, Bayesian model reduction, renormalising generative models

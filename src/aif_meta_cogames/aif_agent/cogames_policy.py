@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -391,15 +392,15 @@ class AIFBeliefState:
 # Level 2: JIT-compiled strategic inference functions
 # ---------------------------------------------------------------------------
 
-def _belief_update(agent, batched_obs, empirical_prior, option_actions):
-    """JIT-compilable belief update -- runs every step (~28ms).
+def _belief_update(agent, batched_obs, empirical_prior):
+    """JIT-compilable belief update -- runs every step.
 
-    Updates beliefs given new observations and the currently executing option.
-    Does NOT replan (no infer_policies).
+    Only runs infer_states (the expensive part). Empirical prior update
+    is done outside JIT to avoid return-value compatibility issues across
+    pymdp versions.
     """
     qs = agent.infer_states(batched_obs, empirical_prior=empirical_prior)
-    pred, _ = agent.update_empirical_prior(option_actions, qs)
-    return pred, qs
+    return qs
 
 
 def _select_option(agent, qs):
@@ -417,17 +418,16 @@ def _select_option(agent, qs):
 # Level 0: JIT-compiled navigation POMDP functions
 # ---------------------------------------------------------------------------
 
-def _nav_infer(agent, batched_obs, empirical_prior, nav_actions):
+def _nav_infer(agent, batched_obs, empirical_prior):
     """JIT-compilable nav POMDP: belief update + policy selection.
 
     Runs every step. ~3-5ms for 16-state POMDP with 25 policies.
-    Returns qs for downstream B-learning.
+    Empirical prior update done outside JIT.
     """
     qs = agent.infer_states(batched_obs, empirical_prior=empirical_prior)
-    pred, _ = agent.update_empirical_prior(nav_actions, qs)
     q_pi, _efe = agent.infer_policies(qs)
     sampled = agent.sample_action(q_pi)
-    return pred, sampled[:, 0], q_pi, qs
+    return sampled[:, 0], q_pi, qs
 
 
 def _nav_learn_B(agent, beliefs_T2, obs_T2, actions_T1):
@@ -441,6 +441,33 @@ def _nav_learn_B(agent, beliefs_T2, obs_T2, actions_T1):
     return agent.infer_parameters(
         beliefs_T2, obs_T2, actions_T1, beliefs_T2, 0.0, 1.0,
     )
+
+
+def _compute_novelty(pB, n_options: int) -> np.ndarray:
+    """Ruiz-Serra Eq. 20: expected parameter information gain per option.
+
+    η(option) ≈ Σ_f 1/Σα_f(option)  (digamma approximation for large α).
+    Options with low total Dirichlet concentrations (few observations)
+    get higher novelty → drives exploration of under-tried options.
+    """
+    novelty = np.zeros(n_options)
+    for f_idx, pb in enumerate(pB):
+        pb_np = np.asarray(pb)
+        for option in range(n_options):
+            # Sum Dirichlet concentrations for this factor×option
+            # pB shapes vary: (s', s1, s2, a) or (s', s, a) etc.
+            # Last axis is action/option
+            if pb_np.ndim == 3:
+                # Non-batched: (s', s, a) — select option from last axis
+                alpha_sum = float(pb_np[:, :, option].sum())
+            elif pb_np.ndim == 4:
+                # Could be batched (batch, s', s, a) or factored (s', s1, s2, a)
+                # For strategic POMDP: (s', s1, s2, a) or (batch, s', s, a)
+                alpha_sum = float(pb_np[..., option].sum())
+            else:
+                alpha_sum = float(pb_np[..., option].sum())
+            novelty[option] += 1.0 / (alpha_sum + 1e-6)
+    return novelty
 
 
 # ---------------------------------------------------------------------------
@@ -660,7 +687,11 @@ class BatchedAIFEngine:
                  policy_len: int = 2,
                  auto_chain: bool = True, context_E: bool = False,
                  log_trajectory: bool = False,
-                 learned_params_path: Optional[str] = None):
+                 learned_params_path: Optional[str] = None,
+                 adaptive_gamma: bool = False,
+                 explore_E: bool = False,
+                 novelty_weight: float = 0.0,
+                 habit_bypass: bool = False):
         self.n_agents = n_agents
         self.learn_B = learn_B
         self.learn_A = learn_A
@@ -668,6 +699,23 @@ class BatchedAIFEngine:
         self.auto_chain = auto_chain
         self.context_E = context_E
         self._step_count = 0
+
+        # Adaptive γ: Ruiz-Serra Eq. 17 — precision as random variable
+        self.adaptive_gamma = adaptive_gamma
+        self.beta_0 = 1.0
+        self.beta_1 = 15.0
+
+        # Novelty η: Ruiz-Serra Eq. 20 — expected parameter info gain
+        self.novelty_weight = novelty_weight
+
+        # Habit bypass: skip planning when confident (Fountas NeurIPS 2020)
+        self.habit_bypass = habit_bypass
+        self.habit_threshold = 0.5      # E[option] threshold for bypass
+        self.vfe_threshold = 5.0        # VFE above this = uncertain, must plan
+        self._vfe_ema = np.zeros(n_agents)   # per-agent EMA of VFE
+        self._vfe_alpha = 0.1           # EMA smoothing factor
+        self._bypass_count = 0          # total bypass events (for logging)
+        self._lr_scale = 1.0            # last computed lr_scale (for logging)
 
         # Trajectory logging for offline parameter learning (Phase B)
         self.log_trajectory = log_trajectory
@@ -706,7 +754,7 @@ class BatchedAIFEngine:
         self.agent = CogsGuardPOMDP.create_strategic_agent(
             n_agents, learn_B=learn_B, learn_A=learn_A,
             custom_A=custom_A, custom_B=custom_B, custom_C=custom_C,
-            policy_len=policy_len,
+            policy_len=policy_len, explore_E=explore_E,
         )
 
         # Level 1: Option executor
@@ -771,7 +819,9 @@ class BatchedAIFEngine:
         )
         self._nav_initial_B = [b.copy() for b in self.nav_agent.B]
 
-        # JIT-compile all functions
+        # JIT-compile ALL expensive functions.
+        # Only update_empirical_prior stays non-JIT (return type varies across
+        # pymdp builds — see note in _run_batch).
         self._jit_belief_update = eqx.filter_jit(_belief_update)
         self._jit_select_option = eqx.filter_jit(_select_option)
         self._jit_nav_infer = eqx.filter_jit(_nav_infer)
@@ -779,18 +829,10 @@ class BatchedAIFEngine:
 
         # Warmup JIT compilation (avoids timeout on first eval step)
         dummy_obs = [jnp.zeros((n_agents, 1), dtype=jnp.int32) for _ in range(6)]
-        dummy_actions = jnp.full((n_agents, 4), 0, dtype=jnp.int32)
-        pred, qs = self._jit_belief_update(
-            self.agent, dummy_obs, self.empirical_prior, dummy_actions
-        )
-        self._jit_select_option(self.agent, qs)
-
-        # Warmup nav POMDP JIT (including B-learning)
         dummy_nav_obs = [jnp.zeros((n_agents, 1), dtype=jnp.int32) for _ in range(2)]
-        dummy_nav_act = jnp.full((n_agents, 2), 0, dtype=jnp.int32)
-        _pred, _act, _qpi, _qs = self._jit_nav_infer(
-            self.nav_agent, dummy_nav_obs, self.nav_prior, dummy_nav_act
-        )
+        _qs = self._jit_belief_update(self.agent, dummy_obs, self.empirical_prior)
+        self._jit_select_option(self.agent, _qs)
+        self._jit_nav_infer(self.nav_agent, dummy_nav_obs, self.nav_prior)
 
         # Context-dependent E vectors for principled hierarchical AIF.
         # E(π | context) where context = inventory state.
@@ -863,12 +905,33 @@ class BatchedAIFEngine:
             )
             batched_obs.append(stacked)
 
-        # Level 2a: Belief update (every step, ~28ms)
-        new_prior, qs = self._jit_belief_update(
-            self.agent, batched_obs, self.empirical_prior, self._option_actions
+        # Level 2a: Belief update (every step, ~0.5ms JIT'd)
+        qs = self._jit_belief_update(
+            self.agent, batched_obs, self.empirical_prior
         )
-        self.empirical_prior = new_prior
+        # Empirical prior update (outside JIT for pymdp version compat)
+        # NOTE: pymdp 1.0.0 has two builds with different return types:
+        #   - local/dev: returns (pred, qs) tuple
+        #   - pip/Docker: returns pred (list[Array]) directly
+        _ep_result = self.agent.update_empirical_prior(
+            self._option_actions, qs
+        )
+        if isinstance(_ep_result, tuple) and len(_ep_result) == 2:
+            self.empirical_prior = _ep_result[0]
+        else:
+            self.empirical_prior = _ep_result
         self.qs = qs
+
+        # Update VFE tracking: F ≈ -ln max_s q(s) across factors
+        if self.habit_bypass:
+            for i in range(self.n_agents):
+                vfe_i = 0.0
+                for f in range(len(qs)):
+                    q_f = qs[f][i]
+                    max_belief = float(jnp.max(q_f))
+                    vfe_i += -np.log(max_belief + 1e-8)
+                self._vfe_ema[i] = (self._vfe_alpha * vfe_i
+                                    + (1 - self._vfe_alpha) * self._vfe_ema[i])
 
         # Level 1: Check option termination and get task policies
         terminated = []
@@ -894,14 +957,47 @@ class BatchedAIFEngine:
                 replan_needed = terminated
 
             if replan_needed:
-                # Context-dependent E: update habit prior based on inventory
-                agent = self._apply_context_E() if self.context_E else self.agent
-                options, q_pi, neg_efe = self._jit_select_option(agent, qs)
-                self._last_q_pi = q_pi
-                self._last_neg_efe = neg_efe
-                for i in replan_needed:
-                    new_option = int(options[i])
-                    self.option_executor.set_option(i, new_option)
+                # Habit bypass: skip planning for confident agents (Fountas 2020)
+                actually_replan = []
+                if self.habit_bypass:
+                    agent_e = np.array(self.agent.E)  # (n_agents, n_pol) or (n_pol,)
+                    n_pol_total = agent_e.shape[-1]
+                    n_pol_per_opt = n_pol_total // NUM_OPTIONS
+                    for i in replan_needed:
+                        opt = int(self._current_options[i])
+                        opt_start = opt * n_pol_per_opt
+                        opt_end = (opt + 1) * n_pol_per_opt
+                        if agent_e.ndim == 2:
+                            habit_prob = float(agent_e[i, opt_start:opt_end].sum())
+                        else:
+                            habit_prob = float(agent_e[opt_start:opt_end].sum())
+
+                        if (habit_prob > self.habit_threshold
+                                and self._vfe_ema[i] < self.vfe_threshold):
+                            # Re-execute same option without replanning
+                            self.option_executor.set_option(i, opt)
+                            self._bypass_count += 1
+                        else:
+                            actually_replan.append(i)
+                else:
+                    actually_replan = replan_needed
+
+                if actually_replan:
+                    # Context-dependent E: update habit prior based on inventory
+                    agent = self._apply_context_E() if self.context_E else self.agent
+                    options, q_pi, neg_efe = self._jit_select_option(agent, qs)
+
+                    # Adaptive γ + novelty η: recompute q_pi with precision update
+                    if self.adaptive_gamma:
+                        options, q_pi = self._adaptive_recompute(
+                            agent, neg_efe
+                        )
+
+                    self._last_q_pi = q_pi
+                    self._last_neg_efe = neg_efe
+                    for i in actually_replan:
+                        new_option = int(options[i])
+                        self.option_executor.set_option(i, new_option)
 
             # Record post-filter options for all terminated agents
             for i in terminated:
@@ -947,6 +1043,10 @@ class BatchedAIFEngine:
             for _p, _c in self.shared_memory.stations.items():
                 shared_cats[_c] = shared_cats.get(_c, 0) + 1
             extras.append(f"shared_cats={shared_cats}")
+            if self.habit_bypass:
+                extras.append(f"vfe_ema={list(np.round(self._vfe_ema, 2))}")
+                extras.append(f"lr_scale={self._lr_scale:.2f}")
+                extras.append(f"bypasses={self._bypass_count}")
             extra_str = f", {', '.join(extras)}" if extras else ""
             print(f"[AIF step={self._step_count}] options={option_names}")
             print(f"  tasks={task_names}{extra_str}")
@@ -1032,6 +1132,48 @@ class BatchedAIFEngine:
         return False
 
     # ------------------------------------------------------------------
+    # Adaptive γ + novelty η (Ruiz-Serra AAMAS 2025)
+    # ------------------------------------------------------------------
+
+    def _adaptive_recompute(self, agent, neg_efe):
+        """Recompute q(π) with adaptive γ and optional novelty bonus.
+
+        Ruiz-Serra Eq. 17: γ = β₁ / (β₀ - ⟨G⟩)
+        When EFE landscape is flat (ambiguous), γ drops → explore.
+        When one option dominates, γ rises → exploit.
+        """
+        # Compute adaptive gamma per agent: (n_agents,)
+        mean_G = jnp.mean(neg_efe, axis=-1)
+        gamma_a = self.beta_1 / (self.beta_0 - mean_G + 1e-8)
+        gamma_a = jnp.clip(gamma_a, 1.0, 32.0)
+
+        # Augment neg_efe with novelty if enabled
+        neg_efe_aug = neg_efe
+        if self.novelty_weight > 0.0 and agent.pB is not None:
+            novelty = _compute_novelty(agent.pB, NUM_OPTIONS)
+            # Tile novelty across all second-step extensions
+            n_pol_per_opt = neg_efe.shape[-1] // NUM_OPTIONS
+            novelty_per_policy = np.repeat(novelty, n_pol_per_opt)
+            # Broadcast to (n_agents, n_policies)
+            novelty_tiled = jnp.broadcast_to(
+                jnp.array(novelty_per_policy), neg_efe.shape
+            )
+            neg_efe_aug = neg_efe + self.novelty_weight * novelty_tiled
+
+        # Recompute q_pi with adaptive gamma
+        log_E = jnp.log(agent.E + 1e-16)
+        q_pi = jax.nn.softmax(
+            gamma_a[:, None] * neg_efe_aug + log_E, axis=-1
+        )
+
+        # Marginalize over second-step to get first-step option probs
+        n_opt = NUM_OPTIONS
+        option_probs = q_pi.reshape(q_pi.shape[0], n_opt, -1).sum(axis=-1)
+        options = jnp.argmax(option_probs, axis=-1)
+
+        return options, q_pi
+
+    # ------------------------------------------------------------------
     # Level 0: Nav POMDP batch inference
     # ------------------------------------------------------------------
 
@@ -1045,11 +1187,19 @@ class BatchedAIFEngine:
             )
             batched_nav_obs.append(stacked)
 
-        # Nav inference: belief update + policy selection (~3-5ms)
-        new_prior, nav_actions, _q_pi, nav_qs = self._jit_nav_infer(
-            self.nav_agent, batched_nav_obs, self.nav_prior, self._nav_actions
+        # Nav inference: belief update + policy selection (~1ms JIT'd)
+        nav_actions, _q_pi, nav_qs = self._jit_nav_infer(
+            self.nav_agent, batched_nav_obs, self.nav_prior
         )
-        self.nav_prior = new_prior
+        # Nav empirical prior update (outside JIT)
+        # Handle both pymdp return types (see note above)
+        _nav_ep_result = self.nav_agent.update_empirical_prior(
+            self._nav_actions, nav_qs
+        )
+        if isinstance(_nav_ep_result, tuple) and len(_nav_ep_result) == 2:
+            self.nav_prior = _nav_ep_result[0]
+        else:
+            self.nav_prior = _nav_ep_result
 
         # Cache actions for each agent
         nav_act_np = np.asarray(nav_actions, dtype=np.int32)
@@ -1139,7 +1289,11 @@ class BatchedAIFEngine:
     # ------------------------------------------------------------------
 
     def _update_parameters(self, curr_obs, curr_qs):
-        """Update A and/or B matrices via online Dirichlet learning."""
+        """Update A and/or B matrices via online Dirichlet learning.
+
+        VFE-gated learning rate (AXIOM, Heins 2025): learn faster when
+        uncertain (high VFE), slower when well-calibrated (low VFE).
+        """
         beliefs_T2 = [
             jnp.concatenate([self._prev_qs[f], curr_qs[f]], axis=1)
             for f in range(len(curr_qs))
@@ -1150,8 +1304,16 @@ class BatchedAIFEngine:
         ]
         actions_T1 = self._prev_actions[:, None, :]
 
-        lr_pA = 1.0 if self.learn_A else 0.0
-        lr_pB = 1.0 if self.learn_B else 0.0
+        # VFE-gated learning rate: scale with mean VFE across agents
+        if self.habit_bypass and float(np.max(self._vfe_ema)) > 0:
+            mean_vfe = float(np.mean(self._vfe_ema))
+            lr_scale = min(1.0, 0.1 + 0.9 * (mean_vfe / (self.vfe_threshold + 1e-8)))
+        else:
+            lr_scale = 1.0
+        self._lr_scale = lr_scale
+
+        lr_pA = lr_scale if self.learn_A else 0.0
+        lr_pB = lr_scale if self.learn_B else 0.0
         self.agent = self.agent.infer_parameters(
             beliefs_T2, obs_T2, actions_T1, beliefs_T2, lr_pA, lr_pB,
         )
@@ -1898,18 +2060,43 @@ class AIFPolicy(_MultiAgentPolicy):
         if learned_params_path:
             print(f"[AIFPolicy] Loading learned params from {learned_params_path}")
 
+        # Adaptive gamma: Ruiz-Serra Eq. 17
+        adaptive_gamma = os.environ.get("AIF_ADAPTIVE_GAMMA", "0") == "1"
+        # Exploration E: weakly informative habit prior for learning
+        explore_E = os.environ.get("AIF_EXPLORE_E", "0") == "1"
+        # Novelty weight: Ruiz-Serra Eq. 20
+        novelty_weight = float(os.environ.get("AIF_NOVELTY_WEIGHT", "0.0"))
+        # Habit bypass: Fountas NeurIPS 2020 — skip planning when confident
+        habit_bypass = os.environ.get("AIF_HABIT_BYPASS", "0") == "1"
+        # Tunable learn interval (default 50)
+        learn_interval = int(os.environ.get("AIF_LEARN_INTERVAL", "50"))
+
         # Hierarchical engine: strategic POMDP + option state machines
         policy_len = int(os.environ.get("AIF_POLICY_LEN", "2"))
         self._engine = BatchedAIFEngine(
             n_agents=n_agents, learn_B=True, learn_A=learn_A,
-            policy_len=policy_len, learn_interval=50,
+            policy_len=policy_len, learn_interval=learn_interval,
             log_trajectory=log_traj,
             learned_params_path=learned_params_path or None,
+            adaptive_gamma=adaptive_gamma,
+            explore_E=explore_E,
+            novelty_weight=novelty_weight,
+            habit_bypass=habit_bypass,
         )
         if log_traj:
             print(f"[AIFPolicy] Trajectory logging ENABLED")
         if learn_A:
             print(f"[AIFPolicy] Online A-learning ENABLED")
+        if adaptive_gamma:
+            print(f"[AIFPolicy] Adaptive γ ENABLED (Ruiz-Serra Eq. 17)")
+        if explore_E:
+            print(f"[AIFPolicy] Exploration E ENABLED (weakly informative)")
+        if novelty_weight > 0.0:
+            print(f"[AIFPolicy] Novelty η ENABLED (weight={novelty_weight})")
+        if habit_bypass:
+            print(f"[AIFPolicy] Habit bypass ENABLED (Fountas NeurIPS 2020)")
+        if learn_interval != 50:
+            print(f"[AIFPolicy] Learn interval={learn_interval}")
         self._agents: dict[int, _StatefulAgentPolicy] = {}
 
     def agent_policy(self, agent_id: int) -> _StatefulAgentPolicy:
