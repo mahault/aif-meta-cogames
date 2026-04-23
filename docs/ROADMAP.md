@@ -117,7 +117,7 @@ The v1 prototype mapped the POMDP action space to 5 primitive movement actions (
 
 ---
 
-## Phase 3b: Discrete AIF Agent — Deep AIF v9.7 (288-State, Two Nested POMDPs) — IN PROGRESS
+## Phase 3b: Discrete AIF Agent — Deep AIF v9.7 (288-State, Two Nested POMDPs) — COMPLETE
 
 **Lead**: Mahault | **Started**: 2026-03-19
 
@@ -253,7 +253,7 @@ The A/B matrices at 288 states are the meta-learning target:
 
 ## Phase 3c: Parameter Learning + Social Coordination
 
-**Lead**: Mahault | **Started**: 2026-03-31 | **Parameter Learning (B-I through B-VI): COMPLETE** (2026-04-01)
+**Lead**: Mahault | **Started**: 2026-03-31 | **Parameter Learning (B-I through B-VI): COMPLETE** (2026-04-01) | **Phase 3c: COMPLETE**
 
 ### Motivation
 
@@ -794,9 +794,13 @@ to close this gap, ordered by impact/effort ratio.
 | 2 | Novelty term η + Exploration E | Ruiz-Serra AAMAS 2025 | Medium | Small | `generative_model.py`, `cogames_policy.py` | **COMPLETE** (2026-04-03) |
 | 3 | Habit bypass | Fountas NeurIPS 2020 | Medium | Small | `cogames_policy.py` | **COMPLETE** (2026-04-09) |
 | 4 | Online streaming A/B | AXIOM (Heins 2025) | High | Medium | `cogames_policy.py` | **COMPLETE** (2026-04-09) |
+| — | JIT optimization | — | Critical | Small | `cogames_policy.py` | **COMPLETE** (2026-04-12) |
+| — | Systematic ablation | — | — | Small | `scripts/eval_ablation.sh` | **COMPLETE** (2026-04-12) |
+| — | Extended training (arena + machina_1) | — | High | Medium | `scripts/extended_train.sh` | **COMPLETE** (2026-04-21) |
+| — | Kickstart pre-training | — | High | Medium | `scripts/kickstart_pretrain.sh` | **COMPLETE** (2026-04-21) |
 | 5 | BTAI tree search | Champion Neural Comp 2024 | High | Large | new `btai_planner.py` | TODO |
 | 6 | Opponent belief factors | Ruiz-Serra AAMAS 2025 | High | Large | `generative_model.py` | TODO |
-| 7 | BMR compression | AXIOM rMM-style | Medium | Medium | `differentiable_bmr.py` | TODO |
+| 7 | Analytical BMR + structure learning | Neacsu 2022, AXIOM | High | Medium | `differentiable_bmr.py`, `scripts/learn_from_teacher.py` | **IN PROGRESS** (2026-04-22) |
 
 ---
 
@@ -1145,7 +1149,65 @@ BMR compression removes redundancies.
 
 **Tournament results** (preliminary, 2 matches completed): 0.00 j/agent. Agents mine and craft but never align junctions. Root cause: R2 params were trained on arena (4 agents, 50×50) but tournament runs on machina_1 (8+ agents, 88×88). Navigation to junction stations takes much longer on the larger map, and the 4-agent B matrices don't transfer to 8-agent dynamics.
 
-**Next steps**: Phase C (plan broadcasting for 8-agent coordination) and map-specific parameter learning are needed before tournament viability.
+**Next steps**: Extended training pipeline (Phase A arena + Phase B machina_1, see below) addresses the domain shift. Phase C (plan broadcasting for 8-agent coordination) remains needed for full tournament viability.
+
+---
+
+##### Extended Training Pipeline: Arena + machina_1 (2026-04-15, COMPLETE)
+
+**Motivation**: Ablation showed novelty (1.83) and VFE-gated lr (1.04) are the only non-destructive features. Adaptive gamma (0.35 alone, 0.00 combined) and habit bypass (never triggers) are excluded. Tournament scores 0.00 on machina_1 because R2 params were trained on arena (50×50, 4 agents) — need map-specific learning.
+
+**Script**: `scripts/extended_train.sh` — two-phase iterative training on GPU 1.
+
+**Feature selection (ablation-informed)**:
+
+| Feature | Status | Rationale |
+|---------|--------|-----------|
+| Novelty η=1.0 | ON | Strongest single feature (1.83 j/agent) |
+| VFE-gated lr + learn_interval=20 | ON | Online adaptation (1.04 j/agent) |
+| Explore E | ON (first half of rounds) | B coverage then convergence |
+| Adaptive gamma | OFF | Marginal alone (0.35), destructive combined |
+| Habit bypass | OFF | Never triggered (E splits 50/50) |
+
+**Phase A: Arena Extended (10 rounds)**:
+- Map: arena no_clips, 4 agents, 10,000 steps/ep, policy_len=4 (625 policies)
+- Init: R2 params (`/tmp/learned_iter_r2.npz`)
+- 500k steps/round (10 batches × 5 episodes), 5,000 grad steps/round
+- Explore E rounds 1-5, deploy E rounds 6-10
+- Output: `/tmp/learned_ext_arena_r{1..10}.npz`
+
+**Phase B: machina_1 Adaptation (5 rounds)**:
+- Map: machina_1 no_clips, **8 agents**, **20,000 steps/ep** (larger map)
+- Init: best arena params from Phase A (r10)
+- 1M steps/round (10 batches × 5 episodes), 5,000 grad steps/round
+- Explore E rounds 1-3, deploy E rounds 4-5
+- Output: `/tmp/learned_ext_machina_r{1..5}.npz`
+
+**Results (as of 2026-04-16)**:
+
+| Round | VFE | VFE Reduction | Aligned Junctions (avg) | Eval Scores (j/agent) | Notes |
+|-------|-----|---------------|------------------------|----------------------|-------|
+| A-R1 | 293.8 | 48.7% | 0.40-1.80 (improving) | 0, 18.68, 0, 0, 0 (mean 3.73) | Learning complete |
+| A-R2 | — | — | 1.40 (collection) | 9.91, 9.88, 9.92, 19.40, 19.85 (latest batch) | Batch 4/10 collecting |
+
+**Final Results (2026-04-21, COMPLETE)**:
+- **Arena Phase A (10 rounds)**: R10 VFE=241.8 (57% reduction, best). Junction: 5.75 j/agent (steady climb R4-R10).
+- **machina_1 Phase B (5 rounds)**: R1 VFE=258.4 (59.4% reduction), junctions: 1.62 j/agent (up from 0.00 at tournament).
+- **Kickstart Pre-training (3 rounds)**: R1 VFE=90.5/65%, R2=196.9/58%, R3=177.8/63%. Params: `/tmp/learned_kickstart_r3.npz`.
+- **Bayes model comparison**: R10 strongly favored over all other rounds (BF > 10^9).
+
+**Track A PPO Results (parallel, metta recipe, 2026-04-21)**:
+- **823.3 j/held at 50M steps** with adaptive entropy controller + cinky cuda teacher.
+- Exponential growth: 0.1 → 12 → 68 ��� 169 → 396 → 823 j/held over 24 epochs.
+- PR submitted: https://github.com/Metta-AI/metta/pull/11757 (adaptive entropy + recipe).
+- Note: 823 j/held is with teacher KL signal. Student-only eval: ~1.0 j/agent.
+- 500M supervisor run: teacher-held ~8,300 j/held but student-only still ~1.0j. ActionSupervised (CE on hard labels) insufficient for knowledge transfer — need KL on soft distributions (kickstarter mode).
+- **PI meeting (2026-04-22)**: Subhojeet clarified teacher modes — supervisor=CE, kickstarter=KL. Recommends KL with zero teacher forcing. Cluster access via SkyPilot (Kelsey handling). Standups Tuesday+Thursday.
+- PR fixes pushed (commit 6ec33c8d98): checkpoint persistence + DDP sync.
+- **Next**: Launch `learned.kickstarter.mixed` with KL distillation (AWS SSO unblocked, S3 access working).
+- R2 collection shows **all 5 episodes scoring >0** in latest batch — major consistency improvement over typical 1-in-5 pattern.
+- Economy chain functioning: agents mine resources, craft gears, acquire aligners, align junctions.
+- GPU 1 at 18GB, 41-73% utilization. ~24h per round, ~10 days for full Phase A.
 
 ---
 
@@ -1295,6 +1357,196 @@ generative models — each agent has a model of what other agents believe and wa
 
 **This connects to social-layer project**: CommitmentInference, IntentParticleFilter,
 SocialEFE, GatedToM patterns from social-layer provide the architecture template.
+
+---
+
+### Phase G: Addressing the 1-2 j/agent Plateau (Empirical Diagnostic)
+
+**Context (April 2026)**: After extensive parameter learning (extended training v2: 10
+arena rounds + 5 machina_1 rounds, kickstart pre-training with LSTM teacher), the
+discrete POMDP AIF agent consistently plateaus at **1-2 j/agent on arena** and
+**~1.6 j/agent on machina_1**. Meanwhile, Track A PPO (metta recipe with adaptive
+entropy) achieves **124+ j/held** with exponential growth. This section diagnoses
+the architectural ceilings and proposes solutions ordered by implementation cost.
+
+#### Diagnosed Architectural Ceilings
+
+**Ceiling 1: Observation Discretisation Loses Spatial Context**
+- 6 observation modalities (phase, hand, station, resource, collision, social) each
+  discretised to 2-5 levels — the agent sees "RESOURCE_NEAR" but not *which* resource
+  or *where* relative to other agents
+- PPO sees raw 200×3 token grids with precise spatial layout
+- Impact: agent cannot distinguish "heart at (10,20) near empty junction" from "heart
+  at (40,40) far from everything" — both map to the same discrete observation
+
+**Ceiling 2: Macro-Option Lock-In (30-120 steps)**
+- 5 macro-options (CRAFT_CYCLE, CAPTURE_CYCLE, EXPLORE, MINE, DEPOSIT) lock the agent
+  into multi-step skill execution
+- Mean option duration: 30-120 steps depending on map size and navigation distance
+- No early termination on changed conditions (e.g., contested junction becomes free)
+- PPO selects a new action every step from Discrete(40) action space
+
+**Ceiling 3: Static C Vectors (Phase-Independent Preferences)**
+- C vectors are fixed parameters learned offline — same preferences regardless of
+  game phase (early exploration vs late capture race)
+- Already identified in "Research Direction: Context-Dependent Preferences" (below)
+  but not yet implemented
+- Impact: agent cannot shift from "explore and gather" to "rush junctions" as game
+  progresses
+
+**Ceiling 4: VFE Doesn't Signal Junction Captures**
+- VFE measures prediction error over the agent's own generative model states
+- Junction capture (the actual objective) is a sparse, externally-scored event that
+  doesn't directly appear in any observation modality
+- The agent optimises for internal coherence (low surprise), not task performance
+- Fix requires either: adding a junction-capture observation modality, or shaping C
+  vectors so that the belief trajectory toward capture coincidentally minimises G
+
+**Ceiling 5: No Multi-Agent Coordination**
+- Each AIF agent plans independently — no target deconfliction, no role specialisation
+- 4 agents all converging on the same junction wastes 3 agents' effort
+- PPO teams benefit from implicit coordination via shared gradient updates
+- Already identified in Phase C (Plan Broadcasting) and Phase E (Factorised Social
+  AIF) but not yet implemented
+
+#### Solution A: Richer Observation Encoding (Quick Fix)
+
+**Cost**: Low (days) | **Expected impact**: +1-3 j/agent
+
+Add 3 new observation modalities to the generative model:
+- `o_junction_state`: {NONE, UNCAPTURED_NEAR, CAPTURED_ALLY, CAPTURED_ENEMY} — makes
+  junction capture visible to the POMDP
+- `o_game_phase`: {EARLY, MID, LATE} — enables temporal awareness from step counter
+- `o_ally_density`: {ALONE, SPARSE, CROWDED} — spatial deconfliction signal
+
+This requires extending the A matrix (30 states × 9 obs modalities) and learning new
+A/B parameters. Existing `learn_parameters.py` handles arbitrary observation counts.
+
+#### Solution B: Shorter Option Horizons (Quick Fix)
+
+**Cost**: Low (days) | **Expected impact**: +0.5-2 j/agent
+
+- Reduce mean option duration from ~60 to ~20 steps
+- Add early-termination conditions: option aborts if key observation changes
+  (e.g., collision detected, target station occupied by ally)
+- Policy reselection every 20 steps instead of waiting for option completion
+
+Already partially supported: `AIF_POLICY_LEN=4` controls planning depth but not
+option *execution* duration. Need to add `max_option_steps` parameter.
+
+#### Solution C: Phase-Conditioned C Vectors (Medium Fix)
+
+**Cost**: Medium (1-2 weeks) | **Expected impact**: +2-5 j/agent
+
+Implement the context-dependent preferences described in "Research Direction:
+Context-Dependent Preferences" (see below). Three C vector sets:
+- `C_gather`: prefer RESOURCE observations, explore broadly
+- `C_craft`: prefer HUB/CRAFT stations, converge on craft cycle
+- `C_capture`: prefer JUNCTION, rush aligned captures
+
+Context switching via game phase (step-based) or inventory state (hand modality).
+This is the hierarchical active inference approach (Friston et al., 2017).
+
+#### Solution D: Shared Intention Broadcast (Medium Fix)
+
+**Cost**: Medium (1-2 weeks) | **Expected impact**: +2-4 j/agent (especially 8-agent)
+
+Implement Phase C (Plan Broadcasting): agents share their current macro-option and
+target position. AIF planning penalises options that duplicate ally targets.
+
+Extends naturally to Phase E (Factorised Social AIF) if more sophistication needed.
+
+#### Solution E: Continuous State Space — Deep AIF (Major Architecture Change)
+
+**Cost**: High (months) | **Expected impact**: 5-20× improvement
+
+Replace discrete POMDP with continuous latent-space AIF:
+- Encoder: raw 200×3 token grid → 64-dim latent z
+- Transition: `z_{t+1} = f(z_t, a_t)` — learned world model IS the B matrix
+- EFE in latent space: use ensemble disagreement for epistemic value
+- Planning: Monte Carlo planning (MCTS or MPPI) over latent rollouts
+
+This IS Phase 4 (Neural AIF + Meta-Learned World Model). The discrete POMDP was
+always a stepping stone — the empirical plateau confirms the need to graduate.
+
+Key references: AXIOM (Heins 2025), Deep AIF (Fountas 2020), DreamerV3 (Hafner 2023).
+
+#### Solution F: Hybrid AIF+PPO
+
+**Cost**: High (months) | **Expected impact**: Best-of-both-worlds
+
+- PPO handles low-level action selection (Discrete(40), per-step)
+- AIF provides macro-level planning: goal selection, exploration drive, social
+  coordination
+- AIF's EFE becomes a shaped reward signal or auxiliary loss for PPO
+- This is effectively Track C from the metta migration plan (VFE as loss function)
+
+#### Solution G: Structure Learning from Teacher Co-Play (Kickstart Extension) — IN PROGRESS
+
+**Cost**: Medium (2-3 weeks) | **Expected impact**: +3-8 j/agent | **Started**: 2026-04-22
+
+**Insight**: Kickstart pre-training already runs mixed teams (2 LSTM teacher + 2 AIF
+agents). The teacher demonstrates successful economy chains. Currently we only learn
+A/B/C *parameters* from these trajectories. Structure learning goes further:
+
+1. **Discover new hidden states**: Use Bayesian Model Reduction (BMR, Phase D) on
+   kickstart trajectories to identify whether the current 30-state POMDP is missing
+   states. Teacher trajectories contain richer state-action patterns that may reveal
+   needed but absent states (e.g., "junction-approach" vs "junction-capture" as
+   distinct phases).
+
+2. **Learn observation→state mappings from teacher behaviour**: Teacher's action
+   sequences imply latent state transitions. Use the teacher's observed
+   `(obs_t, action_t, obs_{t+1})` tuples to fit a *larger* generative model
+   (e.g., 48 or 60 states) and then prune via BMR back to minimum complexity.
+
+3. **Discover new observation modalities**: Cluster teacher's decision points to
+   identify which environmental features the teacher *implicitly* conditions on
+   that the AIF agent's current observations miss. This motivates Solution A
+   (richer obs encoding) with data-driven modality selection.
+
+4. **Teacher-conditioned C vector learning**: Rather than learning C from AIF agent
+   trajectories (which plateau), learn C from *teacher* trajectories — "what
+   observations does the successful agent prefer to encounter?" The teacher's
+   visitation distribution over observation states IS an empirical C vector.
+
+5. **Iterative structure-then-parameter loop**: Each kickstart round expands the
+   model structure (add states/obs that teacher data motivates) then re-learns
+   parameters. Structure changes every 2-3 rounds; parameter learning every round.
+
+**Key reference**: Friston et al. (2025) "Gradient-Free De Novo Learning" — structure
+discovery via Bayesian model reduction, renormalising generative models. Already
+cited in references below.
+
+**Implementation** (2026-04-22, IN PROGRESS):
+
+| Sub-task | File | Status |
+|----------|------|--------|
+| B1: Record teacher trajectories | `cogames_policy.py` (RecordingTeacherPolicy) | IN PROGRESS |
+| B2: Teacher-conditioned C learning | `scripts/learn_from_teacher.py` | IN PROGRESS |
+| B3: Analytical BMR (Neacsu 2022) | `scripts/differentiable_bmr.py` (bmr-analytical cmd) | IN PROGRESS |
+| B4: Spare capacity expansion | `generative_model.py` | PLANNED |
+| B5: Structure-param pipeline | `scripts/structure_learn_pipeline.sh` | PLANNED |
+
+**Teacher upgrade**: Leaderboard Paz-Bot-9000:v47 (#1, score 41.10) replaces dinky_fido:v3 (#19).
+**BMR formula**: Neacsu 2022 `DF = ln B(a) + ln B(a') - ln B(a_bar) - ln B(a_bar')` for Dirichlet params.
+
+#### Recommended Priority Order
+
+| Priority | Solution | Effort | Impact | Builds on |
+|----------|----------|--------|--------|-----------|
+| 1 | **G: Structure learning from teacher** | 2-3 wk | +3-8 j | Kickstart pipeline (done) |
+| 2 | **A: Richer observations** | days | +1-3 j | Current POMDP |
+| 3 | **C: Phase-conditioned C** | 1-2 wk | +2-5 j | A (new obs enable context) |
+| 4 | **D: Shared intention** | 1-2 wk | +2-4 j | Phase C plan (exists) |
+| 5 | **B: Shorter options** | days | +0.5-2 j | Current options |
+| 6 | **E: Deep AIF** | months | 5-20× | Phase 4 plan (exists) |
+| 7 | **F: Hybrid AIF+PPO** | months | best-of | Track C (metta migration) |
+
+Structure learning (G) is prioritised because: (a) kickstart infrastructure already
+exists and works, (b) it addresses ceiling 1 (obs) and ceiling 4 (VFE-junction
+disconnect) simultaneously via data-driven model expansion, (c) it feeds directly
+into Solutions A and C with empirical justification rather than hand-engineering.
 
 ---
 

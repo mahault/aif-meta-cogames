@@ -1138,33 +1138,61 @@ def load_params(path: str) -> dict:
     return result
 
 
-def save_trajectory(path: str, trajectory: list[dict]):
-    """Save trajectory data to .npz file."""
-    data = {}
+def _trajectory_to_batched(trajectory: list[dict]) -> dict:
+    """Convert list[dict] trajectory to batched dict of stacked arrays.
+
+    Batched format v2 stores ~20 large arrays instead of ~15*T tiny ones,
+    reducing npz key count from millions to ~20 and making I/O orders of
+    magnitude faster for large trajectories.
+    """
+    n_obs = len(trajectory[0]["obs"])
+    n_factors = len(trajectory[0]["qs"])
     has_q_pi = "q_pi" in trajectory[0]
-    for t, record in enumerate(trajectory):
-        for m, obs_m in enumerate(record["obs"]):
-            data[f"obs_{t}_{m}"] = obs_m
-        for f, qs_f in enumerate(record["qs"]):
-            data[f"qs_{t}_{f}"] = qs_f
-        for f, prior_f in enumerate(record["prior"]):
-            data[f"prior_{t}_{f}"] = prior_f
-        data[f"actions_{t}"] = record["actions"]
-        data[f"options_{t}"] = record["options"]
-        if has_q_pi and "q_pi" in record:
-            data[f"q_pi_{t}"] = record["q_pi"]
-            data[f"neg_efe_{t}"] = record["neg_efe"]
-    data["n_steps"] = np.array(len(trajectory))
-    data["n_obs_modalities"] = np.array(len(trajectory[0]["obs"]))
-    data["n_state_factors"] = np.array(len(trajectory[0]["qs"]))
-    data["has_q_pi"] = np.array(has_q_pi)
-    np.savez_compressed(path, **data)
-    print(f"[save] Trajectory ({len(trajectory)} steps) saved to {path}")
+
+    batched = {}
+    for m in range(n_obs):
+        batched[f"obs_m{m}"] = np.stack([r["obs"][m] for r in trajectory])
+    for f in range(n_factors):
+        batched[f"qs_f{f}"] = np.stack([r["qs"][f] for r in trajectory])
+        batched[f"prior_f{f}"] = np.stack([r["prior"][f] for r in trajectory])
+    batched["actions"] = np.stack([r["actions"] for r in trajectory])
+    batched["options"] = np.stack([r["options"] for r in trajectory])
+    if has_q_pi:
+        batched["q_pi"] = np.stack([r["q_pi"] for r in trajectory])
+        batched["neg_efe"] = np.stack([r["neg_efe"] for r in trajectory])
+    batched["n_steps"] = np.array(len(trajectory))
+    batched["n_obs_modalities"] = np.array(n_obs)
+    batched["n_state_factors"] = np.array(n_factors)
+    batched["has_q_pi"] = np.array(has_q_pi)
+    batched["format_version"] = np.array(2)
+    return batched
 
 
-def load_trajectory(path: str) -> list[dict]:
-    """Load trajectory data from .npz file."""
-    data = np.load(path, allow_pickle=True)
+def _batched_to_trajectory(batched: dict) -> list[dict]:
+    """Convert batched dict to list[dict] trajectory."""
+    n_steps = int(batched["n_steps"])
+    n_obs = int(batched["n_obs_modalities"])
+    n_factors = int(batched["n_state_factors"])
+    has_q_pi = bool(batched["has_q_pi"])
+
+    trajectory = []
+    for t in range(n_steps):
+        record = {
+            "obs": [batched[f"obs_m{m}"][t] for m in range(n_obs)],
+            "qs": [batched[f"qs_f{f}"][t] for f in range(n_factors)],
+            "prior": [batched[f"prior_f{f}"][t] for f in range(n_factors)],
+            "actions": batched["actions"][t],
+            "options": batched["options"][t],
+        }
+        if has_q_pi and "q_pi" in batched:
+            record["q_pi"] = batched["q_pi"][t]
+            record["neg_efe"] = batched["neg_efe"][t]
+        trajectory.append(record)
+    return trajectory
+
+
+def _load_trajectory_legacy(data) -> list[dict]:
+    """Load legacy per-step-key format (format_version < 2)."""
     n_steps = int(data["n_steps"])
     n_obs = int(data["n_obs_modalities"])
     n_factors = int(data["n_state_factors"])
@@ -1184,6 +1212,72 @@ def load_trajectory(path: str) -> list[dict]:
             record["neg_efe"] = data[f"neg_efe_{t}"]
         trajectory.append(record)
     return trajectory
+
+
+def save_trajectory(path: str, trajectory: list[dict]):
+    """Save trajectory data to .npz file (batched format v2)."""
+    batched = _trajectory_to_batched(trajectory)
+    np.savez_compressed(path, **batched)
+    print(f"[save] Trajectory ({len(trajectory)} steps) saved to {path}")
+
+
+def save_trajectory_batched(path: str, batched: dict):
+    """Save pre-batched trajectory dict to .npz file."""
+    np.savez_compressed(path, **batched)
+    n = int(batched["n_steps"])
+    print(f"[save] Trajectory ({n} steps) saved to {path}")
+
+
+def accumulate_trajectory(existing_path: str, new_batched: dict) -> dict:
+    """Load existing trajectory and concatenate new batched data.
+
+    Fast path: if existing file is already v2, concatenates ~20 arrays.
+    Fallback: if legacy format, converts once (one-time migration cost).
+    """
+    data = dict(np.load(existing_path, allow_pickle=True))
+    if "format_version" in data and int(data["format_version"]) >= 2:
+        n_obs = int(data["n_obs_modalities"])
+        n_factors = int(data["n_state_factors"])
+        has_q_pi = bool(data["has_q_pi"])
+
+        result = {}
+        for m in range(n_obs):
+            key = f"obs_m{m}"
+            result[key] = np.concatenate([data[key], new_batched[key]], axis=0)
+        for f in range(n_factors):
+            for prefix in ("qs_f", "prior_f"):
+                key = f"{prefix}{f}"
+                result[key] = np.concatenate([data[key], new_batched[key]], axis=0)
+        result["actions"] = np.concatenate(
+            [data["actions"], new_batched["actions"]], axis=0)
+        result["options"] = np.concatenate(
+            [data["options"], new_batched["options"]], axis=0)
+        if has_q_pi and "q_pi" in new_batched:
+            result["q_pi"] = np.concatenate(
+                [data["q_pi"], new_batched["q_pi"]], axis=0)
+            result["neg_efe"] = np.concatenate(
+                [data["neg_efe"], new_batched["neg_efe"]], axis=0)
+        result["n_steps"] = np.array(
+            int(data["n_steps"]) + int(new_batched["n_steps"]))
+        result["n_obs_modalities"] = data["n_obs_modalities"]
+        result["n_state_factors"] = data["n_state_factors"]
+        result["has_q_pi"] = data["has_q_pi"]
+        result["format_version"] = np.array(2)
+        return result
+    else:
+        legacy_traj = _load_trajectory_legacy(data)
+        new_traj = _batched_to_trajectory(new_batched)
+        combined = legacy_traj + new_traj
+        return _trajectory_to_batched(combined)
+
+
+def load_trajectory(path: str) -> list[dict]:
+    """Load trajectory data from .npz file (auto-detects format)."""
+    data = np.load(path, allow_pickle=True)
+    if "format_version" in data and int(data["format_version"]) >= 2:
+        return _batched_to_trajectory(dict(data))
+    else:
+        return _load_trajectory_legacy(data)
 
 
 # ---------------------------------------------------------------------------

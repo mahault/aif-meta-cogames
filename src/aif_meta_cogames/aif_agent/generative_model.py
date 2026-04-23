@@ -748,6 +748,167 @@ def build_C_scout() -> list[np.ndarray]:
 # D vectors (initial state prior) — factored
 # ---------------------------------------------------------------------------
 
+def build_expanded_A(
+    extra_per_factor: tuple[int, ...] = (2, 2, 2, 2),
+    spare_alpha: float = 0.1,
+) -> list[np.ndarray]:
+    """Build A matrices with spare capacity states for structure learning.
+
+    Extends each state factor with `extra_per_factor[f]` additional states.
+    Spare columns get weak uniform priors (Dirichlet alpha), allowing
+    online learning to populate them. After training, BMR prunes unused states.
+
+    Parameters
+    ----------
+    extra_per_factor : tuple — number of spare states to add per factor
+        Default (2,2,2,2) expands 6→8, 4→6, 3→5, 4→6 = 1440 total states
+    spare_alpha : float — Dirichlet concentration for spare columns
+
+    Returns
+    -------
+    list of np.ndarray — expanded A matrices
+    """
+    A_base = build_default_A()
+    expanded_dims = [
+        NUM_STATE_FACTORS[f] + extra_per_factor[f]
+        for f in range(len(NUM_STATE_FACTORS))
+    ]
+
+    A_expanded = []
+    for m, a_base in enumerate(A_base):
+        deps = A_DEPENDENCIES[m]
+        n_obs = a_base.shape[0]
+
+        # Build expanded shape
+        dep_dims = tuple(expanded_dims[f] for f in deps)
+        new_shape = (n_obs,) + dep_dims
+
+        # Start with weak uniform prior for ALL states
+        a_new = np.full(new_shape, spare_alpha / n_obs)
+
+        # Copy hand-tuned values into original state slots
+        orig_slices = tuple(
+            slice(0, NUM_STATE_FACTORS[f]) for f in deps
+        )
+        a_new[(slice(None),) + orig_slices] = a_base
+
+        # Normalize each column (distribution over observations)
+        for idx in np.ndindex(*dep_dims):
+            col = a_new[(slice(None),) + idx]
+            col_sum = col.sum()
+            if col_sum > 0:
+                a_new[(slice(None),) + idx] = col / col_sum
+
+        A_expanded.append(a_new)
+
+    return A_expanded
+
+
+def build_expanded_B(
+    extra_per_factor: tuple[int, ...] = (2, 2, 2, 2),
+    spare_alpha: float = 0.1,
+) -> list[np.ndarray]:
+    """Build option B matrices with spare capacity states.
+
+    Extends each factor's B matrix with spare states that have weak
+    self-transition priors. After learning, BMR prunes unused states.
+
+    Parameters
+    ----------
+    extra_per_factor : tuple — spare states per factor
+    spare_alpha : float — Dirichlet concentration for spare transitions
+
+    Returns
+    -------
+    list of np.ndarray — expanded B matrices (for options)
+    """
+    B_base = build_option_B()
+    expanded_dims = [
+        NUM_STATE_FACTORS[f] + extra_per_factor[f]
+        for f in range(len(NUM_STATE_FACTORS))
+    ]
+
+    B_expanded = []
+    for f, b_base in enumerate(B_base):
+        n_s = expanded_dims[f]
+        n_s_orig = NUM_STATE_FACTORS[f]
+
+        if b_base.ndim == 3:
+            # Shape: (n_s, n_s, n_actions)
+            n_actions = b_base.shape[2]
+            b_new = np.full((n_s, n_s, n_actions), spare_alpha / n_s)
+
+            # Copy original transitions
+            b_new[:n_s_orig, :n_s_orig, :] = b_base
+
+            # Spare states: weak self-transition prior
+            for s in range(n_s_orig, n_s):
+                for a in range(n_actions):
+                    b_new[s, s, a] += 0.5  # self-transition bias
+
+            # Normalize columns
+            for a in range(n_actions):
+                for s_prev in range(n_s):
+                    col = b_new[:, s_prev, a]
+                    col_sum = col.sum()
+                    if col_sum > 0:
+                        b_new[:, s_prev, a] = col / col_sum
+
+        elif b_base.ndim == 4:
+            # Factored: (n_s_f, n_s_f, n_s_g, n_actions) — B depends on 2 factors
+            deps = B_DEPENDENCIES[f]
+            dep_dims = tuple(expanded_dims[d] for d in deps)
+            orig_dep_dims = tuple(NUM_STATE_FACTORS[d] for d in deps)
+
+            new_shape = dep_dims + dep_dims + (b_base.shape[-1],)
+            b_new = np.full(new_shape, spare_alpha / dep_dims[0])
+
+            # Copy original
+            orig_slices = tuple(slice(0, d) for d in orig_dep_dims)
+            b_new[orig_slices + orig_slices + (slice(None),)] = b_base
+
+            # Normalize (simplified: normalize first dim for each conditioning)
+            # This is approximate — full normalization would iterate all conditioning combos
+            for idx in np.ndindex(*dep_dims, b_base.shape[-1]):
+                s_next_idx = idx[:len(dep_dims)]
+                col_idx = (slice(None),) + idx
+                col = b_new[col_idx]
+                col_sum = col.sum()
+                if col_sum > 0:
+                    b_new[col_idx] = col / col_sum
+
+        else:
+            # 2D: identity-like (role factor)
+            b_new = np.full((n_s, n_s), spare_alpha / n_s)
+            b_new[:n_s_orig, :n_s_orig] = b_base
+            for s in range(n_s_orig, n_s):
+                b_new[s, s] += 0.5
+            for s_prev in range(n_s):
+                col = b_new[:, s_prev]
+                col_sum = col.sum()
+                if col_sum > 0:
+                    b_new[:, s_prev] = col / col_sum
+
+        B_expanded.append(b_new)
+
+    return B_expanded
+
+
+def build_expanded_D(
+    extra_per_factor: tuple[int, ...] = (2, 2, 2, 2),
+    spare_alpha: float = 0.01,
+) -> list[np.ndarray]:
+    """Build expanded D priors with weak spare state priors."""
+    D_base = build_D()
+    D_expanded = []
+    for f, d_base in enumerate(D_base):
+        n_extra = extra_per_factor[f]
+        d_new = np.concatenate([d_base, np.full(n_extra, spare_alpha)])
+        d_new /= d_new.sum()
+        D_expanded.append(d_new)
+    return D_expanded
+
+
 def build_D() -> list[np.ndarray]:
     """Initial state prior, factored over 4 state factors."""
     # Phase prior: peaked on EXPLORE

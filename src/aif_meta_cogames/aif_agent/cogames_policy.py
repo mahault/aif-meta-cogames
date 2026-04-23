@@ -2141,8 +2141,8 @@ class AIFPolicy(_MultiAgentPolicy):
     def __del__(self):
         """Save trajectory data on cleanup if logging was enabled.
 
-        Accumulates across episodes: if the output file already exists,
-        loads it and appends the new trajectory before saving.
+        Uses batched format v2 for fast I/O. Accumulates by concatenating
+        ~20 large arrays instead of reconstructing millions of per-step dicts.
         """
         if hasattr(self, "_engine") and self._engine.log_trajectory:
             traj = self._engine.get_trajectory()
@@ -2152,15 +2152,230 @@ class AIFPolicy(_MultiAgentPolicy):
                     Path(__file__).resolve().parent.parent.parent.parent / "scripts"
                 ))
                 try:
-                    from learn_parameters import save_trajectory, load_trajectory
+                    from learn_parameters import (
+                        _trajectory_to_batched, save_trajectory_batched,
+                        accumulate_trajectory,
+                    )
                     out = os.environ.get("AIF_TRAJECTORY_PATH", "/tmp/aif_trajectory.npz")
-                    # Accumulate: load existing + append new
+                    new_batched = _trajectory_to_batched(traj)
                     if os.path.exists(out):
                         try:
-                            existing = load_trajectory(out)
-                            traj = existing + traj
+                            combined = accumulate_trajectory(out, new_batched)
+                            save_trajectory_batched(out, combined)
                         except Exception:
-                            pass  # corrupt file, overwrite
-                    save_trajectory(out, traj)
+                            save_trajectory_batched(out, new_batched)
+                    else:
+                        save_trajectory_batched(out, new_batched)
                 except Exception as e:
                     print(f"[AIFPolicy] Failed to save trajectory: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Recording wrapper for teacher policies (mixed-team eval)
+# ---------------------------------------------------------------------------
+
+class _RecordingAgentWrapper:
+    """Wraps an AgentPolicy to record obs/actions/rewards for teacher trajectories.
+
+    Delegates all attribute access and the ``step()`` call to the inner agent
+    policy while capturing raw observation tokens, the chosen action index,
+    and (optionally) per-step reward into the parent
+    ``RecordingTeacherPolicy`` buffers.
+    """
+
+    def __init__(
+        self,
+        inner_agent,
+        recorder: "RecordingTeacherPolicy",
+        agent_id: int,
+    ):
+        self._inner = inner_agent
+        self._recorder = recorder
+        self._agent_id = agent_id
+        self._last_obs_array: np.ndarray | None = None
+
+    def __getattr__(self, name):
+        """Delegate everything not explicitly overridden to the inner agent."""
+        return getattr(self._inner, name)
+
+    # -- AgentPolicy interface ------------------------------------------------
+
+    def step(self, obs: _AgentObservation) -> _Action:
+        """Intercept observation and action for recording."""
+        # Capture raw observation tokens (200 x 3 uint8)
+        obs_array = np.full((200, 3), 255, dtype=np.uint8)
+        for i, token in enumerate(obs.tokens):
+            if i >= 200:
+                break
+            obs_array[i] = token.raw_token
+        self._last_obs_array = obs_array
+
+        # Delegate to inner policy for actual decision-making
+        action = self._inner.step(obs)
+
+        # Extract integer action index from Action name
+        action_names = self._recorder._policy_env_info.all_action_names
+        action_int = 0
+        for idx, name in enumerate(action_names):
+            if name == action.name:
+                action_int = idx
+                break
+
+        # Record step (reward defaults to 0.0; updated via receive_reward)
+        self._recorder.record_step(self._agent_id, obs_array, action_int, 0.0)
+        return action
+
+    def reset(self, simulation=None):
+        """Proxy reset to inner agent."""
+        if hasattr(self._inner, "reset"):
+            self._inner.reset(simulation)
+
+    def receive_reward(self, reward: float):
+        """Record reward for the most recent step."""
+        if self._recorder._teacher_rewards:
+            self._recorder._teacher_rewards[-1] = reward
+        if hasattr(self._inner, "receive_reward"):
+            self._inner.receive_reward(reward)
+
+
+class RecordingTeacherPolicy(_MultiAgentPolicy):
+    """Wrapper that records teacher obs/actions/rewards during mixed-team eval.
+
+    Wraps any ``MultiAgentPolicy`` (e.g. an LSTM checkpoint or metta:// URI)
+    and intercepts every ``step()`` call to record raw observation tokens
+    (200 x 3 uint8), the chosen action (int), and per-step reward (float).
+
+    On cleanup the recording is saved to a compressed ``.npz`` file (same
+    pattern as ``AIFPolicy.__del__``).
+
+    Usage in cogames eval::
+
+        -p "class=aif_meta_cogames.aif_agent.cogames_policy.RecordingTeacherPolicy,inner=TEACHER_PATH,proportion=1"
+
+    Set ``AIF_TEACHER_TRAJECTORY_PATH`` env var for the output file path
+    (default: ``/tmp/teacher_trajectory.npz``).
+    """
+
+    short_names = ["recording_teacher"]
+
+    def __init__(
+        self,
+        policy_env_info: _PolicyEnvInterface,
+        device: str = "cpu",
+        inner: str = "",
+        **kwargs: Any,
+    ):
+        super().__init__(policy_env_info, device=device, **kwargs)
+
+        # Load the inner teacher policy via mettagrid's standard loader
+        self._inner = self._load_inner_policy(inner, policy_env_info, device)
+
+        # Recording buffers
+        self._teacher_obs: list[np.ndarray] = []       # (200, 3) uint8 per step
+        self._teacher_actions: list[int] = []           # action index per step
+        self._teacher_rewards: list[float] = []         # reward per step
+        self._teacher_agent_ids: list[int] = []         # which agent
+        self._step_indices: list[int] = []              # global step counter
+        self._step_counter = 0
+
+        # Cache of per-agent recording wrappers
+        self._agents: dict[int, _RecordingAgentWrapper] = {}
+
+        # Save obs feature metadata for downstream discretization
+        obs_features = policy_env_info.obs_features
+        max_id = max((int(f.id) for f in obs_features), default=0)
+        self._feat_names = [""] * (max_id + 1)
+        for f in obs_features:
+            self._feat_names[int(f.id)] = f.name
+        self._tag_categories = _build_tag_categories(policy_env_info.tags)
+
+        print(f"[RecordingTeacherPolicy] Wrapping inner policy: {inner}")
+        print(f"[RecordingTeacherPolicy] {len(self._feat_names)} obs features, "
+              f"{len(self._tag_categories)} tag categories")
+
+    @staticmethod
+    def _load_inner_policy(
+        inner_path: str,
+        policy_env_info: _PolicyEnvInterface,
+        device: str,
+    ) -> _MultiAgentPolicy:
+        """Load the inner teacher policy from a checkpoint path or short name.
+
+        Supports:
+        - Archive/directory paths (resolved via ``load_policy_spec_from_path``)
+        - Registered short names (e.g. ``"lstm"``, ``"random"``)
+        """
+        if not inner_path:
+            raise ValueError(
+                "RecordingTeacherPolicy requires inner= parameter "
+                "(checkpoint path or registered short name)"
+            )
+        from mettagrid.policy.loader import initialize_or_load_policy
+        from mettagrid.policy.policy import PolicySpec
+
+        path_obj = Path(inner_path)
+        if path_obj.exists():
+            # Archive or directory — extract spec from it
+            from mettagrid.policy.prepare_policy_spec import (
+                load_policy_spec_from_path,
+            )
+            spec = load_policy_spec_from_path(path_obj, device=device)
+        else:
+            # Treat as a short name or fully-qualified class path
+            from mettagrid.policy.loader import resolve_policy_class_path
+            spec = PolicySpec(class_path=resolve_policy_class_path(inner_path))
+        return initialize_or_load_policy(policy_env_info, spec, device_override=device)
+
+    def agent_policy(self, agent_id: int):
+        """Return a recording wrapper around the inner agent policy."""
+        if agent_id not in self._agents:
+            inner_agent = self._inner.agent_policy(agent_id)
+            self._agents[agent_id] = _RecordingAgentWrapper(
+                inner_agent, self, agent_id,
+            )
+        return self._agents[agent_id]
+
+    def record_step(
+        self,
+        agent_id: int,
+        obs_array: np.ndarray,
+        action: int,
+        reward: float,
+    ):
+        """Record a single teacher step."""
+        self._teacher_obs.append(obs_array.copy())
+        self._teacher_actions.append(action)
+        self._teacher_rewards.append(reward)
+        self._teacher_agent_ids.append(agent_id)
+        self._step_indices.append(self._step_counter)
+        self._step_counter += 1
+
+    def is_recurrent(self) -> bool:
+        return getattr(self._inner, "is_recurrent", lambda: True)()
+
+    def __del__(self):
+        """Save teacher trajectory on cleanup."""
+        if not hasattr(self, "_teacher_obs") or not self._teacher_obs:
+            return
+        out = os.environ.get(
+            "AIF_TEACHER_TRAJECTORY_PATH", "/tmp/teacher_trajectory.npz"
+        )
+        try:
+            np.savez_compressed(
+                out,
+                obs=np.array(self._teacher_obs, dtype=np.uint8),          # (N, 200, 3)
+                actions=np.array(self._teacher_actions, dtype=np.int32),   # (N,)
+                rewards=np.array(self._teacher_rewards, dtype=np.float32), # (N,)
+                agent_ids=np.array(self._teacher_agent_ids, dtype=np.int32),  # (N,)
+                step_indices=np.array(self._step_indices, dtype=np.int32),    # (N,)
+                obs_feature_names=np.array(self._feat_names, dtype=object),   # feature name list
+                tag_categories=np.array(
+                    list(self._tag_categories.items()), dtype=object,
+                ),  # [(tag_value, category_name), ...]
+            )
+            print(
+                f"[RecordingTeacherPolicy] Saved {len(self._teacher_obs)} "
+                f"teacher steps to {out}"
+            )
+        except Exception as e:
+            print(f"[RecordingTeacherPolicy] Failed to save: {e}")

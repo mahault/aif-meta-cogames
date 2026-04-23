@@ -247,7 +247,7 @@ For meta-learning (Luca's Phase 2):
 - Outer loop: learn initialization θ* that minimizes post-adaptation loss across variants
 - B matrices are factored (phase/hand coupled, target_mode/role independent) — sparse and structured
 
-### Phase 3c: Parameter Learning (A, B, C, D)
+### Phase 3c: Parameter Learning (A, B, C, D) — COMPLETE
 
 **See**: [LITERATURE_REVIEW.md](LITERATURE_REVIEW.md) for the full academic survey (45 papers).
 **See**: [ROADMAP.md](ROADMAP.md) Phases B-I through B-VI for implementation details.
@@ -291,6 +291,16 @@ For meta-learning (Luca's Phase 2):
 | C (preferences) | Inverse EFE | -ln q_pi(a_observed) | Slow (0.1x LR) |
 | D (initial state) | VFE prior | -E_q[ln P(s_1)] | Fast |
 | E (habits) | Accumulated policy counts | e += pi | Between-trial |
+
+### Phase 3d: Literature-Informed Upgrades — IN PROGRESS
+
+**See**: [ROADMAP.md](ROADMAP.md) Phase 3d for full details.
+
+**Completed**: Adaptive γ, novelty η, exploration E, habit bypass, online streaming A/B, JIT optimization, systematic ablation.
+**In progress**: Extended training pipeline (10 rounds arena + 5 rounds machina_1).
+**TODO**: BTAI tree search, opponent belief factors, BMR compression.
+
+**Best results**: Iterative pipeline R2 = **16.01 j/agent** (arena, 4 agents). Extended pipeline R1 = 48.7% VFE reduction, R2 showing improved consistency (all 5 episodes scoring).
 
 ### Phase 4 (NEXT): Neural AIF + Meta-Learned World Model
 

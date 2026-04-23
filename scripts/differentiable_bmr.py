@@ -2,7 +2,7 @@
 """Phase B-VI: Differentiable BMR + Model Comparison.
 
 Adapts de novo learning ideas (Friston 2025) into the JAX differentiable
-framework. Three capabilities:
+framework. Four capabilities:
 
 1. **Differentiable BMR**: Identify and prune A/B entries with near-zero
    gradient norm (they don't contribute to VFE reduction). Iteratively
@@ -35,6 +35,8 @@ Usage::
 References:
     Friston et al. (2025). Gradient-Free De Novo Learning. Entropy 27(9):992.
     Friston et al. (2018). Bayesian Model Reduction. Neural Computation 30(8).
+    Neacsu et al. (2022). Structure Learning Enhances Concept Formation in
+        Synthetic Active Inference Agents. Front Neurorobot 16:907175.
 """
 
 import argparse
@@ -276,6 +278,295 @@ def differentiable_bmr(
         "history": history,
         "initial_vfe": initial_vfe,
         "final_vfe": final_vfe,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Analytical BMR (Neacsu 2022): Dirichlet free energy for state merging
+# ---------------------------------------------------------------------------
+
+def _log_dirichlet_B(alpha):
+    """Log of multivariate Beta function for Dirichlet distribution.
+
+    ln B(alpha) = sum(gammaln(alpha_i)) - gammaln(sum(alpha_i))
+
+    Parameters
+    ----------
+    alpha : np.ndarray — Dirichlet concentration parameters (all > 0)
+
+    Returns
+    -------
+    float — log B(alpha)
+    """
+    from scipy.special import gammaln
+    return float(np.sum(gammaln(alpha)) - gammaln(np.sum(alpha)))
+
+
+def _dirichlet_free_energy(alpha_post, alpha_prior, alpha_bar_post, alpha_bar_prior):
+    """Compute free energy change for merging states (Neacsu 2022 Eq. 7).
+
+    DF = ln B(alpha_post) + ln B(alpha_prior)
+         - ln B(alpha_bar_post) - ln B(alpha_bar_prior)
+
+    If DF < 0, the reduced model is preferred (merge accepted).
+    If DF > 0, the full model is preferred (merge rejected).
+
+    Parameters
+    ----------
+    alpha_post : np.ndarray — posterior Dirichlet params for full model
+    alpha_prior : np.ndarray — prior Dirichlet params for full model
+    alpha_bar_post : np.ndarray — posterior params after merging
+    alpha_bar_prior : np.ndarray — prior params after merging
+
+    Returns
+    -------
+    float — free energy change (negative = merge is good)
+    """
+    return (_log_dirichlet_B(alpha_post) + _log_dirichlet_B(alpha_prior)
+            - _log_dirichlet_B(alpha_bar_post) - _log_dirichlet_B(alpha_bar_prior))
+
+
+def _params_to_dirichlet_counts(A_params, trajectory, agent_indices, n_steps=None):
+    """Estimate Dirichlet posterior counts from trajectory data.
+
+    For each A matrix A[m], the posterior concentration is:
+        alpha_post[m][o, s] = alpha_prior[m][o, s] + count(obs_m=o, state=s)
+
+    We use trajectory beliefs q(s) as soft state assignments:
+        count[m][o, s] += q(s_t) * I(obs_m_t == o)
+
+    Parameters
+    ----------
+    A_params : list of np.ndarray — current A matrices (used as prior scale)
+    trajectory : list of dicts — trajectory data
+    agent_indices : list of int
+    n_steps : int or None — max steps to use
+
+    Returns
+    -------
+    alpha_prior : list of np.ndarray — prior concentrations
+    alpha_post : list of np.ndarray — posterior concentrations
+    """
+    n_modalities = len(A_params)
+    prior_scale = 1.0  # Dirichlet prior concentration
+
+    # Prior: proportional to hand-tuned A matrices
+    # Flatten multi-dimensional A to 2D (n_obs, product_of_state_dims)
+    # so the rest of the BMR code can operate on a flat joint state space.
+    alpha_prior = []
+    for m in range(n_modalities):
+        a = np.array(A_params[m], dtype=np.float64)
+        a = np.maximum(a, 1e-8)
+        n_obs_m = a.shape[0]
+        a_2d = a.reshape(n_obs_m, -1)  # flatten state dims
+        col_sums = a_2d.sum(axis=0, keepdims=True)
+        a_norm = a_2d / np.maximum(col_sums, 1e-8)
+        alpha_prior.append(a_norm * prior_scale + 0.1)  # +0.1 for smoothing
+
+    # Accumulate counts from trajectory
+    counts = [np.zeros_like(ap) for ap in alpha_prior]
+    steps = trajectory if n_steps is None else trajectory[:n_steps]
+
+    for step in steps:
+        obs_list = step.get("obs", [])
+        qs_list = step.get("qs", [])
+        if not obs_list or not qs_list:
+            continue
+
+        for ai in agent_indices:
+            for m in range(n_modalities):
+                if m >= len(obs_list) or len(obs_list[m].shape) < 2:
+                    continue
+                if ai >= obs_list[m].shape[0]:
+                    continue
+
+                obs_val = int(obs_list[m][ai, -1])  # last timestep
+                if obs_val < 0 or obs_val >= counts[m].shape[0]:
+                    continue
+
+                # Soft state assignment from beliefs
+                # A[m] depends on specific state factors (A_DEPENDENCIES)
+                # Joint belief = outer product of beliefs over all dep factors
+                deps = A_DEPENDENCIES[m] if m < len(A_DEPENDENCIES) else [0]
+                q_factors = []
+                valid = True
+                for dep_f in deps:
+                    if dep_f < len(qs_list) and ai < qs_list[dep_f].shape[0]:
+                        q_s = np.array(qs_list[dep_f][ai, -1], dtype=np.float64)
+                        q_s = np.maximum(q_s, 0)
+                        q_s_sum = q_s.sum()
+                        if q_s_sum > 0:
+                            q_s /= q_s_sum
+                        q_factors.append(q_s)
+                    else:
+                        valid = False
+                        break
+
+                if valid and q_factors:
+                    # Compute joint via outer product: (a,)*(b,)->(a,b), etc.
+                    joint = q_factors[0]
+                    for q in q_factors[1:]:
+                        joint = joint[..., np.newaxis] * q
+                    # Flatten to match 2D counts layout
+                    joint_flat = joint.ravel()
+                    if len(joint_flat) == counts[m].shape[1]:
+                        counts[m][obs_val, :] += joint_flat
+
+    alpha_post = [ap + c for ap, c in zip(alpha_prior, counts)]
+    return alpha_prior, alpha_post
+
+
+def _merge_dirichlet_states(alpha, state_i, state_j):
+    """Merge state j into state i by summing Dirichlet columns.
+
+    For A[m] with shape (n_obs, n_states), merging states i and j means:
+        alpha_bar[:, i] = alpha[:, i] + alpha[:, j]
+        then delete column j.
+
+    Parameters
+    ----------
+    alpha : np.ndarray — (n_obs, n_states) Dirichlet concentrations
+    state_i, state_j : int — states to merge (j merged into i)
+
+    Returns
+    -------
+    np.ndarray — (n_obs, n_states-1) merged concentrations
+    """
+    result = np.copy(alpha)
+    result[:, state_i] = alpha[:, state_i] + alpha[:, state_j]
+    result = np.delete(result, state_j, axis=1)
+    return result
+
+
+def analytical_bmr(
+    trajectory,
+    A_params=None,
+    n_agents=4,
+    max_merges=10,
+    verbose=True,
+):
+    """Analytical BMR using Neacsu 2022 Dirichlet free energy.
+
+    For each pair of states within each factor, compute the free energy
+    change DF from merging them. Accept merge if DF < 0 (reduced model
+    has higher evidence). Iterate greedily: merge the pair with lowest
+    DF, recompute, repeat.
+
+    Parameters
+    ----------
+    trajectory : list of dicts
+    A_params : list of np.ndarray or None — use default if None
+    n_agents : int
+    max_merges : int — stop after this many merges
+    verbose : bool
+
+    Returns
+    -------
+    dict with merge_history, final_state_dims, etc.
+    """
+    if A_params is None:
+        A_params = build_default_A()
+
+    agent_indices = list(range(n_agents))
+    stride = max(1, len(trajectory) // 100)
+    traj_sub = trajectory[::stride]
+
+    if verbose:
+        print(f"[bmr-analytical] Computing Dirichlet posteriors from "
+              f"{len(traj_sub)} steps...")
+
+    alpha_prior, alpha_post = _params_to_dirichlet_counts(
+        A_params, traj_sub, agent_indices
+    )
+
+    merge_history = []
+    current_state_dims = list(NUM_STATE_FACTORS)
+
+    for merge_round in range(max_merges):
+        # Find best merge across all modalities
+        best_df = 0.0  # only accept if DF < 0
+        best_m = -1
+        best_i = -1
+        best_j = -1
+
+        for m in range(len(alpha_post)):
+            n_states = alpha_post[m].shape[1]
+            if n_states <= 2:
+                continue  # don't reduce below 2 states
+
+            for i in range(n_states):
+                for j in range(i + 1, n_states):
+                    # Compute merged Dirichlet params
+                    alpha_bar_post = _merge_dirichlet_states(alpha_post[m], i, j)
+                    alpha_bar_prior = _merge_dirichlet_states(alpha_prior[m], i, j)
+
+                    # Free energy change per column
+                    # We sum DF across all observation rows
+                    df_total = 0.0
+                    for o in range(alpha_post[m].shape[0]):
+                        # For row o: compare full (cols i,j separate) vs merged
+                        a_full = alpha_post[m][o, [i, j]]
+                        a_prior_full = alpha_prior[m][o, [i, j]]
+                        a_merged = np.array([alpha_bar_post[o, i]])
+                        a_prior_merged = np.array([alpha_bar_prior[o, i]])
+
+                        # Pad to same dim for B function (use 2D for full, 1D for merged)
+                        df_total += _dirichlet_free_energy(
+                            a_full, a_prior_full,
+                            a_merged, a_prior_merged,
+                        )
+
+                    if df_total < best_df:
+                        best_df = df_total
+                        best_m = m
+                        best_i = i
+                        best_j = j
+
+        if best_m < 0:
+            if verbose:
+                print(f"[bmr-analytical] Round {merge_round+1}: no beneficial "
+                      f"merge found — stopping")
+            break
+
+        # Apply merge
+        alpha_post[best_m] = _merge_dirichlet_states(
+            alpha_post[best_m], best_i, best_j)
+        alpha_prior[best_m] = _merge_dirichlet_states(
+            alpha_prior[best_m], best_i, best_j)
+
+        # Track which factor this modality depends on
+        deps = A_DEPENDENCIES[best_m] if best_m < len(A_DEPENDENCIES) else [0]
+
+        merge_info = {
+            "round": merge_round + 1,
+            "modality": best_m,
+            "states_merged": (best_i, best_j),
+            "factor_deps": deps,
+            "delta_F": best_df,
+            "new_dim": alpha_post[best_m].shape[1],
+        }
+        merge_history.append(merge_info)
+
+        if verbose:
+            print(f"[bmr-analytical] Round {merge_round+1}: merged "
+                  f"modality {best_m} states ({best_i},{best_j}), "
+                  f"DF={best_df:.4f}, new dim={alpha_post[best_m].shape[1]}")
+
+    # Convert posterior counts back to A matrices
+    A_reduced = []
+    for m in range(len(alpha_post)):
+        # Normalize columns to get probabilities
+        col_sums = alpha_post[m].sum(axis=0, keepdims=True)
+        A_m = alpha_post[m] / np.maximum(col_sums, 1e-8)
+        A_reduced.append(A_m.astype(np.float32))
+
+    return {
+        "A_reduced": A_reduced,
+        "alpha_post": alpha_post,
+        "alpha_prior": alpha_prior,
+        "merge_history": merge_history,
+        "n_merges": len(merge_history),
+        "final_dims": [a.shape[1] for a in alpha_post],
     }
 
 
@@ -529,6 +820,50 @@ def cmd_refine(args):
     )
 
 
+def cmd_bmr_analytical(args):
+    """Run analytical BMR (Neacsu 2022)."""
+    trajectory = load_trajectory(args.trajectory)
+    print(f"[bmr-analytical] Loaded: {len(trajectory)} steps")
+
+    A_init = None
+    if args.params:
+        params = load_params(args.params)
+        A_init = params.get("A")
+        print(f"[bmr-analytical] Using params from {args.params}")
+
+    result = analytical_bmr(
+        trajectory,
+        A_params=A_init,
+        n_agents=args.n_agents,
+        max_merges=args.max_merges,
+        verbose=True,
+    )
+
+    print(f"\n[bmr-analytical] Summary:")
+    print(f"  Merges performed: {result['n_merges']}")
+    print(f"  Final dims: {result['final_dims']}")
+    for entry in result["merge_history"]:
+        print(f"  Round {entry['round']}: modality {entry['modality']}, "
+              f"merged ({entry['states_merged'][0]},{entry['states_merged'][1]}), "
+              f"DF={entry['delta_F']:.4f}")
+
+    if result["A_reduced"]:
+        save_params(
+            args.output,
+            A=result["A_reduced"],
+            B=build_option_B(),  # B not reduced in this version
+            C=build_C(),
+            D=build_D(),
+            metadata={
+                "source": "analytical_bmr_neacsu2022",
+                "n_merges": result["n_merges"],
+                "final_dims": str(result["final_dims"]),
+                "merge_history": json.dumps(result["merge_history"]),
+            },
+        )
+        print(f"[bmr-analytical] Saved reduced params to {args.output}")
+
+
 def cmd_compare(args):
     """Compare multiple parameter sets."""
     trajectory = load_trajectory(args.trajectory)
@@ -562,6 +897,16 @@ def main():
     p_prune.add_argument("--kl-weight", type=float, default=0.1)
     p_prune.add_argument("--n-agents", type=int, default=4)
 
+    # bmr-analytical
+    p_bmr = sub.add_parser("bmr-analytical",
+                           help="Analytical BMR (Neacsu 2022)")
+    p_bmr.add_argument("--trajectory", required=True)
+    p_bmr.add_argument("--params", default="",
+                       help="Optional learned params .npz (uses default A if omitted)")
+    p_bmr.add_argument("--output", default="/tmp/bmr_analytical_params.npz")
+    p_bmr.add_argument("--max-merges", type=int, default=10)
+    p_bmr.add_argument("--n-agents", type=int, default=4)
+
     # refine
     p_refine = sub.add_parser("refine",
                               help="Gradient refine from de novo init")
@@ -584,6 +929,8 @@ def main():
     args = parser.parse_args()
     if args.command == "prune":
         cmd_prune(args)
+    elif args.command == "bmr-analytical":
+        cmd_bmr_analytical(args)
     elif args.command == "refine":
         cmd_refine(args)
     elif args.command == "compare":
